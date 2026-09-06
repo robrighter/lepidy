@@ -326,35 +326,38 @@ The runner holds an **outbound WebSocket** to the workspace Durable Object. Outb
 
 #### The state machine, and the reuse rule
 
-Per agent, per runner, a session is in one of four states:
+Per agent, a session is in one of six durable states, with no live session displayed as idle:
 
 ```
-   idle ──spawn──▶ starting ──▶ running ──drained──▶ waiting ──idle timeout──▶ idle
-     ▲                                                  │
-     └──────────────── process exits ◀──────────────────┘
+   idle ──spawn──▶ starting ──▶ running ──drained──▶ waiting
+     ▲                    │          │                    │
+     └──── stopped ◀── stopping ◀────┴──── timeout/stop ──┘
+                              failed ◀── crash
 ```
 
 When a mention enqueues, the agent's Durable Object decides, in this order:
 
 | Session state | What happens | Why |
 |---|---|---|
-| **`waiting`** — alive, parked in `agent_next` | The held call **returns immediately** with the new item. **No process starts.** | This is the requested behaviour, and it is the fast path: the item reaches a warm session in milliseconds. |
+| **`waiting`** — alive, waiting locally | The wake tells the runner to make a short claim; the existing harness receives the item. **No process starts.** | This preserves the warm session without holding a workspace request open. |
 | **`running`** — alive, mid-task | **Nothing.** The item sits in the queue and the session picks it up when it finishes its current work and calls `agent_next` again. | Interrupting a working agent to hand it a second task is worse than making the second task wait. |
 | **`starting`** | Nothing. The starting session will drain the whole queue, this item included. | Debounce: three mentions in five seconds must produce one session, not three. |
 | **`idle`** | The DO sends a **wake** to the elected runner, which spawns the harness. | The only path that starts a process. |
 
-#### `agent_next(wait_ms)` is the whole mechanism
+#### `agent_next` uses short claims and local waiting
 
-The awkward part of "let the running process read the new message" is normally solved by writing to the child's stdin, which is fragile, harness-specific, and breaks the first time a vendor changes their REPL. Lepidy does not do that. Instead **`agent_next` grows a `wait_ms` parameter** (default 0, max ~60s): the call parks on the agent's Durable Object until an item arrives or the wait expires.
+The awkward part of "let the running process read the new message" is normally solved by writing to the child's stdin, which is fragile and harness-specific. Lepidy does not do that. Instead `agent_next` is a short MCP claim. When it returns empty, the harness adapter waits locally until the runner receives a metadata-only wake, then calls it again. The workspace object can hibernate between those calls.
 
 That single addition buys everything:
 
 - It is **an MCP tool call the harness already makes**, so it works identically across Claude Code, Codex, Open Coder and anything else that speaks MCP. No stdin injection, no harness-specific code, no per-vendor breakage.
-- It makes `waiting` an **observable** state rather than an inferred one — a session parked in a long poll is definitionally reusable, and the DO knows it because it is holding the call.
-- It degrades safely. A harness that ignores `wait_ms` and polls still gets its item; it is just slower and noisier.
-- Hibernating Durable Objects make a held connection close to free, which is the reason this is affordable at all.
+- It makes `waiting` an explicit runner session transition rather than an inferred open request.
+- It degrades safely. Reconnect and process-exit depth checks recover a missed wake.
+- Hibernating Durable Objects carry socket wakeups without a continuously billed request.
 
-The agent brief's default text tells the harness to end each turn with `agent_next(wait_ms: 60000)` and to exit cleanly when it returns empty. That is the loop, and it is four words long.
+The agent brief's default text tells the harness to end each turn with `agent_next`. The runner adapter owns local waiting, lease renewal and idle exit around that tool call.
+
+Claims use a 60-second lease renewed no more often than every 20 seconds. A lost lease before execution starts can retry; a lost lease after execution starts becomes `needs_attention` because its external effect may be ambiguous. The [runner and queue lifecycle contract](./docs/runner-queue-contract.md) is normative for fencing, retry, completion and token scope.
 
 #### The exit race, and the drain check
 
@@ -385,8 +388,8 @@ Runtime   ( ) Connected      (•) Local session      ( ) Hosted      ( ) Custom
 
   Session
     Reuse a running session                    [✓]   recommended
-    Idle timeout before the session exits      [ 15 minutes ▾ ]
-    Max concurrent sessions                    [ 1 ▾ ]
+    Idle timeout before the session exits      [ 10 minutes ▾ ]
+    Max concurrent sessions on this runner     [ 2 ▾ ]
     Max starts per hour                        [ 6 ▾ ]
     Who can start a session                    [ Anyone in scope ▾ ]  Owners only · A group
 
@@ -415,7 +418,7 @@ Everything above amounts to: *anyone in the workspace can cause a process to sta
 1. **The wake message carries no command.** It carries an agent id and nothing else. The runner looks up what to run in **its own local configuration**, which is on that machine, under that user's control. A compromised Lepidy server — or a compromised workspace admin account — cannot make a runner execute something the runner does not already permit. This is the load-bearing property of the whole feature and no optimization is allowed to erode it.
 2. **A runner opts in per agent, on the machine, once.** A native dialog on `maya-mbp`, not a checkbox somebody else can tick in a web app. Until it is approved, the web config shows the warning banner above and nothing starts.
 3. **All launch configuration is local-only.** The runner keeps the executable or script, arguments, working directory, environment references, directory allowlist and resource limits in its protected local store. The web UI and every cloud API can display only the preset id, revision/hash and readiness; they have no mutation field for any launch configuration. A local edit requires a fresh operating-system user-verification gesture in the signed desktop app or local CLI and invalidates pending starts for the old revision.
-4. **Concurrency, rate and cooldown caps enforced locally**, so a mention storm — or a bug in ours — cannot fork-bomb a laptop. One concurrent session and six starts an hour are the defaults.
+4. **Concurrency, rate and cooldown caps enforced locally**, so a mention storm — or a bug in ours — cannot fork-bomb a laptop. Two concurrent sessions across different agents and six starts an hour are the defaults; one agent still has only one live session.
 5. **The harness's own permission mode is the second wall**, and Lepidy defaults to the safe one. An agent that auto-approves file edits and shell commands because a mention arrived is a thing somebody should have to switch on, having read a sentence about what it does.
 6. **The kill switch reaches runners.** Workspace access off, or agent paused, terminates live sessions and refuses new ones. The desktop app and `lepidy agentd` both carry a local **Stop all sessions** that works with no network at all — the case where you most want it is the case where you least trust the connection.
 7. **Nothing runs invisibly.** A live session shows as a working indicator on the agent in the room, on the agent's page, in the tray, and in the audit log — start, exit code, duration, items drained, credentials touched.
@@ -1425,7 +1428,7 @@ M4 can start in parallel with M2/M3 — the vault shares only auth and the app s
 - **D12. ~~Does the free tier get local sessions?~~ Resolved: yes, and Solo's designated computer also owns channel content.** It maintains one outbound connection for internet control; channel metadata remains in cloud and content availability follows host availability. See the [free local workspace contract](./docs/free-local-workspace-contract.md).
 - **D13a. Whose Anthropic organization runs a Claude Cloud agent?** Spec'd as **the customer's** — their agent, their sandbox, their bill, their data-retention posture, and nothing of theirs in our custody. The alternative (our org, resold) onboards in one click and makes us the operator of everyone's agents, which is precisely what decision 8 removed. Revisit only if the manual Console step (§7.9) proves fatal to activation.
 - **D13. Which non-interactive invocation for each harness?** The presets need real, tested commands per harness per platform, and the flags drift. Recommended: pin a preset version, test the three in CI against the current release of each CLI weekly, and ship the preset table from the server (§7.8). **Blocking M9.5** — and the CI job is the deliverable, not the flags.
-- **D14. Does a local session get its own MCP token, or borrow the owner's?** Borrowing is simpler and keeps §7.1's "authority is the owner" property literal. A session-scoped token is narrower and revocable per session without disturbing the owner's other clients. Recommended: **a session-scoped token minted from the delegation**, expiring with the session — slightly more work, and it means a runaway session is killable without signing the human out of Claude Code. **Decide at M9.5.**
+- **D14 resolved:** a local session receives a narrow token minted from exactly one delegation. It is bound to workspace, agent, owner, session, runner device/epoch, local preset revision and capabilities; it rotates every 15 minutes, ends by eight hours and is revoked with any underlying authority. The full lifecycle is normative in the [runner and queue contract](./docs/runner-queue-contract.md).
 - **D15. Does the free tier get Claude Cloud agents?** The compute and the tokens are the customer's Anthropic account; ours is a webhook route and some outbound calls. Recommended: **yes**, with a ceiling on *scheduled deployments* rather than on sessions — a free workspace with forty cron agents is a reconciliation-sweep cost, not an inference cost. Needs a number before M10.
 
 ---

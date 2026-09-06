@@ -508,9 +508,9 @@ runner ──WS──▶ Workspace DO
 
 **The wake message carries an agent id and nothing else.** The runner looks up what to execute in its own local policy. This is the property that makes a compromised Lepidy unable to run code on a customer's laptop, and it is worth restating here because it is an architectural invariant, not a UI choice: *no code path anywhere may add a command to a wake message.*
 
-**Session reuse remains required, but the waiting transport is not yet finalized.** Parking `agent_next(wait_ms)` inside the workspace object prevents hibernation for the duration of the request. A pending HTTP/RPC response cannot survive hibernation as an in-memory continuation. [Cloudflare lifecycle documentation](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/)
+**Session reuse uses local waiting plus short claims.** Parking `agent_next(wait_ms)` inside the workspace object would prevent hibernation for the duration of the request. Instead, the harness waits locally; a metadata-only WebSocket wake causes the runner to make a short claim request. A pending HTTP/RPC response is never treated as a hibernatable continuation. [Cloudflare lifecycle documentation](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/)
 
-The preferred cost shape is a hibernating runner WebSocket carrying wake notifications, followed by short requests to claim work. Prototype how the harness's MCP wait can terminate outside the workspace object while preserving session reuse, cancellation, reconnect, and the exit-race check. Long polling is acceptable as a measured fallback, not as a supposedly free mechanism. Do not add an always-awake object per agent merely to move the cost elsewhere.
+The normative claim, lease, completion, retry, idle, disconnect and session-token rules are in the [runner and queue contract](./docs/runner-queue-contract.md). The cost shape is a hibernating runner WebSocket carrying wake notifications followed by short claim requests. D03 must demonstrate the local waiting adapter, cancellation and reconnect with the real harnesses; it may not add an always-awake object per agent.
 
 Use WebSocket auto-responses for suitable keepalives. Avoid persisting every heartbeat; persist meaningful state transitions and periodic last-seen checkpoints. Presence freshness, lease renewal, and revocation bounds must still satisfy their explicit reliability requirements.
 
@@ -695,8 +695,7 @@ Next.js built with the OpenNext Cloudflare adapter and deployed with Wrangler, a
 
 ## 18. Open engineering questions
 
-- **Waiting transport:** prototype session reuse without a parked workspace RPC; compare cost and reconnect behavior against bounded long polling (§10.1).
-- **Runner and queue contract:** one designated runner and active session per agent is the v1 recommendation, not yet a finalized failover specification. Set claim leases, completion, renewal cadence, disconnected-runner behavior, and session-scoped delegation tokens before implementation.
+- **Waiting adapter certification:** the no-park transport and lifecycle are fixed by §10.1 and the runner contract. D03 must demonstrate session reuse, cancellation, reconnect and the exit race against each supported harness.
 - **Vault owner sharing:** the user-held AVK and recovery protocol are fixed by §9 and the [vault key and recovery contract](./docs/vault-key-recovery-contract.md). Specify multi-owner envelope distribution, removal and rekeying without creating a server-decryptable wrap before V01.
 - **Cloud provider authorization:** specify what credential authorizes session creation and resource fetches in the customer's account, where it is stored, and how it is revoked. Customer-paid execution does not eliminate this integration credential.
 

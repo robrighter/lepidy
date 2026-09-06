@@ -21,7 +21,7 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | Done | ID | Task | Dependencies | Reuse | Acceptance / required output | Status | Owner | Started | Finished | Evidence |
 |---|---|---|---|---|---|---|---|---|---|---|
 | [x] | D01 | Identity and tenant contract | — | S1,S2 | Document URL/cookie/passkey boundaries, tenant-local author IDs, linking/recovery and cross-plane revocation; reconcile specs. | done | /root | 2026-09-05 | 2026-09-05 | [D01](#d01--identity-and-tenant-contract) |
-| [ ] | D02 | Runner and queue contract | — | S2,S3,V2 | Resolve designated runner/concurrency, leases/fencing, completion, retries, idle timeout, disconnect policy and session-token scope. | todo | — | — | — | — |
+| [x] | D02 | Runner and queue contract | — | S2,S3,V2 | Resolve designated runner/concurrency, leases/fencing, completion, retries, idle timeout, disconnect policy and session-token scope. | done | /root | 2026-09-06 | 2026-09-06 | [D02](#d02--runner-and-queue-contract) |
 | [ ] | D03 | MCP waiting and harness spike | F01,F03,D02 | S3,V2 | Demonstrate repeated work in one harness without a permanently parked workspace request; measure idle duration and test cancellation/reconnect. | todo | — | — | — | — |
 | [x] | D04 | Vault and approval contract | D01 | V1,V4 | Specify ACL union/intersection, provenance binding, signed project/device claims, step-up matrix, batch approvals and grant expiry semantics. | done | /root | 2026-09-06 | 2026-09-06 | [D04](#d04--vault-and-approval-contract) |
 | [x] | D05 | Vault sharing and release contract | D04,D05a | V4 | Resolve device-mediated delivery, browser trust, per-owner wraps, removal/rekey and lost-device behavior while preserving user-held root custody. | done | /root | 2026-09-06 | 2026-09-06 | [D05](#d05--vault-sharing-and-release-contract) |
@@ -84,6 +84,16 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [ ] | G05 | Release documentation and final decision | G01,G02,G03,G04,O03 | — | Reconcile PRD/HLD/mockups, publish-ready docs/marketing and support runbooks, enumerate accepted deferrals and external reviews; release only with required authorization. | todo | — | — | — | — |
 
 ## Evidence records
+
+### D02 — Runner and queue contract
+
+- Task / owner: D02 / `/root`
+- Status / dates: done / 2026-09-06 to 2026-09-06
+- Decision delivered: one explicitly designated runner and one live session per agent; local runner concurrency defaults to two and cannot be raised remotely; 60-second leases renewed at most every 20 seconds with generation/token/runner-epoch fencing; idempotent claim and completion; bounded retry only before execution or after a definite retry-safe failure; ambiguous post-start outcomes require human attention; ten-minute local idle default, eight-hour hard lifetime and process-tree termination; WebSocket wake plus reconnect/exit depth checks without a parked object request; session tokens scoped to one delegation and the exact workspace/agent/owner/session/device/epoch/preset/capability tuple, rotated every 15 minutes and rechecked live.
+- Changed files: `docs/runner-queue-contract.md`, `PRD.md`, `HLD.md`, `IMPLEMENTATION-PLAN.md` and `IMPLEMENTATION-LEDGER.md`.
+- Reused design: Slipchat's S3 opaque hashed OAuth tokens, atomic single-use authorization and explicit reduced MCP surfaces informed session-token storage and capability boundaries. Agent Vault's V2 lease-like exact-client grants and fail-closed revocation informed token binding and expiry. Lepidy adds durable queue leases, local preset revisions, runner epochs and ambiguous-external-outcome handling.
+- Verification: `npm run verify:local` passed with 48 Worker/D1/SQLite/crypto tests, 3 native Windows file-backed SQLite integration tests, 12 desktop/mobile browser tests, TypeScript, production Next.js/OpenNext/Wrangler builds and zero production dependency vulnerabilities.
+- Exercised boundaries and follow-ups: this is a normative decision task; no queue runtime behavior is claimed. A01/A03/R01 implement the same state machine in Team DO and Solo host storage. D03 certifies the no-park waiting adapter with real harnesses. F06 supplies transactional wake delivery and retry alarms. The contract lists ten mandatory integration scenarios, including stale claimers, lost responses, pre/post-start crashes, lost wakes, disconnect termination and exact session-token mismatch cases.
 
 ### F03b — Solo host content store and encrypted relay
 
