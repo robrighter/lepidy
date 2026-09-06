@@ -18,7 +18,7 @@ export const channelHistory = cache(
 
     if (!token) {
       return environment === "development"
-        ? { status: "ready", page: developmentChannelHistory(channelId), pins: [] }
+        ? { status: "ready", page: developmentChannelHistory(channelId), pins: [], draft: null }
         : { status: "not_found" };
     }
 

@@ -111,6 +111,7 @@ export default async function ChannelPage({
         channelId={channel.id}
         channelLabel={channelLabel(channel)}
         canPost={canPost && channel.kind !== "dm"}
+        initialDraft={history.status === "ready" ? history.draft : null}
       />
     </>
   );

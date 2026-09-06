@@ -179,3 +179,73 @@ test("MSG-INT-014 reveals older messages without disturbing what is already on s
   await expect(page.locator(".messages")).toContainText("paged message 20");
   await expect(page.getByText("You have reached the start of this room.")).toBeVisible();
 });
+
+test("DRAFT-INT-006 syncs a draft to the server so it survives more than this browser", async ({
+  page,
+  context,
+}) => {
+  await page.goto("/c/general");
+  const composer = page.getByRole("textbox", { name: /Message #general/ });
+  await composer.click();
+  await composer.fill("a thought I have not finished");
+  await expect(page.getByText("Draft saved")).toBeVisible();
+
+  // A different browser context carrying the same session is another device.
+  const session = (await context.cookies()).find((entry) => entry.name === "lepidy_session");
+  const csrf = (await context.cookies()).find((entry) => entry.name === "lepidy_csrf");
+  const second = await context.browser()!.newContext();
+  await second.addCookies(
+    [session!, csrf!].map((cookie) => ({
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain,
+      path: cookie.path,
+    })),
+  );
+  const other = await second.newPage();
+  await other.goto("/c/general");
+  await expect(other.getByRole("textbox", { name: /Message #general/ })).toHaveValue(
+    "a thought I have not finished",
+  );
+  await other.close();
+  await second.close();
+
+  // Sending spends the draft everywhere, not only in this browser.
+  await composer.click();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".messages > li")).toHaveCount(1);
+  await page.reload();
+  await expect(page.getByRole("textbox", { name: /Message #general/ })).toHaveValue("");
+});
+
+test("SCHED-MSG-INT-008 schedules a message for later and can take it back", async ({ page }) => {
+  await page.goto("/c/general");
+  const composer = page.getByRole("textbox", { name: /Message #general/ });
+  await composer.click();
+  await composer.fill("SCHEDULED_BROWSER_CANARY");
+
+  await page.getByRole("button", { name: "Schedule this message for later" }).click();
+  const when = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 16);
+  await page.getByLabel("Send at").fill(when);
+  await page.getByRole("button", { name: "Schedule", exact: true }).click();
+  // The panel closes only once the schedule has been accepted, so this waits on
+  // the outcome rather than on the click.
+  await expect(page.getByLabel("Send at")).toHaveCount(0);
+  await expect(page.locator(".composer-error")).toHaveCount(0);
+
+  // It is waiting, not posted.
+  await expect(page.locator(".messages > li")).toHaveCount(0);
+  await page.goto("/scheduled");
+  await expect(page.getByRole("heading", { name: "Scheduled", level: 2 })).toBeVisible();
+  const entry = page.locator(".scheduled-list li");
+  await expect(entry).toHaveCount(1);
+  await expect(entry).toContainText("SCHEDULED_BROWSER_CANARY");
+  await expect(entry.locator(".tag")).toHaveText("scheduled");
+
+  await entry.getByRole("button", { name: /^Cancel the message scheduled/ }).click();
+  await expect(page.getByRole("heading", { name: "Nothing scheduled" })).toBeVisible();
+
+  // Cancelling means it never arrives in the room.
+  await page.goto("/c/general");
+  await expect(page.locator(".messages")).toHaveCount(0);
+});

@@ -4,7 +4,7 @@
  * resolution can be case-tested without a workspace.
  */
 
-export type ShellSection = "home" | "inbox" | "saved" | "agents" | "vault" | "channel" | "profile";
+export type ShellSection = "home" | "inbox" | "saved" | "scheduled" | "agents" | "vault" | "channel" | "profile";
 
 export type ShellNavItem = {
   id: ShellSection;
@@ -19,6 +19,7 @@ export const SHELL_NAV: readonly ShellNavItem[] = [
   { id: "home", label: "Home", href: "/", match: "/" },
   { id: "inbox", label: "Inbox", href: "/inbox", match: "/inbox" },
   { id: "saved", label: "Saved", href: "/saved", match: "/saved" },
+  { id: "scheduled", label: "Scheduled", href: "/scheduled", match: "/scheduled" },
   { id: "agents", label: "Agents", href: "/agents", match: "/agents" },
   { id: "vault", label: "Vault", href: "/vault", match: "/vault" },
 ] as const;

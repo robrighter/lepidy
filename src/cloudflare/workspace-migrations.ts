@@ -438,6 +438,39 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
          ON messages(forwarded_from_message_id) WHERE forwarded_from_message_id IS NOT NULL`,
     ],
   },
+  {
+    version: 12,
+    name: "synced drafts and scheduled messages",
+    statements: [
+      // One draft per member per composing surface. The empty string is the
+      // room itself; a thread root id is a thread's own draft.
+      `CREATE TABLE message_drafts (
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        thread_root_id TEXT NOT NULL DEFAULT '',
+        body_markdown TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (member_id, channel_id, thread_root_id)
+      ) STRICT`,
+      `CREATE INDEX message_drafts_member_idx ON message_drafts(member_id, updated_at)`,
+      `CREATE TABLE scheduled_messages (
+        id TEXT PRIMARY KEY,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        thread_root_id TEXT,
+        body_markdown TEXT NOT NULL,
+        send_at INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('scheduled', 'sent', 'cancelled', 'failed')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        sent_message_id TEXT,
+        failure_reason TEXT
+      ) STRICT`,
+      `CREATE INDEX scheduled_messages_due_idx ON scheduled_messages(status, send_at)`,
+      `CREATE INDEX scheduled_messages_member_idx ON scheduled_messages(member_id, send_at)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

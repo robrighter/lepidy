@@ -21,7 +21,19 @@ describe("Solo opaque relay encryption", () => {
     await expect(openRelayFrame(key, { ...frame, hostEpoch: 4 })).rejects.toThrow(
       "relay frame authentication failed",
     );
-    const tampered = `${frame.ciphertext.slice(0, -1)}${frame.ciphertext.endsWith("A") ? "B" : "A"}`;
+    // Flip a bit in the middle of the ciphertext rather than the last base64
+    // character: that character's low bits are discarded on decode, so
+    // changing it sometimes produces the very same bytes and no tampering.
+    const bytes = Uint8Array.from(
+      atob(frame.ciphertext.replaceAll("-", "+").replaceAll("_", "/")),
+      (character) => character.charCodeAt(0),
+    );
+    bytes[Math.floor(bytes.length / 2)] ^= 0x01;
+    const tampered = btoa(String.fromCharCode(...bytes))
+      .replaceAll("+", "-")
+      .replaceAll("/", "_")
+      .replace(/=+$/, "");
+    expect(tampered).not.toBe(frame.ciphertext);
     await expect(openRelayFrame(key, { ...frame, ciphertext: tampered })).rejects.toThrow(
       "relay frame authentication failed",
     );

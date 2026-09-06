@@ -47,6 +47,7 @@ import {
   parseChannelName,
   parseChannelSlug,
   parseChannelTopic,
+  MAX_MESSAGE_LENGTH,
   clampHistoryLimit,
   parseMessageBody,
   parseReactionEmoji,
@@ -85,8 +86,19 @@ import {
   isChannelMember,
   listChannelHistory,
   listThreadHistory,
+  claimDueScheduledMessages,
+  deleteDraft,
+  insertScheduledMessage,
+  listDraftsForMember,
   listPinnedMessages,
   listSavedPointers,
+  listScheduledForMember,
+  nextScheduledSendAt,
+  readDraft,
+  readScheduledMessage,
+  settleScheduledMessage,
+  updateScheduledMessage,
+  writeDraft,
   listVisibleChannels,
   nextChannelSequence,
   pinMessage,
@@ -111,8 +123,10 @@ import {
   writeChannelCursor,
   writeThreadCursor,
   type ChannelRow,
+  type DraftRow,
   type MessagePage,
   type MessageRow,
+  type ScheduledMessageRow,
 } from "./workspace-rooms";
 import { verifySoloSnapshot, type SoloContentSnapshot } from "../domain/solo-snapshot";
 
@@ -162,6 +176,7 @@ export type DueWorkReport = {
   outbox: { attempted: number; delivered: number; retried: number; dead: number };
   retention: RetentionSweepReport | null;
   anchor: AuditAnchor | null;
+  scheduledSends: { sent: number; failed: number };
   alarmAt: number | null;
 };
 
@@ -237,6 +252,18 @@ export type SocketAttachment = {
   cursor: number;
   connectedAt: number;
 };
+
+export type DraftSaveResult =
+  | { status: "saved"; draft: DraftRow }
+  | { status: "cleared"; draft: null }
+  /** Another device moved the draft on; this is what is actually stored. */
+  | { status: "conflict"; draft: DraftRow };
+
+/** One multiplexed deadline covers every pending scheduled send. */
+export const SCHEDULED_SEND_WORK_ID = "system:scheduled_send";
+const SCHEDULED_SEND_BATCH = 25;
+/** A year is already further ahead than anybody means; beyond it is a mistake. */
+const MAX_SCHEDULE_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
 
 /** Roles that may create rooms. A guest joins what they are invited to. */
 const ROOM_CREATOR_ROLES: ReadonlySet<MemberProjection["role"]> = new Set(["owner", "admin", "member"]);
@@ -1947,6 +1974,365 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     return { messages: decorated, nextCursor: annotated.nextCursor };
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Synced drafts and scheduled messages (C05b)                         */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Save a draft for this member and this composing surface.
+   *
+   * Drafts follow a person between devices, which means two devices can edit
+   * one draft. The caller sends the revision it was editing from; if the stored
+   * draft has moved on, this refuses and hands back what is actually stored
+   * rather than silently overwriting whatever the other device typed.
+   */
+  saveDraft(input: {
+    actor: Actor;
+    channelId: string;
+    threadRootId?: string | null;
+    bodyMarkdown: string;
+    baseRevision?: number;
+    now: number;
+  }): DraftSaveResult {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    this.requireChannelParticipant(input.channelId, actor.id);
+    const threadKey = this.requireThreadKey(input.channelId, input.threadRootId ?? null);
+
+    const body = input.bodyMarkdown.slice(0, MAX_MESSAGE_LENGTH);
+
+    return this.ctx.storage.transactionSync(() => {
+      const existing = readDraft(this.ctx.storage, actor.id, input.channelId, threadKey);
+
+      // An empty body clears the draft rather than storing nothing.
+      if (body.trim().length === 0) {
+        if (existing && input.baseRevision !== undefined && existing.revision !== input.baseRevision) {
+          return { status: "conflict" as const, draft: existing };
+        }
+        deleteDraft(this.ctx.storage, actor.id, input.channelId, threadKey);
+        return { status: "cleared" as const, draft: null };
+      }
+
+      if (existing && input.baseRevision !== undefined && existing.revision !== input.baseRevision) {
+        return { status: "conflict" as const, draft: existing };
+      }
+
+      const revision = (existing?.revision ?? 0) + 1;
+      writeDraft(this.ctx.storage, actor.id, input.channelId, threadKey, body, revision, input.now);
+      return {
+        status: "saved" as const,
+        draft: {
+          channelId: input.channelId,
+          threadRootId: threadKey === "" ? null : threadKey,
+          bodyMarkdown: body,
+          revision,
+          updatedAt: input.now,
+        },
+      };
+    });
+  }
+
+  getDraft(input: {
+    actor: Actor;
+    channelId: string;
+    threadRootId?: string | null;
+  }): { draft: DraftRow | null } {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireVisibleChannel(input.channelId, actor.id);
+    const threadKey = input.threadRootId ?? "";
+    return { draft: readDraft(this.ctx.storage, actor.id, channel.id, threadKey) };
+  }
+
+  /**
+   * Every draft this member has, filtered to rooms they can still see. A draft
+   * left in a room they have since left is not handed back to them.
+   */
+  listDrafts(input: { actor: Actor }): { drafts: readonly DraftRow[]; unavailable: number } {
+    const actor = this.authorizeActor(input.actor);
+    const all = listDraftsForMember(this.ctx.storage, actor.id);
+    const drafts: DraftRow[] = [];
+    let unavailable = 0;
+    for (const draft of all) {
+      const channel = readChannel(this.ctx.storage, draft.channelId);
+      if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))) {
+        unavailable += 1;
+        continue;
+      }
+      drafts.push(draft);
+    }
+    return { drafts, unavailable };
+  }
+
+  /**
+   * Schedule a message for later.
+   *
+   * The body is validated now so a scheduled send cannot become a surprise
+   * failure at three in the morning, and the deadline rides the object's one
+   * alarm through the F06 scheduler rather than a timer of its own.
+   */
+  async scheduleMessage(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    channelId: string;
+    bodyMarkdown: string;
+    threadParentId?: string | null;
+    sendAt: number;
+    now: number;
+  }): Promise<{ id: string; sendAt: number; replayed: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const channel = this.requireChannelParticipant(input.channelId, actor.id);
+    if (channel.archivedAt !== null) throw new Error("this room is archived");
+
+    const sendAt = this.requireSendAt(input.sendAt, input.now);
+    const body = parseMessageBody(input.bodyMarkdown);
+    if (body === null) throw new Error("message body is empty or too long");
+    const threadRootId = this.resolveScheduledThreadRoot(input.threadParentId ?? null, channel.id);
+
+    const outcome = await this.commitMutation(
+      {
+        scope: "message.schedule",
+        idempotencyKey: input.idempotencyKey,
+        requestHash: `${actor.id}|${channel.id}|${sendAt}`,
+        now: input.now,
+      },
+      () => {
+        const id = crypto.randomUUID();
+        insertScheduledMessage(this.ctx.storage, {
+          id,
+          memberId: actor.id,
+          channelId: channel.id,
+          threadRootId,
+          bodyMarkdown: body,
+          sendAt,
+          now: input.now,
+        });
+        return {
+          result: { id, sendAt },
+          effects: {
+            audit: {
+              eventType: "message.scheduled",
+              outcome: "allowed" as const,
+              requesterKind: "member" as const,
+              requesterId: actor.id,
+              subjectKind: "scheduled_message",
+              subjectId: id,
+              metadata: { channel_id: channel.id, send_at: sendAt },
+            },
+            dueWork: [{ id: SCHEDULED_SEND_WORK_ID, kind: "scheduled_send", dueAt: sendAt }],
+          } satisfies MutationEffects,
+        };
+      },
+    );
+
+    await this.armScheduledSends(input.now);
+    return { ...outcome.result, replayed: outcome.replayed };
+  }
+
+  /** Only the person who scheduled it may change it, and only before it fires. */
+  async updateScheduledMessage(input: {
+    actor: Actor;
+    id: string;
+    bodyMarkdown?: string;
+    sendAt?: number;
+    now: number;
+  }): Promise<{ updated: boolean; sendAt: number }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const scheduled = this.requireOwnScheduledMessage(input.id, actor.id);
+
+    const changes: { bodyMarkdown?: string; sendAt?: number } = {};
+    if (input.bodyMarkdown !== undefined) {
+      const body = parseMessageBody(input.bodyMarkdown);
+      if (body === null) throw new Error("message body is empty or too long");
+      changes.bodyMarkdown = body;
+    }
+    if (input.sendAt !== undefined) changes.sendAt = this.requireSendAt(input.sendAt, input.now);
+
+    const updated = this.ctx.storage.transactionSync(() =>
+      updateScheduledMessage(this.ctx.storage, scheduled.id, changes, input.now),
+    );
+    await this.armScheduledSends(input.now);
+    return { updated, sendAt: changes.sendAt ?? scheduled.sendAt };
+  }
+
+  async cancelScheduledMessage(input: {
+    actor: Actor;
+    id: string;
+    now: number;
+  }): Promise<{ cancelled: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const scheduled = this.requireOwnScheduledMessage(input.id, actor.id);
+    const cancelled = this.ctx.storage.transactionSync(() =>
+      settleScheduledMessage(this.ctx.storage, scheduled.id, { status: "cancelled" }, input.now),
+    );
+    await this.armScheduledSends(input.now);
+    return { cancelled };
+  }
+
+  listScheduledMessages(input: { actor: Actor; limit?: number }): {
+    scheduled: readonly ScheduledMessageRow[];
+  } {
+    const actor = this.authorizeActor(input.actor);
+    return {
+      scheduled: listScheduledForMember(this.ctx.storage, actor.id, clampHistoryLimit(input.limit)),
+    };
+  }
+
+  /**
+   * Send everything that has come due.
+   *
+   * Authority is rechecked at the moment of sending, not at the moment of
+   * scheduling: somebody suspended, removed from the room, or whose room was
+   * archived in the meantime does not get a message posted in their name. A
+   * refusal settles the row with a reason instead of retrying forever.
+   *
+   * The send itself is keyed on the scheduled id, so a duplicate alarm returns
+   * the message the first one wrote rather than posting a second.
+   */
+  async deliverDueScheduledMessages(now: number): Promise<{
+    sent: number;
+    failed: number;
+    considered: number;
+  }> {
+    const due = claimDueScheduledMessages(this.ctx.storage, now, SCHEDULED_SEND_BATCH);
+    let sent = 0;
+    let failed = 0;
+
+    for (const scheduled of due) {
+      const refusal = this.scheduledSendRefusal(scheduled);
+      if (refusal !== null) {
+        this.ctx.storage.transactionSync(() =>
+          settleScheduledMessage(
+            this.ctx.storage,
+            scheduled.id,
+            { status: "failed", reason: refusal },
+            now,
+          ),
+        );
+        failed += 1;
+        continue;
+      }
+
+      try {
+        const result = await this.sendMessage({
+          actor: {
+            memberId: scheduled.memberId,
+            authorizationEpoch: this.memberAuthorizationEpoch(scheduled.memberId),
+          },
+          // Keyed on the scheduled row, so a duplicate alarm cannot post twice.
+          idempotencyKey: `scheduled:${scheduled.id}`,
+          channelId: scheduled.channelId,
+          bodyMarkdown: scheduled.bodyMarkdown,
+          threadParentId: scheduled.threadRootId,
+          now,
+        });
+        this.ctx.storage.transactionSync(() =>
+          settleScheduledMessage(
+            this.ctx.storage,
+            scheduled.id,
+            { status: "sent", messageId: result.messageId },
+            now,
+          ),
+        );
+        sent += 1;
+      } catch (error) {
+        this.ctx.storage.transactionSync(() =>
+          settleScheduledMessage(
+            this.ctx.storage,
+            scheduled.id,
+            { status: "failed", reason: redactedError(error) },
+            now,
+          ),
+        );
+        failed += 1;
+      }
+    }
+
+    await this.armScheduledSends(now);
+    return { sent, failed, considered: due.length };
+  }
+
+  /* -- scheduling helpers ---------------------------------------------- */
+
+  /** Why this scheduled message must not be sent, or null if it may be. */
+  private scheduledSendRefusal(scheduled: ScheduledMessageRow): string | null {
+    const member = this.ctx.storage.sql
+      .exec<{ status: string }>("SELECT status FROM members WHERE id = ?", scheduled.memberId)
+      .toArray()[0];
+    if (!member || member.status !== "active") return "author is no longer an active member";
+
+    const channel = readChannel(this.ctx.storage, scheduled.channelId);
+    if (channel === null) return "channel no longer exists";
+    if (channel.archivedAt !== null) return "channel was archived before the send time";
+    if (!isChannelMember(this.ctx.storage, channel.id, scheduled.memberId)) {
+      return "author is no longer in the channel";
+    }
+    return null;
+  }
+
+  private memberAuthorizationEpoch(memberId: string): number {
+    return (
+      this.ctx.storage.sql
+        .exec<{ authorization_epoch: number }>(
+          "SELECT authorization_epoch FROM members WHERE id = ?",
+          memberId,
+        )
+        .toArray()[0]?.authorization_epoch ?? 0
+    );
+  }
+
+  /** Keep the object's one alarm pointed at the next scheduled send. */
+  private async armScheduledSends(now: number): Promise<void> {
+    const next = nextScheduledSendAt(this.ctx.storage);
+    if (next === null) return;
+    this.ctx.storage.transactionSync(() =>
+      scheduleDueWork(
+        this.ctx.storage,
+        [{ id: SCHEDULED_SEND_WORK_ID, kind: "scheduled_send", dueAt: next }],
+        now,
+      ),
+    );
+    await this.armAlarm();
+  }
+
+  private requireSendAt(sendAt: number, now: number): number {
+    if (!Number.isSafeInteger(sendAt)) throw new Error("send time must be a whole timestamp");
+    if (sendAt <= now) throw new Error("send time must be in the future");
+    if (sendAt - now > MAX_SCHEDULE_AHEAD_MS) throw new Error("send time is too far ahead");
+    return sendAt;
+  }
+
+  private requireOwnScheduledMessage(id: string, memberId: string): ScheduledMessageRow {
+    const scheduled = readScheduledMessage(this.ctx.storage, id);
+    // Somebody else's scheduled message is reported as missing, not forbidden.
+    if (scheduled === null || scheduled.memberId !== memberId) {
+      throw new Error("scheduled message not found");
+    }
+    if (scheduled.status !== "scheduled") throw new Error("this message has already been settled");
+    return scheduled;
+  }
+
+  private resolveScheduledThreadRoot(parentId: string | null, channelId: string): string | null {
+    if (parentId === null) return null;
+    const parent = readMessage(this.ctx.storage, parentId);
+    if (parent === null) throw new Error("thread parent not found");
+    const placement = resolveThreadPlacement(parent, channelId);
+    if (placement.kind === "invalid") throw new Error(placement.reason);
+    return placement.kind === "reply" ? placement.threadRootId : null;
+  }
+
+  /** A draft's thread key must name a real thread root in that same room. */
+  private requireThreadKey(channelId: string, threadRootId: string | null): string {
+    if (threadRootId === null || threadRootId === "") return "";
+    const root = readMessage(this.ctx.storage, threadRootId);
+    if (root === null || root.channelId !== channelId || root.threadRootId !== null) {
+      throw new Error("thread not found");
+    }
+    return root.id;
+  }
+
   /** Newest-first channel history, refused outright for a room the caller cannot see. */
   readChannelHistory(input: {
     actor: Actor;
@@ -2198,6 +2584,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     let outbox = { attempted: 0, delivered: 0, retried: 0, dead: 0 };
     let retention: RetentionSweepReport | null = null;
     let anchor: AuditAnchor | null = null;
+    let scheduledSends = { sent: 0, failed: 0 };
 
     for (const item of claimed) {
       try {
@@ -2225,6 +2612,14 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                       value + retention![key as keyof RetentionSweepReport],
                     ]),
                   ) as RetentionSweepReport);
+            break;
+          }
+          case "scheduled_send": {
+            const report = await this.deliverDueScheduledMessages(now);
+            scheduledSends = {
+              sent: scheduledSends.sent + report.sent,
+              failed: scheduledSends.failed + report.failed,
+            };
             break;
           }
           case "audit_anchor":
@@ -2261,7 +2656,16 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       );
     }
 
-    return { now, processed, failed, outbox, retention, anchor, alarmAt: await this.armAlarm() };
+    return {
+      now,
+      processed,
+      failed,
+      outbox,
+      retention,
+      anchor,
+      scheduledSends,
+      alarmAt: await this.armAlarm(),
+    };
   }
 
   /**

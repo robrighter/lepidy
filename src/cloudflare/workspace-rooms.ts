@@ -967,3 +967,283 @@ export function savedMessageIds(storage: DurableObjectStorage, memberId: string)
       .map((row) => row.message_id),
   );
 }
+
+/* -------------------------------------------------------------------------- */
+/* Drafts and scheduled messages                                               */
+/* -------------------------------------------------------------------------- */
+
+export type DraftRow = {
+  channelId: string;
+  threadRootId: string | null;
+  bodyMarkdown: string;
+  revision: number;
+  updatedAt: number;
+};
+
+function toDraft(row: {
+  channel_id: string;
+  thread_root_id: string;
+  body_markdown: string;
+  revision: number;
+  updated_at: number;
+}): DraftRow {
+  return {
+    channelId: row.channel_id,
+    threadRootId: row.thread_root_id === "" ? null : row.thread_root_id,
+    bodyMarkdown: row.body_markdown,
+    revision: row.revision,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function readDraft(
+  storage: DurableObjectStorage,
+  memberId: string,
+  channelId: string,
+  threadRootId: string,
+): DraftRow | null {
+  const row = storage.sql
+    .exec<{
+      channel_id: string;
+      thread_root_id: string;
+      body_markdown: string;
+      revision: number;
+      updated_at: number;
+    }>(
+      `SELECT channel_id, thread_root_id, body_markdown, revision, updated_at
+       FROM message_drafts WHERE member_id = ? AND channel_id = ? AND thread_root_id = ?`,
+      memberId,
+      channelId,
+      threadRootId,
+    )
+    .toArray()[0];
+  return row ? toDraft(row) : null;
+}
+
+export function writeDraft(
+  storage: DurableObjectStorage,
+  memberId: string,
+  channelId: string,
+  threadRootId: string,
+  bodyMarkdown: string,
+  revision: number,
+  now: number,
+): void {
+  storage.sql.exec(
+    `INSERT INTO message_drafts(member_id, channel_id, thread_root_id, body_markdown, revision, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(member_id, channel_id, thread_root_id) DO UPDATE SET
+       body_markdown = excluded.body_markdown,
+       revision = excluded.revision,
+       updated_at = excluded.updated_at`,
+    memberId,
+    channelId,
+    threadRootId,
+    bodyMarkdown,
+    revision,
+    now,
+  );
+}
+
+export function deleteDraft(
+  storage: DurableObjectStorage,
+  memberId: string,
+  channelId: string,
+  threadRootId: string,
+): boolean {
+  return (
+    storage.sql.exec(
+      "DELETE FROM message_drafts WHERE member_id = ? AND channel_id = ? AND thread_root_id = ?",
+      memberId,
+      channelId,
+      threadRootId,
+    ).rowsWritten > 0
+  );
+}
+
+export function listDraftsForMember(storage: DurableObjectStorage, memberId: string): DraftRow[] {
+  return storage.sql
+    .exec<{
+      channel_id: string;
+      thread_root_id: string;
+      body_markdown: string;
+      revision: number;
+      updated_at: number;
+    }>(
+      `SELECT channel_id, thread_root_id, body_markdown, revision, updated_at
+       FROM message_drafts WHERE member_id = ? ORDER BY updated_at DESC`,
+      memberId,
+    )
+    .toArray()
+    .map(toDraft);
+}
+
+export type ScheduledMessageRow = {
+  id: string;
+  memberId: string;
+  channelId: string;
+  threadRootId: string | null;
+  bodyMarkdown: string;
+  sendAt: number;
+  status: "scheduled" | "sent" | "cancelled" | "failed";
+  sentMessageId: string | null;
+  failureReason: string | null;
+};
+
+const SCHEDULED_COLUMNS = `id, member_id, channel_id, thread_root_id, body_markdown, send_at,
+                           status, sent_message_id, failure_reason`;
+
+type RawScheduled = {
+  id: string;
+  member_id: string;
+  channel_id: string;
+  thread_root_id: string | null;
+  body_markdown: string;
+  send_at: number;
+  status: ScheduledMessageRow["status"];
+  sent_message_id: string | null;
+  failure_reason: string | null;
+};
+
+function toScheduled(row: RawScheduled): ScheduledMessageRow {
+  return {
+    id: row.id,
+    memberId: row.member_id,
+    channelId: row.channel_id,
+    threadRootId: row.thread_root_id,
+    bodyMarkdown: row.body_markdown,
+    sendAt: row.send_at,
+    status: row.status,
+    sentMessageId: row.sent_message_id,
+    failureReason: row.failure_reason,
+  };
+}
+
+export function insertScheduledMessage(
+  storage: DurableObjectStorage,
+  input: {
+    id: string;
+    memberId: string;
+    channelId: string;
+    threadRootId: string | null;
+    bodyMarkdown: string;
+    sendAt: number;
+    now: number;
+  },
+): void {
+  storage.sql.exec(
+    `INSERT INTO scheduled_messages(
+       id, member_id, channel_id, thread_root_id, body_markdown, send_at, status, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)`,
+    input.id,
+    input.memberId,
+    input.channelId,
+    input.threadRootId,
+    input.bodyMarkdown,
+    input.sendAt,
+    input.now,
+    input.now,
+  );
+}
+
+export function readScheduledMessage(
+  storage: DurableObjectStorage,
+  id: string,
+): ScheduledMessageRow | null {
+  const row = storage.sql
+    .exec<RawScheduled>(`SELECT ${SCHEDULED_COLUMNS} FROM scheduled_messages WHERE id = ?`, id)
+    .toArray()[0];
+  return row ? toScheduled(row) : null;
+}
+
+export function listScheduledForMember(
+  storage: DurableObjectStorage,
+  memberId: string,
+  limit: number,
+): ScheduledMessageRow[] {
+  return storage.sql
+    .exec<RawScheduled>(
+      `SELECT ${SCHEDULED_COLUMNS} FROM scheduled_messages
+       WHERE member_id = ? ORDER BY send_at ASC, id ASC LIMIT ?`,
+      memberId,
+      limit,
+    )
+    .toArray()
+    .map(toScheduled);
+}
+
+/** Everything due at or before `now` that has not already been settled. */
+export function claimDueScheduledMessages(
+  storage: DurableObjectStorage,
+  now: number,
+  limit: number,
+): ScheduledMessageRow[] {
+  return storage.sql
+    .exec<RawScheduled>(
+      `SELECT ${SCHEDULED_COLUMNS} FROM scheduled_messages
+       WHERE status = 'scheduled' AND send_at <= ? ORDER BY send_at ASC, id ASC LIMIT ?`,
+      now,
+      limit,
+    )
+    .toArray()
+    .map(toScheduled);
+}
+
+export function nextScheduledSendAt(storage: DurableObjectStorage): number | null {
+  return storage.sql
+    .exec<{ send_at: number | null }>(
+      "SELECT MIN(send_at) AS send_at FROM scheduled_messages WHERE status = 'scheduled'",
+    )
+    .one().send_at;
+}
+
+export function updateScheduledMessage(
+  storage: DurableObjectStorage,
+  id: string,
+  changes: { bodyMarkdown?: string; sendAt?: number },
+  now: number,
+): boolean {
+  const sets: string[] = [];
+  const bindings: unknown[] = [];
+  if (changes.bodyMarkdown !== undefined) {
+    sets.push("body_markdown = ?");
+    bindings.push(changes.bodyMarkdown);
+  }
+  if (changes.sendAt !== undefined) {
+    sets.push("send_at = ?");
+    bindings.push(changes.sendAt);
+  }
+  if (sets.length === 0) return false;
+  sets.push("updated_at = ?");
+  bindings.push(now, id);
+  return (
+    storage.sql.exec(
+      `UPDATE scheduled_messages SET ${sets.join(", ")} WHERE id = ? AND status = 'scheduled'`,
+      ...bindings,
+    ).rowsWritten > 0
+  );
+}
+
+/** Settling is conditional on still being scheduled, so a duplicate alarm is a no-op. */
+export function settleScheduledMessage(
+  storage: DurableObjectStorage,
+  id: string,
+  outcome:
+    | { status: "sent"; messageId: string }
+    | { status: "cancelled" }
+    | { status: "failed"; reason: string },
+  now: number,
+): boolean {
+  return (
+    storage.sql.exec(
+      `UPDATE scheduled_messages
+       SET status = ?, sent_message_id = ?, failure_reason = ?, updated_at = ?
+       WHERE id = ? AND status = 'scheduled'`,
+      outcome.status,
+      outcome.status === "sent" ? outcome.messageId : null,
+      outcome.status === "failed" ? outcome.reason : null,
+      now,
+      id,
+    ).rowsWritten > 0
+  );
+}

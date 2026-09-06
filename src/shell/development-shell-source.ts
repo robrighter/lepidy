@@ -38,7 +38,7 @@ export class DevelopmentShellSource implements WorkspaceShellSource {
           { id: "agent-triage", handle: "a.triage", displayName: "Triage", status: "active" },
         ],
         storageMode: "local_host",
-        schemaVersion: 11,
+        schemaVersion: 12,
       },
     };
   }
