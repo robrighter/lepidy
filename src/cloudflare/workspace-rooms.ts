@@ -321,12 +321,22 @@ export function insertMessage(
     channelSequence: number;
     now: number;
   },
-): void {
+): { threadSequence: number | null } {
+  const threadSequence =
+    message.threadRootId === null
+      ? null
+      : (storage.sql
+          .exec<{ reply_count: number }>(
+            "SELECT reply_count FROM messages WHERE id = ?",
+            message.threadRootId,
+          )
+          .one().reply_count ?? 0) + 1;
+
   storage.sql.exec(
     `INSERT INTO messages(
        id, channel_id, thread_root_id, author_kind, author_id, author_display_snapshot,
-       body_markdown, created_at, channel_sequence
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       body_markdown, created_at, channel_sequence, thread_sequence
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     message.id,
     message.channelId,
     message.threadRootId,
@@ -336,6 +346,7 @@ export function insertMessage(
     message.bodyMarkdown,
     message.now,
     message.channelSequence,
+    threadSequence,
   );
   storage.sql.exec(
     `UPDATE channels SET message_count = message_count + 1, last_activity_at = ?, updated_at = ?
@@ -351,6 +362,7 @@ export function insertMessage(
       message.threadRootId,
     );
   }
+  return { threadSequence };
 }
 
 /**
@@ -441,4 +453,148 @@ function page(rows: readonly RawMessage[], size: number): MessagePage {
     nextCursor:
       hasMore && last ? encodeHistoryCursor({ createdAt: last.createdAt, id: last.id }) : null,
   };
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Read cursors                                                                */
+/* -------------------------------------------------------------------------- */
+
+export function readChannelCursor(
+  storage: DurableObjectStorage,
+  channelId: string,
+  memberId: string,
+): number {
+  return (
+    storage.sql
+      .exec<{ last_read_sequence: number }>(
+        "SELECT last_read_sequence FROM channel_read_state WHERE channel_id = ? AND member_id = ?",
+        channelId,
+        memberId,
+      )
+      .toArray()[0]?.last_read_sequence ?? 0
+  );
+}
+
+export function writeChannelCursor(
+  storage: DurableObjectStorage,
+  channelId: string,
+  memberId: string,
+  sequence: number,
+  now: number,
+): void {
+  storage.sql.exec(
+    `INSERT INTO channel_read_state(channel_id, member_id, last_read_sequence, last_read_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(channel_id, member_id) DO UPDATE SET
+       last_read_sequence = excluded.last_read_sequence,
+       last_read_at = excluded.last_read_at`,
+    channelId,
+    memberId,
+    sequence,
+    now,
+  );
+}
+
+export function readThreadCursor(
+  storage: DurableObjectStorage,
+  threadRootId: string,
+  memberId: string,
+): number {
+  return (
+    storage.sql
+      .exec<{ last_read_sequence: number }>(
+        "SELECT last_read_sequence FROM thread_read_state WHERE thread_root_id = ? AND member_id = ?",
+        threadRootId,
+        memberId,
+      )
+      .toArray()[0]?.last_read_sequence ?? 0
+  );
+}
+
+export function writeThreadCursor(
+  storage: DurableObjectStorage,
+  threadRootId: string,
+  memberId: string,
+  sequence: number,
+  now: number,
+): void {
+  storage.sql.exec(
+    `INSERT INTO thread_read_state(thread_root_id, member_id, last_read_sequence, last_read_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(thread_root_id, member_id) DO UPDATE SET
+       last_read_sequence = excluded.last_read_sequence,
+       last_read_at = excluded.last_read_at`,
+    threadRootId,
+    memberId,
+    sequence,
+    now,
+  );
+}
+
+/** Every visible room with its latest sequence and this member's cursor. */
+export function readUnreadFacts(
+  storage: DurableObjectStorage,
+  memberId: string,
+): {
+  channelId: string;
+  kind: ChannelRow["kind"];
+  archivedAt: number | null;
+  isMember: boolean;
+  latestSequence: number;
+  lastReadSequence: number;
+}[] {
+  return storage.sql
+    .exec<{
+      channel_id: string;
+      kind: ChannelRow["kind"];
+      archived_at: number | null;
+      is_member: number;
+      latest_sequence: number;
+      last_read_sequence: number;
+    }>(
+      `SELECT c.id AS channel_id, c.kind, c.archived_at,
+              CASE WHEN cm.member_id IS NULL THEN 0 ELSE 1 END AS is_member,
+              COALESCE((SELECT MAX(channel_sequence) FROM messages m
+                        WHERE m.channel_id = c.id AND m.thread_root_id IS NULL), 0) AS latest_sequence,
+              COALESCE(rs.last_read_sequence, 0) AS last_read_sequence
+       FROM channels c
+       LEFT JOIN channel_members cm ON cm.channel_id = c.id AND cm.member_id = ?
+       LEFT JOIN channel_read_state rs ON rs.channel_id = c.id AND rs.member_id = ?
+       WHERE c.kind = 'public' OR cm.member_id IS NOT NULL
+       ORDER BY c.id`,
+      memberId,
+      memberId,
+    )
+    .toArray()
+    .map((row) => ({
+      channelId: row.channel_id,
+      kind: row.kind,
+      archivedAt: row.archived_at,
+      isMember: row.is_member === 1,
+      latestSequence: row.latest_sequence,
+      lastReadSequence: row.last_read_sequence,
+    }));
+}
+
+export function latestChannelSequence(storage: DurableObjectStorage, channelId: string): number {
+  return (
+    storage.sql
+      .exec<{ latest: number | null }>(
+        "SELECT MAX(channel_sequence) AS latest FROM messages WHERE channel_id = ? AND thread_root_id IS NULL",
+        channelId,
+      )
+      .one().latest ?? 0
+  );
+}
+
+export function latestThreadSequence(storage: DurableObjectStorage, threadRootId: string): number {
+  return (
+    storage.sql
+      .exec<{ latest: number | null }>(
+        "SELECT MAX(thread_sequence) AS latest FROM messages WHERE thread_root_id = ?",
+        threadRootId,
+      )
+      .one().latest ?? 0
+  );
 }

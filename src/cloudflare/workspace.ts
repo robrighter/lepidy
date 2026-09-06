@@ -52,6 +52,24 @@ import {
   type ChannelKind,
 } from "../domain/rooms";
 import {
+  canReceiveChannelEvent,
+  canSeeChannel,
+  type ChannelVisibility,
+} from "../domain/visibility";
+import {
+  PRESENCE_TTL_MS,
+  advanceReadCursor,
+  summariseUnread,
+  type UnreadSummary,
+} from "../domain/read-state";
+import {
+  SOCKET_PING,
+  SOCKET_PONG,
+  encodeServerFrame,
+  parseClientFrame,
+  type ServerFrame,
+} from "../domain/socket-protocol";
+import {
   addChannelMembers,
   archiveChannel,
   channelMemberIds,
@@ -65,8 +83,15 @@ import {
   readChannel,
   readChannelByDirectMessageKey,
   readChannelBySlug,
+  latestChannelSequence,
+  latestThreadSequence,
+  readChannelCursor,
   readMessage,
+  readThreadCursor,
+  readUnreadFacts,
   removeChannelMember,
+  writeChannelCursor,
+  writeThreadCursor,
   type ChannelRow,
   type MessagePage,
 } from "./workspace-rooms";
@@ -185,6 +210,15 @@ export type SentMessage = {
   replayed: boolean;
 };
 
+/** What a hibernated socket remembers about itself. */
+export type SocketAttachment = {
+  memberId: string;
+  authorizationEpoch: number;
+  /** Highest replay sequence this socket has been sent. */
+  cursor: number;
+  connectedAt: number;
+};
+
 /** Roles that may create rooms. A guest joins what they are invited to. */
 const ROOM_CREATOR_ROLES: ReadonlySet<MemberProjection["role"]> = new Set(["owner", "admin", "member"]);
 
@@ -209,6 +243,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       // An evicted object loses nothing: the alarm is rebuilt from durable state.
       await this.armAlarm();
     });
+
+    // Keepalives are answered by the runtime without waking this object, so a
+    // room full of idle tabs costs nothing and writes nothing.
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(SOCKET_PING, SOCKET_PONG));
   }
 
   health(): WorkspaceHealth {
@@ -232,8 +270,29 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     if (!this.authorizeMember(memberId, authorizationEpoch)) {
       return new Response("Forbidden", { status: 403 });
     }
+    const since = Number(url.searchParams.get("since") ?? "0");
+    const now = Date.now();
     const pair = new WebSocketPair();
+    // The tag is how a woken socket is recognised after hibernation; the
+    // attachment carries the rest and survives with it.
     this.ctx.acceptWebSocket(pair[1], [memberId]);
+    const attachment: SocketAttachment = {
+      memberId,
+      authorizationEpoch,
+      cursor: Number.isSafeInteger(since) && since >= 0 ? since : 0,
+      connectedAt: now,
+    };
+    pair[1].serializeAttachment(attachment);
+
+    this.sendFrame(pair[1], {
+      type: "welcome",
+      memberId,
+      sequence: this.latestReplaySequence(),
+      presence: this.onlineMemberIds(),
+    });
+    if (attachment.cursor > 0) this.replayForSocket(pair[1], attachment, attachment.cursor);
+    this.broadcastPresence(memberId, true);
+
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -704,6 +763,328 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }
 
   /* ------------------------------------------------------------------ */
+  /* Live delivery, read state and presence (C03)                        */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Frames arrive after authentication but decide nothing about who is acting:
+   * the actor comes from the socket's own attachment, never from the payload.
+   * Nothing here writes storage except an actual read-cursor advance.
+   */
+  webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {
+    const attachment = this.attachmentOf(socket);
+    if (attachment === null) {
+      socket.close(4001, "socket has no identity");
+      return;
+    }
+    // Authority is rechecked live, so a revoked member's open tab stops working.
+    if (!this.authorizeMember(attachment.memberId, attachment.authorizationEpoch)) {
+      socket.close(4003, "membership authority changed");
+      return;
+    }
+
+    const frame = parseClientFrame(typeof message === "string" ? message : null);
+    switch (frame.type) {
+      case "invalid":
+        this.sendFrame(socket, { type: "error", reason: frame.reason });
+        return;
+      case "resume":
+        this.replayForSocket(socket, attachment, frame.since);
+        return;
+      case "read":
+        this.applyChannelRead(socket, attachment, frame.channelId, frame.sequence, Date.now());
+        return;
+      case "thread_read":
+        this.applyThreadRead(socket, attachment, frame.threadRootId, frame.sequence, Date.now());
+        return;
+      case "typing":
+        // Ephemeral by design: typing is relayed and never stored.
+        this.relayTyping(attachment, frame.channelId, Date.now());
+        return;
+    }
+  }
+
+  webSocketClose(socket: WebSocket): void {
+    const attachment = this.attachmentOf(socket);
+    if (attachment === null) return;
+    if (this.socketsFor(attachment.memberId).length <= 1) {
+      this.broadcastPresence(attachment.memberId, false);
+    }
+  }
+
+  webSocketError(socket: WebSocket): void {
+    this.webSocketClose(socket);
+  }
+
+  /** Members with at least one live socket. Derived, never written down. */
+  onlineMemberIds(): string[] {
+    const ids = new Set<string>();
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = this.attachmentOf(socket);
+      if (attachment) ids.add(attachment.memberId);
+    }
+    return [...ids].sort();
+  }
+
+  presence(): { memberIds: readonly string[]; ttlMs: number } {
+    return { memberIds: this.onlineMemberIds(), ttlMs: PRESENCE_TTL_MS };
+  }
+
+  /** A cursor per member per room: reading on the phone reads on the laptop. */
+  markChannelRead(input: {
+    actor: Actor;
+    channelId: string;
+    sequence: number;
+    now: number;
+  }): { sequence: number } {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireVisibleChannel(input.channelId, actor.id);
+    const sequence = this.advanceChannelCursor(channel.id, actor.id, input.sequence, input.now);
+    this.broadcastToMember(actor.id, { type: "read", channelId: channel.id, sequence });
+    return { sequence };
+  }
+
+  /** Thread read state is separate from the channel's, as the product promises. */
+  markThreadRead(input: {
+    actor: Actor;
+    threadRootId: string;
+    sequence: number;
+    now: number;
+  }): { sequence: number } {
+    const actor = this.authorizeActor(input.actor);
+    const root = readMessage(this.ctx.storage, input.threadRootId);
+    if (root === null || root.threadRootId !== null) throw new Error("thread not found");
+    this.requireVisibleChannel(root.channelId, actor.id);
+    const sequence = this.advanceThreadCursor(root.id, actor.id, input.sequence, input.now);
+    this.broadcastToMember(actor.id, { type: "thread_read", threadRootId: root.id, sequence });
+    return { sequence };
+  }
+
+  unreadSummary(input: { actor: Actor }): UnreadSummary {
+    const actor = this.authorizeActor(input.actor);
+    return summariseUnread(readUnreadFacts(this.ctx.storage, actor.id));
+  }
+
+  /* -- realtime internals ---------------------------------------------- */
+
+  private attachmentOf(socket: WebSocket): SocketAttachment | null {
+    const raw = socket.deserializeAttachment() as SocketAttachment | null;
+    return raw && typeof raw.memberId === "string" ? raw : null;
+  }
+
+  private socketsFor(memberId: string): WebSocket[] {
+    return this.ctx.getWebSockets(memberId);
+  }
+
+  private sendFrame(socket: WebSocket, frame: ServerFrame): void {
+    try {
+      socket.send(encodeServerFrame(frame));
+    } catch {
+      // A socket that has gone away is not an error worth failing a write for.
+    }
+  }
+
+  private latestReplaySequence(): number {
+    return (
+      this.ctx.storage.sql
+        .exec<{ sequence: number | null }>("SELECT MAX(sequence) AS sequence FROM replay_events")
+        .one().sequence ?? 0
+    );
+  }
+
+  private oldestReplaySequence(): number {
+    return (
+      this.ctx.storage.sql
+        .exec<{ sequence: number | null }>("SELECT MIN(sequence) AS sequence FROM replay_events")
+        .one().sequence ?? 0
+    );
+  }
+
+  /**
+   * Replay from the client's cursor, filtered through the same visibility rule
+   * the query path uses. A cursor older than the retention window is answered
+   * with a reset rather than a silent gap.
+   */
+  private replayForSocket(socket: WebSocket, attachment: SocketAttachment, since: number): void {
+    const oldest = this.oldestReplaySequence();
+    if (oldest > 0 && since > 0 && since < oldest - 1) {
+      this.sendFrame(socket, { type: "reset", reason: "replay window has expired" });
+      this.updateAttachment(socket, { ...attachment, cursor: this.latestReplaySequence() });
+      return;
+    }
+
+    const rows = this.ctx.storage.sql
+      .exec<{ sequence: number; kind: string; audience_json: string; payload_json: string }>(
+        "SELECT sequence, kind, audience_json, payload_json FROM replay_events WHERE sequence > ? ORDER BY sequence",
+        since,
+      )
+      .toArray();
+
+    let cursor = Math.max(attachment.cursor, since);
+    for (const row of rows) {
+      const audience = JSON.parse(row.audience_json) as string[];
+      const channelId = audience[0] ?? "";
+      // Re-check now, against current membership: an event stored while the
+      // member could see the room must not be replayed after they left it.
+      if (!this.socketMaySee(channelId, attachment.memberId)) {
+        cursor = Math.max(cursor, row.sequence);
+        continue;
+      }
+      this.sendFrame(socket, {
+        type: "event",
+        sequence: row.sequence,
+        kind: row.kind,
+        channelId,
+        payload: JSON.parse(row.payload_json) as unknown,
+      });
+      cursor = Math.max(cursor, row.sequence);
+    }
+    this.updateAttachment(socket, { ...attachment, cursor });
+  }
+
+  private updateAttachment(socket: WebSocket, attachment: SocketAttachment): void {
+    try {
+      socket.serializeAttachment(attachment);
+    } catch {
+      // A closing socket cannot carry state forward, and does not need to.
+    }
+  }
+
+  private socketMaySee(channelId: string, memberId: string): boolean {
+    const channel = readChannel(this.ctx.storage, channelId);
+    if (channel === null) return false;
+    return canReceiveChannelEvent(this.channelVisibility(channel, memberId));
+  }
+
+  private channelVisibility(channel: ChannelRow, memberId: string): ChannelVisibility {
+    return {
+      kind: channel.kind,
+      archivedAt: channel.archivedAt,
+      isMember: isChannelMember(this.ctx.storage, channel.id, memberId),
+    };
+  }
+
+  /**
+   * Persist, then broadcast, filtered per socket. A client can never be told
+   * about a message that is not already durable.
+   */
+  private broadcastChannelEvent(
+    channel: ChannelRow,
+    sequence: number,
+    kind: string,
+    payload: unknown,
+  ): void {
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = this.attachmentOf(socket);
+      if (attachment === null) continue;
+      if (!this.authorizeMember(attachment.memberId, attachment.authorizationEpoch)) continue;
+      if (!canReceiveChannelEvent(this.channelVisibility(channel, attachment.memberId))) continue;
+      this.sendFrame(socket, { type: "event", sequence, kind, channelId: channel.id, payload });
+      this.updateAttachment(socket, { ...attachment, cursor: Math.max(attachment.cursor, sequence) });
+    }
+  }
+
+  private broadcastToMember(memberId: string, frame: ServerFrame): void {
+    for (const socket of this.socketsFor(memberId)) this.sendFrame(socket, frame);
+  }
+
+  private broadcastPresence(memberId: string, online: boolean): void {
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = this.attachmentOf(socket);
+      if (attachment === null || attachment.memberId === memberId) continue;
+      this.sendFrame(socket, { type: "presence", memberId, online });
+    }
+  }
+
+  private relayTyping(attachment: SocketAttachment, channelId: string, now: number): void {
+    const channel = readChannel(this.ctx.storage, channelId);
+    if (channel === null) return;
+    if (!canSeeChannel(this.channelVisibility(channel, attachment.memberId))) return;
+    for (const socket of this.ctx.getWebSockets()) {
+      const other = this.attachmentOf(socket);
+      if (other === null || other.memberId === attachment.memberId) continue;
+      if (!canReceiveChannelEvent(this.channelVisibility(channel, other.memberId))) continue;
+      this.sendFrame(socket, {
+        type: "typing",
+        channelId: channel.id,
+        memberId: attachment.memberId,
+        at: now,
+      });
+    }
+  }
+
+  private applyChannelRead(
+    socket: WebSocket,
+    attachment: SocketAttachment,
+    channelId: string,
+    requested: number,
+    now: number,
+  ): void {
+    const channel = readChannel(this.ctx.storage, channelId);
+    if (channel === null || !canSeeChannel(this.channelVisibility(channel, attachment.memberId))) {
+      this.sendFrame(socket, { type: "error", reason: "channel not found" });
+      return;
+    }
+    const sequence = this.advanceChannelCursor(channel.id, attachment.memberId, requested, now);
+    this.broadcastToMember(attachment.memberId, { type: "read", channelId: channel.id, sequence });
+  }
+
+  private applyThreadRead(
+    socket: WebSocket,
+    attachment: SocketAttachment,
+    threadRootId: string,
+    requested: number,
+    now: number,
+  ): void {
+    const root = readMessage(this.ctx.storage, threadRootId);
+    if (root === null || root.threadRootId !== null) {
+      this.sendFrame(socket, { type: "error", reason: "thread not found" });
+      return;
+    }
+    const channel = readChannel(this.ctx.storage, root.channelId);
+    if (channel === null || !canSeeChannel(this.channelVisibility(channel, attachment.memberId))) {
+      this.sendFrame(socket, { type: "error", reason: "thread not found" });
+      return;
+    }
+    const sequence = this.advanceThreadCursor(root.id, attachment.memberId, requested, now);
+    this.broadcastToMember(attachment.memberId, {
+      type: "thread_read",
+      threadRootId: root.id,
+      sequence,
+    });
+  }
+
+  private advanceChannelCursor(
+    channelId: string,
+    memberId: string,
+    requested: number,
+    now: number,
+  ): number {
+    return this.ctx.storage.transactionSync(() => {
+      const current = readChannelCursor(this.ctx.storage, channelId, memberId);
+      const latest = latestChannelSequence(this.ctx.storage, channelId);
+      const next = advanceReadCursor(current, requested, latest);
+      if (next !== current) writeChannelCursor(this.ctx.storage, channelId, memberId, next, now);
+      return next;
+    });
+  }
+
+  private advanceThreadCursor(
+    threadRootId: string,
+    memberId: string,
+    requested: number,
+    now: number,
+  ): number {
+    return this.ctx.storage.transactionSync(() => {
+      const current = readThreadCursor(this.ctx.storage, threadRootId, memberId);
+      const latest = latestThreadSequence(this.ctx.storage, threadRootId);
+      const next = advanceReadCursor(current, requested, latest);
+      if (next !== current) writeThreadCursor(this.ctx.storage, threadRootId, memberId, next, now);
+      return next;
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Rooms, direct messages and message writes (C02)                     */
   /* ------------------------------------------------------------------ */
 
@@ -1030,6 +1411,19 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         };
       },
     );
+
+    // Persist, then broadcast: the write is already durable, and the ordering
+    // clients observe is the ordering the database has.
+    if (!outcome.replayed) {
+      this.broadcastChannelEvent(channel, this.latestReplaySequence(), "message.created", {
+        messageId: outcome.result.messageId,
+        channelId: channel.id,
+        threadRootId: outcome.result.threadRootId,
+        channelSequence: outcome.result.channelSequence,
+        authorId: actor.id,
+        createdAt: input.now,
+      });
+    }
     return { ...outcome.result, replayed: outcome.replayed };
   }
 
@@ -1116,8 +1510,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   private requireVisibleChannel(channelId: string, memberId: string): ChannelRow {
     const channel = readChannel(this.ctx.storage, channelId);
     if (channel === null) throw new Error("channel not found");
-    if (channel.kind === "public") return channel;
-    if (!isChannelMember(this.ctx.storage, channel.id, memberId)) throw new Error("channel not found");
+    if (!canSeeChannel(this.channelVisibility(channel, memberId))) throw new Error("channel not found");
     return channel;
   }
 

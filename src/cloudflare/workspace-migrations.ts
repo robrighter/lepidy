@@ -353,6 +353,32 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
          ON messages(channel_id, channel_sequence) WHERE channel_sequence IS NOT NULL`,
     ],
   },
+  {
+    version: 9,
+    name: "read cursors and thread sequences",
+    statements: [
+      `ALTER TABLE messages ADD COLUMN thread_sequence INTEGER`,
+      `CREATE UNIQUE INDEX messages_thread_sequence_idx
+         ON messages(thread_root_id, thread_sequence) WHERE thread_sequence IS NOT NULL`,
+      // A cursor per member per room, so reading on one device reads on all.
+      `CREATE TABLE channel_read_state (
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        last_read_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_read_sequence >= 0),
+        last_read_at INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, member_id)
+      ) STRICT`,
+      `CREATE INDEX channel_read_state_member_idx ON channel_read_state(member_id)`,
+      `CREATE TABLE thread_read_state (
+        thread_root_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        last_read_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_read_sequence >= 0),
+        last_read_at INTEGER NOT NULL,
+        PRIMARY KEY (thread_root_id, member_id)
+      ) STRICT`,
+      `CREATE INDEX thread_read_state_member_idx ON thread_read_state(member_id)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {
