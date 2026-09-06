@@ -24,7 +24,7 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [ ] | D02 | Runner and queue contract | — | S2,S3,V2 | Resolve designated runner/concurrency, leases/fencing, completion, retries, idle timeout, disconnect policy and session-token scope. | todo | — | — | — | — |
 | [ ] | D03 | MCP waiting and harness spike | F01,F03,D02 | S3,V2 | Demonstrate repeated work in one harness without a permanently parked workspace request; measure idle duration and test cancellation/reconnect. | todo | — | — | — | — |
 | [x] | D04 | Vault and approval contract | D01 | V1,V4 | Specify ACL union/intersection, provenance binding, signed project/device claims, step-up matrix, batch approvals and grant expiry semantics. | done | /root | 2026-09-06 | 2026-09-06 | [D04](#d04--vault-and-approval-contract) |
-| [ ] | D05 | Vault sharing and release contract | D04,D05a | V4 | Resolve device-mediated delivery, browser trust, per-owner wraps, removal/rekey and lost-device behavior while preserving user-held root custody. | in_progress | /root | 2026-09-06 | — | — |
+| [x] | D05 | Vault sharing and release contract | D04,D05a | V4 | Resolve device-mediated delivery, browser trust, per-owner wraps, removal/rekey and lost-device behavior while preserving user-held root custody. | done | /root | 2026-09-06 | 2026-09-06 | [D05](#d05--vault-sharing-and-release-contract) |
 | [x] | D05a | Local execution and vault-root invariants | D01,D08a | V1,V2,V4 | Specify and reconcile local-only runner configuration plus client-generated vault unlock/recovery material that never reaches Lepidy; add schema/protocol negative tests. | done | /root | 2026-09-06 | 2026-09-06 | [D05a](#d05a--local-execution-and-vault-root-invariants) |
 | [ ] | D06 | Cloud and custom contract spike | F01 | S3 | Verify provider auth, APIs, signed callbacks, schedule budgets and reconciliation; custom replay/SSRF boundaries; record supported capabilities. | todo | — | — | — | — |
 | [ ] | D07 | Retention/residency/recovery contract | — | V4 | Specify retention by data class, export/delete/restore, EU scope, audit anchors and archive-search design. | todo | — | — | — | — |
@@ -36,7 +36,7 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [x] | F03 | Workspace storage and migrations | F01,D01 | S2 | Create D1 control plane and per-workspace SQLite schema; singleton migration version, atomic progression, quarantine and historical-fixture tests. | done | /root | 2026-09-05 | 2026-09-05 | [F03](#f03--workspace-storage-and-migrations) |
 | [ ] | F03b | Solo host content store and encrypted relay | F03,D08a,F05 | V2,V4,S2 | Implement host SQLite content schema, authenticated encrypted frames, commit-before-ack idempotency, offline errors, host-epoch fencing, transfer and Team-upgrade migration. | todo | — | — | — | — | — |
 | [x] | F04 | Identity and workspace onboarding | F03,D01,D08a | S1,S2 | Implement verified accounts, password/passkey/Google/email-link methods, safe linking, local-host or cloud workspace creation, invitations, roles and last-admin protection. | done | /root | 2026-09-05 | 2026-09-06 | [F04](#f04--identity-and-workspace-onboarding) |
-| [ ] | F05 | Session/device authorization | F04,D04 | S3,V2 | Revocable browser/device credentials, request signing/replay protection, authoritative membership checks and socket revocation; separate runner lifecycle. | todo | — | — | — | — |
+| [ ] | F05 | Session/device authorization | F04,D04 | S3,V2 | Revocable browser/device credentials, request signing/replay protection, authoritative membership checks and socket revocation; separate runner lifecycle. | in_progress | /root | 2026-09-06 | — | — |
 | [ ] | F06 | Alarm scheduler, outbox and audit baseline | F03,D07 | V4 | Multiplex due work; transactional pending events, idempotent retry/replay and audit; test restart, duplicates and competing deadlines. | todo | — | — | — | — |
 | [ ] | C01 | Tauri-compatible branded shell | F04 | S1 | Implement shell/navigation/theme/profile basics from mockups, Next.js data adapters, responsive layouts and desktop layout boundary. | todo | — | — | — | — |
 | [ ] | C02 | Channels, DMs and message writes | F05,F06,F03b,C01 | S1,S2 | Public/private rooms, membership, group DMs, threads and idempotent send against the plan authority; transactions include replay/outbox; authorized history reads. | todo | — | — | — | — |
@@ -84,6 +84,16 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [ ] | G05 | Release documentation and final decision | G01,G02,G03,G04,O03 | — | Reconcile PRD/HLD/mockups, publish-ready docs/marketing and support runbooks, enumerate accepted deferrals and external reviews; release only with required authorization. | todo | — | — | — | — |
 
 ## Evidence records
+
+### D05 — Vault sharing and release contract
+
+- Task / owner: D05 / `/root`
+- Status / dates: done / 2026-09-06 to 2026-09-06
+- Decision delivered: native-client account vault and P-256 wrapping keys; per-credential, per-custodian DEK wraps with no server wrap; explicit custodian addition; credential re-encryption/rekey on removal; final-custodian guard; native-only setup/recovery/value/reveal operations; same-device and encrypted cross-device injection; device-mediated HTTP use; epoch-bound loss, restore and deletion behavior. Team availability still requires an online unlocked release device.
+- Changed files: `docs/vault-sharing-release-contract.md`, `docs/vault-key-recovery-contract.md`, `docs/vault-authorization-contract.md`, `PRD.md`, `HLD.md`, `IMPLEMENTATION-PLAN.md`, `TESTING.md`, `markups/credential.html`, `markups/vault.html`, mockup browser coverage and `IMPLEMENTATION-LEDGER.md`.
+- Security boundary: remotely delivered browser/PWA code has no vault root or plaintext API. Workspace administrators can freeze/revoke/delete ciphertext but gain no cryptographic custody. Removing a custodian cannot erase previously observed plaintext, and the product does not claim that it can.
+- Verification: `npm run verify:local` passed with 39 Worker/D1/SQLite/pure tests, 12 desktop/mobile browser tests including native-only reveal copy, TypeScript, production Next.js/OpenNext/Wrangler builds, zero production dependency vulnerabilities and native Windows Tauri compilation.
+- Limitations / follow-ups: V01/V07 implement and exercise the cryptographic envelopes, enrollment, recovery, rekey and lost-device scenarios. V02/V06 implement the two release paths. The contract chooses P-256 ECDH for broad native/WebCrypto support; implementation must version the suite and verify platform interoperability.
 
 ### D04 — Vault and approval contract
 

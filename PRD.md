@@ -517,21 +517,24 @@ All primitives are available in the trusted client. The cloud never executes the
 ```
   Account Vault Key (AVK)          32B random, generated and retained on trusted clients
     │
-    ├─ wraps ─▶ per-credential DEK ──▶ AES-256-GCM(credential value)
-    │                                  AAD = workspace_id ‖ credential_id ‖ version
+    ├─ encrypts ─▶ account wrapping private key
+    │                    │
+    │                    └─ opens custodian-specific credential DEK wraps
+    │                                      │
+    │                                      └─ AES-256-GCM(credential value)
+    │                                         AAD = workspace_id ‖ credential_id ‖ version
     │
     ├─ device-specific wrap ──────▶ enrolled device secure storage
-    │
-    └─ recovery wrap ─────────────▶ encrypted recovery package stored in cloud
+    └─ recovery wrap ─────────────▶ encrypted AVK recovery package stored in cloud
          ▲
          └─ recovery-code-derived key; recovery code is shown once and user-held
 ```
 
-- **A random DEK per credential, rotated on every value change.** Envelope encryption bounds a single-key compromise to one credential and lets the user rotate the AVK by rewrapping keys instead of credential bodies.
+- **A random DEK per credential version, wrapped independently to each explicit custodian.** Adding a custodian adds a public-key wrap. Removing one creates a new DEK/value version and wraps it only to the remaining custodians. The full sharing and release protocol is in the [vault sharing contract](./docs/vault-sharing-release-contract.md).
 - **AAD binds the tuple** so a ciphertext cannot be moved between credentials or workspaces.
 - **AES-256-GCM, 96-bit random IV.** XChaCha20-Poly1305 would be the nicer nonce story, but it is not in WebCrypto and a WASM dependency in the decrypt path of a credential store is a worse trade than a fresh-key-per-version discipline.
 - **Recovery-code KDF work runs on the client.** Its salt and parameters may be stored with the encrypted recovery package; the recovery code and derived key may not.
-- **Platform secure storage is the preferred daily unlock path.** Passkey PRF or OS-bound key storage can protect a device wrap. The printable recovery code remains independent and mandatory during initial setup.
+- **Platform secure storage is the daily unlock path.** The signed native client protects device wraps with Windows Hello, Keychain/Touch ID or the supported Linux secret service and local OS verification. WebAuthn authorizes account actions but remotely served browser code never receives the AVK. The printable recovery code remains independent and mandatory during initial setup.
 
 ### 8.3 Disclosure — the most important design decision
 
@@ -549,9 +552,9 @@ Variants: `--with-file NAME:/path` materializes into a `0600` temp file deleted 
 
 **Tier 2 — `template`.** The agent writes a config referencing `${lepidy:NAME}`; the CLI resolves the placeholder at exec time. Small, and it removes a real category of "injection doesn't fit" cases.
 
-**Tier 3 — `reveal`.** Returns plaintext into the agent's context via the MCP `request_secret` tool. **Off by default, per-credential opt-in**, and the toggle's warning says exactly what it means in the user's own words: *"this value will be sent to your model provider and written to your session transcript on disk."*
+**Tier 3 — `reveal`.** Shows plaintext only inside a signed native client after fresh user verification and local unlock. It is **off by default and requires separate `use + reveal` rights**. V1 has no MCP endpoint that returns credential plaintext and no remote web page receives it.
 
-**Reveal-once — the pressure valve.** A strict inject-only default is only tolerable with a clean escape hatch that doesn't erode it. Reveal-once is a **button in the Lepidy UI, not an MCP tool**: it pushes a value into the requesting session one time without changing the credential's stored policy. The human initiates it; the agent cannot request it; it leaves an audit entry marked `reveal_once`. This is what someone reaches for instead of permanently flipping `allow_reveal` on and forgetting.
+**Reveal-once — the pressure valve.** Reveal-once is a button in the signed native vault UI, never an MCP tool. It displays the value locally one time without changing stored policy. The human initiates it and the audit records `reveal_once`; copying it into another system is an explicit human action outside Lepidy's protected injection path.
 
 **Tier 0 — device-mediated `proxy`.** An agent calls Lepidy deliberately:
 
@@ -570,7 +573,7 @@ The normative ACL composition, delegation intersection, signed device/project cl
 
 `agent-vault` identifies its caller with `SO_PEERCRED` over a unix socket. Over a network there is no such thing, so identity is established once, deliberately, in a browser:
 
-**Device registration.** `lepidy login` opens a browser, the human authenticates, and the CLI receives a device-bound credential (an audience-scoped token, with a device keypair for request signing). The device gets a name, an owner, a first-seen and last-seen time, and a **revoke button in Settings that takes effect on the next request**. Every injected command names its project directory, so policy can be project-scoped exactly as the local version was.
+**Device registration.** `lepidy login` opens a browser, the human authenticates, and the CLI receives a device-bound credential with signing and ECDH public keys. The device gets a name, an owner, a first-seen and last-seen time, and a **revoke button in Settings that takes effect on the next request**. Every injected command names an opaque locally registered project id and configuration revision. Paths remain on the runner; approval surfaces may show its non-secret preset label.
 
 **A grant is `(credential, principal, disclosure, expiry, remaining_uses)`** where the principal is the tuple `(user, device, project, agent?)`. Semantics, because "TTL" is ambiguous:
 
@@ -1125,21 +1128,28 @@ CREATE TABLE credentials (
   name          text NOT NULL,               -- 'GITHUB_TOKEN'
   description   text,                        -- shown to agents; never the value
   env_var       text,                        -- defaults to name
-  tier          text NOT NULL DEFAULT 'server' CHECK (tier IN ('server','human_gated')),
   ciphertext    blob NOT NULL,               -- AES-256-GCM(DEK, value)
   iv            blob NOT NULL,
-  dek_wrapped   blob NOT NULL,               -- wrapped by the WDK
-  dek_vault_wrapped blob,                    -- server cannot unwrap this
+  key_epoch     integer NOT NULL DEFAULT 1,
   version       integer NOT NULL DEFAULT 1,
   tags          text,                        -- JSON array
   commands      text,                        -- JSON: ['gh','git push'] — drives hook coaching
   proxy_hosts   text,                        -- JSON: allowlist for Tier-0 proxy
   policy        text NOT NULL,               -- JSON: mode, allow_reveal, grant_ttl,
-                                             --       project_allowlist, max_uses_per_hour
+                                             --       opaque project ids, max_uses_per_hour
   expires_at    integer,                     -- the credential's own expiry → rotation nag
   created_by    text, created_at integer, updated_at integer,
   last_accessed integer, access_count integer NOT NULL DEFAULT 0,
   UNIQUE (name)
+);
+
+CREATE TABLE credential_key_wraps (          -- no server-decryptable wrap exists
+  credential_id text NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+  credential_version integer NOT NULL,
+  custodian_member_id text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  recipient_key_epoch integer NOT NULL,
+  wrapped_dek blob NOT NULL,                  -- sealed to custodian public wrapping key
+  PRIMARY KEY (credential_id, credential_version, custodian_member_id)
 );
 
 CREATE TABLE credential_acl (                -- who may use / reveal / manage

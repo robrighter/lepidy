@@ -431,8 +431,12 @@ Workspace content uses an immutable tenant-local `member_id`, never the global D
   Trusted client
        Account Vault Key (AVK), random 32 bytes
           │
-          ├─ wraps ─▶ per-credential DEK ──▶ AES-256-GCM(value)
-          │                                  AAD = ws ‖ cred ‖ version
+          ├─ encrypts ─▶ account ECDH private wrapping key
+          │                       │
+          │                       └─ opens custodian-specific DEK wraps
+          │                                            │
+          │                                            └─ AES-256-GCM(value)
+          │                                               AAD = ws ‖ cred ‖ version
           │
           ├─ device wrap ────────────────▶ enrolled device secure storage
           │
@@ -441,13 +445,13 @@ Workspace content uses an immutable tenant-local `member_id`, never the global D
                    └─ key derived locally from the user-held recovery code
 
   Lepidy cloud
-       ciphertext · wrapped DEKs · device/recovery wraps · salts · KDF parameters
+       ciphertext · public keys · custodian/device/recovery wraps · salts · KDF parameters
        no AVK · no recovery code · no recovery-derived key · no plaintext
 ```
 
-The AVK is generated on the first trusted client and never crosses a Lepidy transport. Setup creates a printable recovery code, derives a recovery key locally, uploads only an encrypted AVK recovery package, and requires the user to confirm that the code was saved. Enrollment creates a device-specific wrap through an authenticated client-to-client flow. Account password or provider recovery cannot substitute for either path.
+The AVK and account wrapping keypair are generated on the first signed native client and never cross a Lepidy transport in plaintext. Setup creates a printable recovery code, derives a recovery key locally, uploads only an encrypted AVK recovery package, and requires the user to confirm that the code was saved. Enrollment creates a device-specific wrap through an authenticated client-to-client flow. Credential DEKs are sealed separately to each explicit custodian's public wrapping key. Account password or provider recovery cannot substitute for vault recovery. The normative protocol is the [vault sharing and release contract](./docs/vault-sharing-release-contract.md).
 
-**Rotation.** An unlocked client creates a new AVK and rewraps credential DEKs and enrolled-device packages. Credential bodies remain untouched. The server coordinates versions and stores new ciphertext, but never sees either AVK. A stale device cannot publish an old wrap after the rotation epoch advances.
+**Rotation.** AVK rotation re-encrypts the account private wrapping key and device packages. Custodian removal creates a new credential DEK and ciphertext version because the former custodian may retain the old DEK. The server coordinates epochs and stores new ciphertext but never sees private keys, AVKs or DEKs. A stale device cannot publish an old wrap after the epoch advances.
 
 ### 9.2 Where the plaintext exists, exhaustively
 
@@ -456,9 +460,9 @@ The list must be short enough to state, or the design is wrong:
 1. In an unlocked trusted client, for the duration of a local decrypt.
 2. In the injecting child process's environment, on the user's own machine (`lepidy run`).
 3. In an outbound request header on an enrolled release device, for the duration of one fetch.
-4. In the browser, briefly, for explicit reveal and reveal-once.
+4. In a signed native client, briefly, for explicit reveal and reveal-once.
 
-**Nowhere else, and specifically:** never in a Worker, Durable Object, D1, KV, R2, Queue, server log, audit entry, FTS index, cloud broadcast, support tool or backup, and never in an MCP tool result unless the user explicitly permits reveal from an unlocked client.
+**Nowhere else, and specifically:** never in a Worker, Durable Object, D1, KV, R2, Queue, remotely served browser page, server log, audit entry, FTS index, cloud broadcast, support tool, backup or MCP tool result.
 
 ### 9.3 The device-mediated egress proxy (Tier 0)
 

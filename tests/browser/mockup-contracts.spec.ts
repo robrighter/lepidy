@@ -36,4 +36,6 @@ test("MOCKUP-SEC-003 explains user-held vault recovery and device-mediated use",
   await page.goto(`${mockups}/credential.html`);
   await expect(page.getByText("Only your devices can unlock this.")).toBeVisible();
   await expect(page.getByText(/An enrolled, unlocked device attaches the key/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Reveal in desktop app…" })).toBeVisible();
+  await expect(page.getByText(/Keys and plaintext never enter this remote page/)).toBeVisible();
 });

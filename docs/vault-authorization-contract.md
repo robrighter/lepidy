@@ -42,9 +42,9 @@ Connected agents use the current authenticated owner session and do not need an 
 
 | Operation | Required user presence |
 |---|---|
-| Automatic inject/file/device-proxy use | Valid signed device request and an unlocked release device; no new prompt |
+| Automatic inject/file/device-proxy use | Valid signed device request and an unlocked signed-native release device; no new prompt |
 | `ask` inject/file/device-proxy approval | Approver WebAuthn assertion with user verification, at most five minutes old and bound to the approval id/digest |
-| Reveal or reveal-once | Initiating human's fresh WebAuthn UV plus an unlocked client; an agent cannot initiate reveal-once |
+| Reveal or reveal-once | Initiating human's fresh WebAuthn UV plus an unlocked signed native client; an agent cannot initiate reveal-once |
 | Add/change credential value, policy, ACL or owners; delete; enroll/remove owner/device wrap; rotate/recover vault | Fresh WebAuthn UV and local vault unlock |
 | Turn agent access off, deny, revoke grant/device/delegation | No step-up; protective actions remain easy |
 | Turn agent access on | Fresh WebAuthn UV |

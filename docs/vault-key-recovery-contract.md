@@ -8,7 +8,7 @@ Lepidy never stores the user's vault unlock secret or recovery code. Cloud stora
 
 ## Key creation
 
-Vault setup runs in a trusted client. It generates a random account vault key and a high-entropy recovery code locally. The recovery code wraps the account vault key through a memory-hard derivation and authenticated encryption. A passkey PRF or a locally protected device key creates additional device wraps.
+Vault setup runs in a signed native client or local CLI. It generates a random account vault key and a high-entropy recovery code locally. The recovery code wraps the account vault key through a memory-hard derivation and authenticated encryption. Platform secure storage protects additional device wraps. Remotely served browser/PWA code never receives root key material.
 
 Only these values may reach Lepidy storage:
 
@@ -31,7 +31,7 @@ Account recovery and vault recovery are separate. Regaining an email account may
 
 Local injection is performed by an unlocked local host and plaintext stays in the target process environment for the required lifetime. A cloud or remote agent can use a protected credential only while an enrolled online client performs the credential-bearing operation itself or injects into its own local child process. Cloud relays handle authenticated ciphertext and policy metadata only; they never receive an operation key capable of unwrapping a credential.
 
-This decision removes the former server-root-key Tier A design. The proxy is device-mediated. D04 and D05 still need to settle multi-owner wrapping, approval scope and browser trust without weakening this root invariant.
+This decision removes the former server-root-key design. The proxy is device-mediated; multi-owner wrapping, native-client trust and release behavior are fixed by the [vault sharing and release contract](./vault-sharing-release-contract.md). Approval scope is fixed by the [vault authorization contract](./vault-authorization-contract.md).
 
 ## Required tests
 
