@@ -61,8 +61,9 @@ Test names use `<AREA>-INT-<number>` and include the identifier in the test titl
 | Identity and tenancy | D01, F04–F05, C07 | Sign-up/link/recovery, invite, last-admin guard, tenant mismatch across HTTP/socket/MCP, device revoke and cross-plane session termination. |
 | Chat | C01–C11 | Authorized send/read/edit/delete, idempotent writes, thread/read state, reconnect replay, responsive composer, drafts, notification rules, file visibility, search privacy, ranked queues and resumable import. |
 | Agents | D02–D06, A01–A05 | Reserved identities, enqueue/claim/lease/fence/complete, lost wake, crash/retry, delegation expiry, OAuth resource binding, cloud callbacks and duplicate external outcomes. |
-| Vault | D04–D05, V01–V08 | Every policy branch, ciphertext/AAD/versioning, requester-owner-approver provenance, first-decision-wins, expiry, revoke, local injection, cleanup, proxy SSRF/redirect cases, recovery and leak canaries. |
-| Runner and desktop | R01–R05, P01–P04 | Real process launch/stop/tree cleanup, session reuse, offline stop, Windows/macOS/Linux presets, Tauri IPC allow/deny, deep links, updates, notifications and distribution capability differences. |
+| Solo local content | D08a, F03b, C02–C09 | Cloud metadata with no message bodies, host SQLite commit-before-ack, encrypted relay frames, offline failure, stale-host fencing, reconnect, host transfer and Team upgrade migration. |
+| Vault | D04–D05, D05a, V01–V08 | Client-generated root/recovery material, cloud-schema and transport absence, every policy branch, ciphertext/AAD/versioning, device enrollment, requester-owner-approver provenance, expiry/revoke, local injection, device-mediated proxy, recovery and leak canaries. |
+| Runner and desktop | D05a, R01–R05, P01–P04 | Remote trigger schema rejects executable/script/arguments/directory/environment/limit overrides; local edits require real OS verification; process launch/stop/tree cleanup, session reuse, offline stop, Windows/macOS/Linux presets, Tauri IPC allow/deny and distribution capability differences. |
 | Billing | B01–B03 | Seat examples 1/2/5/6/20/21/50, storage packs, proration decisions, webhook replay/order, lapse/recovery and preservation of customer data. |
 | Operations | D07, O01–O03 | Retention clocks, export/delete, restore without authority resurrection, tenant cost counters, limits, migration quarantine, rollback and redacted diagnostics. |
 | Release gates | G01–G05 | The full synthetic-secret product journey, two-tenant adversarial suite, load/fault suite and supported-platform acceptance matrix. |
@@ -81,6 +82,8 @@ Test names use `<AREA>-INT-<number>` and include the identifier in the test titl
 A success assertion is insufficient. Each authorization, vault and tenant feature includes paired allow and deny cases. Tests assert that denied or failed operations leave no forbidden rows, queued events, files, grants, logs, notifications or partial external actions. Cross-tenant cases use two valid tenants and valid credentials so they cannot pass merely because the request was malformed.
 
 Leak tests scan HTTP bodies, WebSocket messages, MCP results, browser storage, captured logs, audit metadata, child stdout/stderr and temporary files for the synthetic secret canaries. Redaction tests also cover encoded and line-split output forms defined by the threat model.
+
+Security boundary tests also scan every cloud migration and serialized cloud protocol fixture for vault roots, recovery codes and local launch configuration. The runner suite sends validly authenticated requests containing each forbidden launch field and proves rejection before any process or durable write. Vault setup and recovery tests capture every local cloud-bound request and prove that only ciphertext, wraps, salts and KDF parameters leave the client.
 
 ## Flake policy
 
@@ -106,6 +109,8 @@ Manual review and screenshots can supplement visual judgment, store review and h
 | Scenario | Location | Coverage |
 |---|---|---|
 | `WORKSPACE-INT-001` | `tests/workspace.test.ts` | Direct RPC to a local SQLite Durable Object and singleton schema persistence. |
+| `RUNNER-SEC-001/002` | `src/domain/local-agent-trigger.test.ts` | Exact opaque remote trigger schema and rejection of every local launch-configuration override. |
+| `MOCKUP-SEC-001/002/003` | `tests/browser/mockup-contracts.spec.ts` | Rendered Solo storage, local-only runner configuration and user-held vault recovery disclosures. |
 | `SHELL-INT-001` | `tests/browser/shell.spec.ts` | Branded shell semantics, horizontal overflow and desktop/mobile layout. |
 | `SHELL-INT-002` | `tests/browser/shell.spec.ts` | Serious/critical accessibility scan. |
 | `DESKTOP-INT-001` | `tests/browser/shell.spec.ts` | Windows branded drag region and visible caption controls. |

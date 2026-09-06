@@ -1,6 +1,6 @@
 # Lepidy
 
-Lepidy is a shared workspace for people, agents, and credentials. The application uses Next.js on Cloudflare Workers through OpenNext, one SQLite Durable Object per workspace, and a Tauri v2 desktop shell.
+Lepidy is a shared workspace for people, agents, and credentials. The application uses Next.js on Cloudflare Workers through OpenNext and a Tauri v2 desktop shell. Team workspaces keep content in an isolated SQLite Durable Object; free Solo workspaces keep channel metadata in their cloud object while one designated computer owns content SQLite.
 
 ## Local development
 
@@ -20,7 +20,7 @@ npm run db:migrate:local
 
 Workspace Durable Objects migrate their isolated SQLite database on first wake. A failed workspace migration is rolled back and that workspace reports a quarantined health state.
 
-Open <http://localhost:3000>. The Next.js development proxy intentionally uses `wrangler.next-dev.jsonc`; the workspace Durable Object will run in its dedicated local Worker fixture when F03 adds the storage and migration system.
+Open <http://localhost:3000>. The Next.js development proxy intentionally uses `wrangler.next-dev.jsonc`; workspace Durable Objects run in the dedicated local Worker integration fixture.
 
 The complete local gate is:
 

@@ -22,12 +22,22 @@ export default defineConfig({
       grepInvert: /DESKTOP-INT/,
     },
   ],
-  webServer: {
-    command: "npm run dev -- --hostname 127.0.0.1",
-    url: "http://127.0.0.1:3000",
-    reuseExistingServer: false,
-    timeout: 120_000,
-    stdout: "ignore",
-    stderr: "pipe",
-  },
+  webServer: [
+    {
+      command: "npm run dev -- --hostname 127.0.0.1",
+      url: "http://127.0.0.1:3000",
+      reuseExistingServer: false,
+      timeout: 120_000,
+      stdout: "ignore",
+      stderr: "pipe",
+    },
+    {
+      command: "node scripts/serve-markups.mjs",
+      url: "http://127.0.0.1:4174",
+      reuseExistingServer: false,
+      timeout: 30_000,
+      stdout: "ignore",
+      stderr: "pipe",
+    },
+  ],
 });

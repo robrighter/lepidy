@@ -25,12 +25,12 @@ This document decides **how Lepidy is built**, and one question dominates it: *w
 ### Accepted hosting decisions
 
 - **Next.js App Router on Cloudflare Workers via OpenNext.** Preserve useful components, routing, initial server rendering, loading states, and error boundaries from `../slip-robotics-chat`. Vite is not the selected application architecture. Next.js is the presentation and transport layer; server components, actions, and route handlers call the same workspace authority rather than implementing separate business rules.
-- **One SQLite-backed Durable Object per workspace.** It owns tenant content, policy, transactional mutations, search, and realtime. Keep the initial 50-human ceiling and validate agent-heavy workloads; human seat count alone does not bound traffic. Do not create an always-active object per agent or channel by default.
-- **D1 is the shared control plane:** accounts, sessions, membership, routing, devices, billing. **R2** holds files and exports; **Queues** delivers background work; **Secrets Store** holds service root material. **KV is restricted to non-authoritative caches**, such as immutable routing metadata and public provider metadata.
+- **One isolated Durable Object per workspace, with plan-specific authority.** A Team object owns tenant content, policy, transactional mutations, search and realtime. A Solo object persists channel/authorization metadata and relays encrypted content frames to one designated computer whose local SQLite database is authoritative. See [`docs/free-local-workspace-contract.md`](./docs/free-local-workspace-contract.md).
+- **D1 is the shared control plane:** accounts, sessions, membership, routing, devices, billing. **R2** holds plan-appropriate files and exports; **Queues** delivers background work; **Secrets Store** holds service signing and provider integration keys only, never a vault decryption root. **KV is restricted to non-authoritative caches**, such as immutable routing metadata and public provider metadata.
 - **Lepidy does not host agent execution.** Local execution runs on customer machines; cloud execution runs in the customer's provider account. Customer-funded execution is distinct from Lepidy's storage and coordination costs.
 - **Allow idle workspaces to stop accruing duration charges.** Use hibernating WebSockets. An open client or a harness working elsewhere must not require a continuously pending workspace request. The exact session-wait transport remains a prototype decision (§10.1).
 
-These decisions supersede the earlier frontend comparison and session-cache proposal. They do not resolve Tier B key custody, runner failover, or the provider authorization mechanism; those remain explicit engineering decisions in §18.
+These decisions supersede the earlier frontend comparison, session-cache proposal and server-decryptable vault design. Runner failover, vault owner sharing and the provider authorization mechanism remain explicit engineering decisions in §18.
 
 ```
    ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐
@@ -67,12 +67,12 @@ These decisions supersede the earlier frontend comparison and session-cache prop
               ┌─────────┐  ┌──────────┐     ┌────────────┐  ┌───────────┐
               │   R2    │  │    KV    │     │  Secrets   │  │  Queues   │
               │  files  │  │  cache   │     │   Store    │  │  fan-out  │
-              │ per-ws  │  │          │     │ root key   │  │           │
+              │ prefix  │  │          │     │ signing    │  │           │
               │ prefix  │  │          │     │            │  │           │
               └─────────┘  └──────────┘     └────────────┘  └───────────┘
 ```
 
-Five client kinds, one Worker, and a hard split between a **control plane** that knows *who exists* and a **data plane** that holds *what they wrote*.
+Five client kinds, one Worker, and a hard split between a **control plane** that knows *who exists* and a **data plane** that holds *what they wrote*. For Solo, the content portion of that data plane runs on the designated host and the workspace object is its cloud metadata/relay peer.
 
 ---
 
@@ -102,9 +102,19 @@ So the requirement is:
 
 That rules out shared tables. It leaves database-per-tenant, and on Cloudflare there are exactly two ways to do that.
 
-### 3.3 The decision: one Durable Object per workspace, SQLite-backed
+### 3.3 The Team decision: one Durable Object per workspace, SQLite-backed
 
-**A workspace *is* a Durable Object.** Its SQLite database is the system of record for everything the workspace contains. There is no shared table anywhere that holds a message, a credential, a channel or an agent.
+**A Team workspace *is* a Durable Object.** Its SQLite database is the system of record for everything the workspace contains. There is no shared table anywhere that holds content from multiple tenants.
+
+For a paid Team workspace this object is the complete tenant authority described below. Solo deliberately uses the split in §3.3a.
+
+### 3.3a Solo: cloud metadata and relay, host-owned content
+
+A Solo workspace still has one isolated workspace object. That object stores principals and channel metadata, host authority and relay protocol state. One designated desktop or laptop stores messages, reactions, attachments, search, content-bearing agent state and vault data in local SQLite. The host maintains an outbound hibernatable WebSocket; remote web, mobile, desktop, MCP and cloud-agent clients reach it through the object without an inbound port.
+
+The relay forwards authenticated, encrypted transient frames. It does not persist content for retry: if the host is offline, a content operation returns `host_offline`. Channel navigation and host status remain available from cloud metadata. The host commits a local transaction before acknowledging a mutation and persists its request id, preserving read-after-write and idempotent retry on that authority.
+
+D1 names the designated host and a monotonically increasing host epoch. The workspace object grants one writer lease for that epoch, so a replacement device fences the former host and delayed frames cannot write. Host transfer, lost-host recovery and resumable conversion to Team follow the [free local workspace contract](./docs/free-local-workspace-contract.md).
 
 The alternative was one D1 database per tenant. Here is the comparison against verified platform limits, because this is the decision the whole document rests on:
 
@@ -256,15 +266,17 @@ src/
 | Membership (user ↔ workspace, role) | **D1** | Answers "which workspaces am I in" and gates §3.5 step 4 |
 | Subscription, seats, billing source | **D1** | Money is global |
 | Webhook event dedupe ids | **D1** | Arrives before we know which tenant, then routed |
-| **Channels, members, messages, threads, reactions** | **Workspace DO** | Tenant content |
-| **Read cursors, unread state** | **Workspace DO** | Cross-channel aggregation must be local |
-| **Agents, briefs, delegations, mention queue, sessions** | **Workspace DO** | Tenant content |
-| **Queue items, statuses, votes** | **Workspace DO** | Votes are reactions; same table |
-| **Credentials (ciphertext), policy, ACL, grants, approvals** | **Workspace DO** | The reason §3.2 exists |
-| **Audit log** | **Workspace DO** | Hash-chained per tenant |
-| **FTS5 index** | **Workspace DO** | Beside what it indexes |
+| Channel definitions, members and access metadata | **Workspace DO for every plan** | Remote navigation and authorization remain available |
+| Team messages, threads and reactions | **Workspace DO** | Structurally isolated cloud tenant content |
+| Solo messages, threads and reactions | **Designated host SQLite** | No cloud content persistence; internet access routes through relay |
+| Read cursors and unread state | **Team workspace DO / Solo host SQLite, with coarse Solo aggregates in relay metadata** | Content-derived state remains with content |
+| Agents, briefs, delegations, mention queue and sessions | **Team workspace DO / Solo host SQLite; identity metadata in every relay** | Content-bearing configuration follows the plan authority |
+| Queue items, statuses and votes | **Team workspace DO / Solo host SQLite** | Votes are reactions; same authority |
+| Credentials, policy, ACL, grants and approvals | **Team workspace DO / Solo host SQLite unless D05 changes custody** | Secret-bearing data never enters the Solo relay store |
+| Audit log | **Team workspace DO / Solo host SQLite** | Hash-chained per tenant authority |
+| **FTS5 index** | **Team workspace DO / Solo host SQLite** | Beside what it indexes |
 | Files, attachments, avatars, exports | **R2**, `ws/<id>/…` prefix | Bytes don't belong in SQLite |
-| Workspace root key material | **Secrets Store** (service key) + wrapped keys in the DO | §9 |
+| Vault ciphertext and wrapped data keys | **Team workspace DO / Solo host SQLite** | The account vault key and recovery code remain user-held; §9 |
 | Non-authoritative caches: immutable slug→DO id, public metadata | **KV** | §13 |
 
 Membership appears in both planes, and that is deliberate rather than sloppy: **D1 answers "may this person reach this workspace at all"** (the routing gate), **the DO answers "may this person read this channel"** (the content gate). Two different questions, two different blast radii. The DO's copy is authoritative for anything inside the workspace; D1's is authoritative for the door.
@@ -416,46 +428,43 @@ Workspace content uses an immutable tenant-local `member_id`, never the global D
 ### 9.1 The key hierarchy, and where each key actually is
 
 ```
-  Secrets Store (service-wide, one)
-       SERVICE_ROOT_KEY  ──HKDF-SHA256(salt = workspace_id)──▶  KEK_ws
-                                                                   │
-  Workspace DO SQLite                                              │ wraps
-       wrapped_wdk  ────────────── AES-KW ─────────────────────────┘
-             │
-             └─ WDK ──wraps──▶ per-credential DEK ──▶ AES-256-GCM(value)
-                                                       AAD = ws ‖ cred ‖ version
+  Trusted client
+       Account Vault Key (AVK), random 32 bytes
+          │
+          ├─ wraps ─▶ per-credential DEK ──▶ AES-256-GCM(value)
+          │                                  AAD = ws ‖ cred ‖ version
+          │
+          ├─ device wrap ────────────────▶ enrolled device secure storage
+          │
+          └─ recovery wrap ──────────────▶ cloud ciphertext
+                   ▲
+                   └─ key derived locally from the user-held recovery code
 
-  Tier B only — a second, independent wrap of the same DEK:
-       passkey PRF ──HKDF──▶ KEK_user ──wraps──▶ dek_user_wrapped
-                                                  (the server cannot open this)
+  Lepidy cloud
+       ciphertext · wrapped DEKs · device/recovery wraps · salts · KDF parameters
+       no AVK · no recovery code · no recovery-derived key · no plaintext
 ```
 
-**Why a derived per-workspace KEK rather than a per-workspace secret.** Secrets Store bindings are static; there is no way to bind fifty thousand of them. Deriving `KEK_ws = HKDF(SERVICE_ROOT_KEY, workspace_id)` gives every tenant a distinct key with no per-tenant configuration, keeps the wrapped material inside the tenant's own object, and makes per-tenant rotation possible by versioning the salt.
+The AVK is generated on the first trusted client and never crosses a Lepidy transport. Setup creates a printable recovery code, derives a recovery key locally, uploads only an encrypted AVK recovery package, and requires the user to confirm that the code was saved. Enrollment creates a device-specific wrap through an authenticated client-to-client flow. Account password or provider recovery cannot substitute for either path.
 
-**It does not, and must not be described as, protecting one tenant from us.** The service root key can derive every tenant's KEK. That is precisely what PRD §8.1 admits in plain words, and the honest architectural statement is:
-
-> **Tier A protects against database disclosure, backup leakage and a stolen object; it does not protect against a compromise of the running Worker plus the service root key.** Tier B does, because its second wrap only ever exists in the customer's browser.
-
-**Rotation.** The service root key rotates by adding a new version, re-deriving each tenant's KEK and re-wrapping its WDK on the tenant's next wake — the credential bodies are untouched because only the WDK wrap changes. A `key_version` column drives which derivation to use, so the fleet can be mid-rotation indefinitely without anything breaking.
+**Rotation.** An unlocked client creates a new AVK and rewraps credential DEKs and enrolled-device packages. Credential bodies remain untouched. The server coordinates versions and stores new ciphertext, but never sees either AVK. A stale device cannot publish an old wrap after the rotation epoch advances.
 
 ### 9.2 Where the plaintext exists, exhaustively
 
 The list must be short enough to state, or the design is wrong:
 
-1. Inside the workspace object, in memory, for the duration of one decrypt.
+1. In an unlocked trusted client, for the duration of a local decrypt.
 2. In the injecting child process's environment, on the user's own machine (`lepidy run`).
-3. In an outbound request header, in the egress proxy, for the duration of one fetch.
-4. In the browser, briefly, for reveal and reveal-once.
+3. In an outbound request header on an enrolled release device, for the duration of one fetch.
+4. In the browser, briefly, for explicit reveal and reveal-once.
 
-**Nowhere else, and specifically:** never in D1, never in KV, never in R2, never in a log line, never in an audit entry, never in the FTS index, never in a broadcast, and never in an MCP tool result unless the credential is explicitly `allow_reveal`.
+**Nowhere else, and specifically:** never in a Worker, Durable Object, D1, KV, R2, Queue, server log, audit entry, FTS index, cloud broadcast, support tool or backup, and never in an MCP tool result unless the user explicitly permits reveal from an unlocked client.
 
-### 9.3 The egress proxy (Tier 0)
+### 9.3 The device-mediated egress proxy (Tier 0)
 
-The proxy runs in the **Worker**, not the DO: it is I/O-bound and a DO has a six-connection ceiling on simultaneous outgoing requests, which is exactly the wrong place for a request-forwarding service.
+The cloud components authorize and relay; an enrolled, unlocked release device performs the credential-bearing fetch. Flow: the agent calls `proxy_request` over MCP → the workspace authority evaluates metadata policy and issues a single-use request id → an end-to-end encrypted request goes to the release device → the device rechecks the credential ACL, host allowlist, redirect policy, rate limit and request id → it unwraps locally, performs the fetch and redacts the response → an encrypted response returns through the relay → the workspace authority atomically records usage and audit metadata.
 
-Flow: the agent calls `proxy_request` over MCP → the Worker resolves the tenant and asks the DO for a policy decision → the DO returns *the plaintext plus a one-shot decision token* over RPC → the Worker attaches the credential to the allowlisted host and streams the response back → the DO records the audit entry.
-
-The credential crosses the RPC boundary between the two, and that is the cost of not putting a forwarding proxy inside a single-threaded object. It stays inside Cloudflare, inside one request, and never reaches the client. **The host allowlist is checked in the DO, before the value is released** — never in the Worker, which is the part an attacker would be trying to influence.
+The request contains no server-selectable header value or executable input. Redirects are checked on the release device at every hop. The cloud never receives the vault key, credential plaintext or unredacted authorization headers. No online release device means `vault_device_unavailable`, including for scheduled cloud agents.
 
 ### 9.4 The approval path
 
@@ -587,7 +596,7 @@ Targets, measured at p95 from a client in the workspace's own region:
 
 ### 13.1 Tenant economics and resource controls
 
-The accepted model is Next.js, one workspace DO, and customer-funded agent execution. Optimize billable idle duration and database writes before framework CPU or indexed authorization reads. Reliability features such as scoped tokens, durable pending work, and queue completion records remain required even when they add writes.
+The accepted model is Next.js, one workspace cloud authority, plan-specific content storage, and customer-funded agent execution. A Team DO owns content; a Solo DO owns metadata and relays opaque frames to host SQLite. Optimize billable idle duration and cloud writes before framework CPU or indexed authorization reads. Reliability features such as scoped tokens, durable pending work, and queue completion records remain required even when they add writes.
 
 Illustrative monthly workload assumptions, not benchmarks or plan limits:
 
@@ -598,8 +607,8 @@ Illustrative monthly workload assumptions, not benchmarks or plan limits:
 | Dynamic Worker requests / DO requests | 50,000 each | 500,000 each | 2 million each |
 | Worker CPU per request | 10 ms | 10 ms | 10 ms |
 | Billable DO hours | 5 | 50 | 200 |
-| Average DO database | 0.1 GB | 1 GB | 5 GB |
-| Average R2 attachments | 1 GB | 10 GB | 100 GB |
+| Average cloud DO database | metadata only | 1 GB | 5 GB |
+| Average cloud R2 attachments | 0 GB | 10 GB | 100 GB |
 | Background queue messages, under 64 KB, no retries | 5,000 | 50,000 | 200,000 |
 | R2 operation-cost allowance | $0.005 | $0.05 | $0.50 |
 | **Illustrative core infrastructure cost** | **$0.21** | **$2.08** | **$15.79** |
@@ -608,7 +617,7 @@ Calculation uses published marginal rates before shared allowances and account-l
 
 The $5/month Workers subscription and included allowances are account-wide, not per tenant. These estimates exclude additional control-plane usage, email, observability, builds, payment fees, support, and any Lepidy-funded inference. Background-consumer CPU and retries require measurement. They are not invoices or gross-margin guarantees. A continuously non-hibernating workspace represents about $4.15 of duration usage over 30 days alone, shared across that object's concurrent activity rather than multiplied per agent.
 
-**Accepted commercial allowances:** Solo is free with one human and 1 GB attachments. Team is $19/month including five humans, plus $4 per human above five, with 25 GB attachments plus 5 GB per additional seat. Optional 100 GB packs cost $5/month. Warn before storage limits and block new uploads rather than deleting content. Maintain the separate 10 GB DO capacity guard. Unlimited agent identities do not imply unlimited automated traffic; publish tested rate and concurrency limits before launch, with no automatic usage overages.
+**Accepted commercial allowances:** Solo is free with one human; its messages and attachments use the designated computer's storage, with local disk-health warnings rather than a Lepidy cloud quota. Team is $19/month including five humans, plus $4 per human above five, with 25 GB cloud attachments plus 5 GB per additional seat. Optional 100 GB packs cost $5/month. Warn before storage limits and block new uploads rather than deleting content. Maintain the separate 10 GB Team DO capacity guard. Unlimited agent identities do not imply unlimited automated traffic; publish tested rate and concurrency limits before launch, with no automatic usage overages.
 
 Before public launch, exercise the complete mention → harness → approval → threaded reply flow and a synthetic busy workspace. Attribute writes, active duration, requests, storage, and background work to each workspace. Use aggregated counters or sampled telemetry so cost measurement does not itself produce a write per event. Test idle connected runners, imports, long messages, and agent-heavy workloads independently of human seat count. Apply measurements to the paid-plan margin and the free-workspace subsidy before treating these estimates as forecasts.
 
@@ -628,7 +637,7 @@ Each of those is a test, not a convention. In particular there is a test asserti
 
 ### 14.2 What it does not buy
 
-- **A compromised Worker sees everything.** It holds the service root key and can address every object. This is the honest ceiling of Tier A and the reason Tier B exists.
+- **A compromised Worker can address every cloud object and disclose cloud-held social metadata and ciphertext.** It cannot derive the account vault key or recovery code. It can still deny service, replay or tamper with traffic, so clients authenticate ciphertext, bind AAD and reject stale epochs.
 - **A compromised control plane discloses the social graph** — who is in which workspace — without disclosing any content.
 - **A prompt-injected agent operating with a valid delegation is acting with its owner's authority.** Policy bounds it; nothing prevents it.
 - **PITR restores deleted credentials.** A 30-day restore reinstates what a customer deliberately deleted, so restores are audited events with an explicit acknowledgement, never a silent operation.
@@ -682,7 +691,7 @@ Next.js built with the OpenNext Cloudflare adapter and deployed with Wrangler, a
 
 - **Waiting transport:** prototype session reuse without a parked workspace RPC; compare cost and reconnect behavior against bounded long polling (§10.1).
 - **Runner and queue contract:** one designated runner and active session per agent is the v1 recommendation, not yet a finalized failover specification. Set claim leases, completion, renewal cadence, disconnected-runner behavior, and session-scoped delegation tokens before implementation.
-- **Tier B custody:** the current independent server and human wraps in §9.1 do not prevent server decryption. Finalize a design with no server-decryptable alternative, or explicitly change the promise. Local-only Tier B injection was recommended but is not yet accepted; cloud release, recovery, and owner sharing remain unresolved.
+- **Vault owner sharing:** the user-held AVK and recovery protocol are fixed by §9 and the [vault key and recovery contract](./docs/vault-key-recovery-contract.md). Specify multi-owner envelope distribution, removal and rekeying without creating a server-decryptable wrap before V01.
 - **Cloud provider authorization:** specify what credential authorizes session creation and resource fetches in the customer's account, where it is stored, and how it is revoked. Customer-paid execution does not eliminate this integration credential.
 
 - **Does the object need splitting before 50 seats?** §3.4 argues no on a soft 1,000 req/s ceiling. Before GA, load-test one object with 50 simulated users, 500 sockets, a busy queue and two local agents draining, and find the real number rather than trusting the soft one.

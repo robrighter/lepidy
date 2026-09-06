@@ -25,19 +25,19 @@ window.LEPIDY = (function () {
     { id: "agent",      file: "agent.html",      name: "Agent detail",      group: "Agents",
       note: "Owners, the standing brief, the compiled-in security preamble, scope, and the interaction list." },
     { id: "runtime",    file: "runtime.html",    name: "Agent runtime",     group: "Agents",
-      note: "Connected / Local / Claude Cloud / Custom \u2014 harness presets, and the cron schedule." },
+      note: "Connected / Local / Claude Cloud / Custom \u2014 remote starts reference a preset configured only on its machine." },
     { id: "vault",      file: "vault.html",      name: "Vault",             group: "Vault",
-      note: "Every credential, its disclosure tier, its policy and who may use it. The kill switch is in the header." },
+      note: "Every credential, its policy and who may use it. Vault keys and recovery codes remain user-held." },
     { id: "credential", file: "credential.html", name: "Credential detail", group: "Vault",
-      note: "Disclosure tiers, the ACL's three verbs, live grants with countdowns, and the access log." },
+      note: "Local and device-mediated disclosure, the ACL's three verbs, live grants and the access log." },
     { id: "sessions",   file: "sessions.html",   name: "Devices & sessions",group: "Account",
-      note: "Concurrent logins by design. Client sessions and runner registrations are revoked separately." },
+      note: "Concurrent logins, runner registrations and the designated computer storing Solo channel contents." },
     { id: "mobile",     file: "mobile.html",     name: "Phone approval",    group: "Account",
       note: "The approvals companion. Ask from a bus stop, approve with Face ID, watch the laptop do the work." },
     { id: "signin",     file: "signin.html",     name: "Sign in",           group: "Account",
       note: "Our own accounts. Google is a way in, never the identity." },
     { id: "pricing",    file: "pricing.html",    name: "Pricing",           group: "Marketing",
-      note: "Agents are free; humans are the meter. The free tier is a whole product." }
+      note: "Solo uses your online computer for content storage; Team pays for cloud availability and collaboration." }
   ];
 
   const NAV = [

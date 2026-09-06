@@ -15,8 +15,8 @@
       <img src="assets/img/mark.svg" width="40" height="40" alt="">
       <h1 style="font:700 34px/1.15 var(--font-display);margin:14px 0 8px">Agents are free.<br>Humans are the meter.</h1>
       <p style="color:var(--text-2);max-width:440px;margin:0 auto">
-        Every plan has the whole product — the vault, the agents, the lot.
-        Solo is free. Team starts at $19/month with five people included.</p>
+        Every plan has the vault, agents and remote access.
+        Solo stores channel contents on your computer. Team keeps them available in the cloud.</p>
     </div>
 
     <div class="plans">
@@ -42,8 +42,8 @@
     <div class="grid g3 mt24">
       <div class="panel"><div class="panel-b">
         <b style="font:var(--t-h3)">The free plan isn't a trial</b>
-        <p class="small muted mt6">One person gets the entire vault, unlimited agents, local sessions and the
-          full audit trail. The thing you can't do is invite a second human.</p></div></div>
+        <p class="small muted mt6">One person gets the vault, unlimited agents and remote access. Your designated
+          computer stores channel contents and must be online when you use Lepidy from another device.</p></div></div>
       <div class="panel"><div class="panel-b">
         <b style="font:var(--t-h3)">Agents never count</b>
         <p class="small muted mt6">Nor do deactivated accounts. Published traffic and concurrency limits apply;
@@ -61,8 +61,8 @@
 UI.mount({ page: "pricing" });
 const tick = UI.icon("check");
 const F = {
- f1: ["Full vault, approvals and audit export", "Unlimited agent identities", "Local runners and customer-funded cloud agents", "Channels, DMs and threads", "1 GB attachment storage"],
- f2: ["All core features, security and offboarding", "5 humans included; up to 50 supported", "10 humans: $39/month · 20: $79 · 50: $199", "25 GB storage + 5 GB per seat above five", "Optional 100 GB storage packs: $5/month", "Monthly billing · no automatic usage overages"]
+ f1: ["Channel names and access metadata in cloud", "Messages, files and vault ciphertext on one designated computer", "Remote access while that computer is online", "Full vault, approvals and unlimited agents", "Use storage available on your own computer"],
+ f2: ["Cloud-hosted messages and collaboration", "5 humans included; up to 50 supported", "10 humans: $39/month · 20: $79 · 50: $199", "25 GB storage + 5 GB per seat above five", "Optional 100 GB storage packs: $5/month", "Monthly billing · no automatic usage overages"]
 };
 for (const [id, items] of Object.entries(F))
   document.getElementById(id).innerHTML = items.map(t => `<li>${tick}<span>${t}</span></li>`).join("");

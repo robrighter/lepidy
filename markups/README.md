@@ -27,10 +27,10 @@ Then open <http://localhost:4173/>.
 | 08 | `people.html` | Directory, local time, focus state, groups, the seat boundary |
 | 09 | `agents.html` | The promoted rail item — the agent directory |
 | 10 | `agent.html` | Owners, standing brief, security preamble, scope, interaction list |
-| 11 | `runtime.html` | Connected / Local / Claude Cloud / Custom. Deep-link: `?runtime=cloud` |
-| 12 | `vault.html` | Credentials, live grants, the kill switch |
-| 13 | `credential.html` | Disclosure tiers, the ACL's three verbs, the access log |
-| 14 | `sessions.html` | Concurrent devices; client sessions vs. runner registrations |
+| 11 | `runtime.html` | Connected / Local / Claude Cloud / Custom; remote launch details are read-only. Deep-link: `?runtime=cloud` |
+| 12 | `vault.html` | Credentials, live grants, the kill switch and user-held recovery |
+| 13 | `credential.html` | Local/device-mediated disclosure, the ACL's three verbs, the access log |
+| 14 | `sessions.html` | Concurrent devices, Solo content host, client sessions vs. runner registrations |
 | 15 | `mobile.html` | The approvals companion |
 | 16 | `signin.html` | Our own accounts, Google as a way in |
 | 17 | `pricing.html` | The plan ladder |
@@ -62,9 +62,10 @@ Editing `data.js` changes the content on every screen at once. Editing
 ## Notes
 
 - Dark mode works — the moon button in any top bar, and it persists.
+- Pricing and device screens show the Solo boundary: cloud channel metadata, host-owned content and remote access only while the designated computer is online.
+- Runtime screens never offer remote editing of executable, script, arguments, directory, environment or limits. Vault screens state that Lepidy never stores the account vault key or recovery code.
 - Avatars are generated from initials on brand gradients. Nothing here is a
   photograph of a person.
 - Palette, typefaces (Sora + Inter) and motifs come from `../brandkit/`.
-  JetBrains Mono is the one addition: this product's most distinctive surfaces are
-  a launch command and an audit log, and setting those in Inter would misrepresent
-  what they are.
+  JetBrains Mono is the one addition: local configuration summaries and audit logs
+  need a clear technical voice.

@@ -32,7 +32,19 @@ describe("D1 control-plane schema", () => {
     );
 
     const schema = tables.results.map(({ sql }) => sql.toLowerCase()).join("\n");
-    for (const forbidden of ["body_markdown", "ciphertext", "credential_value", "agent_brief"]) {
+    for (const forbidden of [
+      "body_markdown",
+      "ciphertext",
+      "credential_value",
+      "agent_brief",
+      "vault_secret",
+      "vault_root",
+      "recovery_code",
+      "launch_script",
+      "launch_command",
+      "working_directory",
+      "environment_value",
+    ]) {
       expect(schema).not.toContain(forbidden);
     }
   });
