@@ -42,6 +42,34 @@ import {
   redactedError,
 } from "../domain/due-work";
 import { parseIdempotencyKey } from "../domain/idempotency-key";
+import {
+  directMessageIdentity,
+  parseChannelName,
+  parseChannelSlug,
+  parseChannelTopic,
+  parseMessageBody,
+  resolveThreadPlacement,
+  type ChannelKind,
+} from "../domain/rooms";
+import {
+  addChannelMembers,
+  archiveChannel,
+  channelMemberIds,
+  insertChannel,
+  insertMessage,
+  isChannelMember,
+  listChannelHistory,
+  listThreadHistory,
+  listVisibleChannels,
+  nextChannelSequence,
+  readChannel,
+  readChannelByDirectMessageKey,
+  readChannelBySlug,
+  readMessage,
+  removeChannelMember,
+  type ChannelRow,
+  type MessagePage,
+} from "./workspace-rooms";
 import { verifySoloSnapshot, type SoloContentSnapshot } from "../domain/solo-snapshot";
 
 export type WorkspaceHealth = {
@@ -136,6 +164,29 @@ export type WorkspaceShellSnapshot = {
   storageMode: WorkspaceStorageMode | null;
   schemaVersion: number;
 };
+
+export type Actor = { memberId: string; authorizationEpoch: number };
+
+export type ActiveMember = {
+  id: string;
+  handle: string;
+  displayName: string;
+  role: MemberProjection["role"];
+};
+
+export type CreatedChannel = { channelId: string; kind: ChannelKind; created: boolean };
+
+export type SentMessage = {
+  messageId: string;
+  channelId: string;
+  threadRootId: string | null;
+  channelSequence: number;
+  createdAt: number;
+  replayed: boolean;
+};
+
+/** Roles that may create rooms. A guest joins what they are invited to. */
+const ROOM_CREATOR_ROLES: ReadonlySet<MemberProjection["role"]> = new Set(["owner", "admin", "member"]);
 
 export class Workspace extends DurableObject<CloudflareEnv> {
   constructor(ctx: DurableObjectState, env: CloudflareEnv) {
@@ -649,6 +700,465 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       agents,
       storageMode: config?.storage_mode ?? null,
       schemaVersion: schema.version,
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Rooms, direct messages and message writes (C02)                     */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Create a named room. The slug is normalised before it is stored, so two
+   * spellings of the same name cannot become two rooms that look identical in a
+   * sidebar, and a repeated request under the same idempotency key returns the
+   * room the first one made rather than a second room.
+   */
+  async createChannel(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    kind: "public" | "private";
+    slug: string;
+    name?: string | null;
+    topic?: string | null;
+    memberIds?: readonly string[];
+    now: number;
+  }): Promise<CreatedChannel> {
+    const actor = this.authorizeActor(input.actor);
+    if (!ROOM_CREATOR_ROLES.has(actor.role)) throw new Error("this role cannot create rooms");
+    if (input.kind !== "public" && input.kind !== "private") throw new Error("unknown room kind");
+
+    const slug = parseChannelSlug(input.slug);
+    if (slug === null) throw new Error("invalid channel slug");
+    const name = parseChannelName(input.name, slug);
+    const topic = parseChannelTopic(input.topic);
+    const invited = this.resolveActiveMemberIds(input.memberIds ?? []);
+
+    const outcome = await this.commitMutation(
+      {
+        scope: "channel.create",
+        idempotencyKey: input.idempotencyKey,
+        requestHash: `${actor.id}|${input.kind}|${slug}`,
+        now: input.now,
+      },
+      () => {
+        const existing = readChannelBySlug(this.ctx.storage, slug);
+        if (existing) throw new Error("channel slug is already taken");
+
+        const channelId = crypto.randomUUID();
+        insertChannel(this.ctx.storage, {
+          id: channelId,
+          kind: input.kind,
+          slug,
+          name,
+          topic,
+          dmKey: null,
+          createdByMemberId: actor.id,
+          now: input.now,
+        });
+        const members = [...new Set([actor.id, ...invited])];
+        addChannelMembers(this.ctx.storage, channelId, members, input.now);
+
+        return {
+          result: { channelId, kind: input.kind as ChannelKind, created: true },
+          effects: this.channelEffects("channel.created", channelId, actor, {
+            channel_kind: input.kind,
+            member_count: members.length,
+          }),
+        };
+      },
+    );
+    return { ...outcome.result, created: !outcome.replayed };
+  }
+
+  /**
+   * Open the conversation between a set of people. The same set always resolves
+   * to the same room, whoever opens it and in whatever order, so two people
+   * cannot end up in two parallel copies of one conversation.
+   */
+  async openDirectMessage(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    participantMemberIds: readonly string[];
+    now: number;
+  }): Promise<CreatedChannel> {
+    const actor = this.authorizeActor(input.actor);
+    const identity = directMessageIdentity([actor.id, ...input.participantMemberIds]);
+    if (identity === null) throw new Error("invalid direct message participants");
+
+    const others = identity.participantIds.filter((id) => id !== actor.id);
+    if (this.resolveActiveMemberIds(others).length !== others.length) {
+      throw new Error("every participant must be an active member");
+    }
+
+    const outcome = await this.commitMutation(
+      {
+        scope: "channel.direct",
+        idempotencyKey: input.idempotencyKey,
+        requestHash: identity.key,
+        now: input.now,
+      },
+      () => {
+        const existing = readChannelByDirectMessageKey(this.ctx.storage, identity.key);
+        if (existing) {
+          return { result: { channelId: existing.id, kind: existing.kind, created: false } };
+        }
+        const channelId = crypto.randomUUID();
+        insertChannel(this.ctx.storage, {
+          id: channelId,
+          kind: identity.kind,
+          slug: null,
+          name: null,
+          topic: null,
+          dmKey: identity.key,
+          createdByMemberId: actor.id,
+          now: input.now,
+        });
+        addChannelMembers(this.ctx.storage, channelId, identity.participantIds, input.now);
+        return {
+          result: { channelId, kind: identity.kind as ChannelKind, created: true },
+          effects: this.channelEffects("channel.direct_opened", channelId, actor, {
+            channel_kind: identity.kind,
+            member_count: identity.participantIds.length,
+          }),
+        };
+      },
+    );
+    return { ...outcome.result, created: outcome.replayed ? false : outcome.result.created };
+  }
+
+  /** Anyone in the workspace may join an open room; a closed one needs an invite. */
+  async joinChannel(input: { actor: Actor; channelId: string; now: number }): Promise<{ joined: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireVisibleChannel(input.channelId, actor.id);
+    if (channel.kind !== "public") throw new Error("this room is joined by invitation only");
+    if (channel.archivedAt !== null) throw new Error("this room is archived");
+
+    const outcome = await this.commitMutation({ scope: "channel.join", now: input.now }, () => {
+      const added = addChannelMembers(this.ctx.storage, channel.id, [actor.id], input.now);
+      if (added.length === 0) return { result: { joined: false } };
+      return {
+        result: { joined: true },
+        effects: this.channelEffects("channel.member_joined", channel.id, actor, {
+          channel_kind: channel.kind,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /** Adding someone else requires already being in the room you are adding them to. */
+  async addChannelMember(input: {
+    actor: Actor;
+    channelId: string;
+    memberId: string;
+    now: number;
+  }): Promise<{ added: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireChannelParticipant(input.channelId, actor.id);
+    if (channel.kind === "dm" || channel.kind === "group_dm") {
+      throw new Error("a conversation's participants are fixed when it is opened");
+    }
+    if (channel.archivedAt !== null) throw new Error("this room is archived");
+    if (this.resolveActiveMemberIds([input.memberId]).length !== 1) {
+      throw new Error("member is not active in this workspace");
+    }
+
+    const outcome = await this.commitMutation({ scope: "channel.add_member", now: input.now }, () => {
+      const added = addChannelMembers(this.ctx.storage, channel.id, [input.memberId], input.now);
+      if (added.length === 0) return { result: { added: false } };
+      return {
+        result: { added: true },
+        effects: this.channelEffects("channel.member_added", channel.id, actor, {
+          channel_kind: channel.kind,
+          subject_member_id: input.memberId,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /** Leaving is idempotent: a retry after a lost response is not an error. */
+  async leaveChannel(input: { actor: Actor; channelId: string; now: number }): Promise<{ left: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireVisibleChannel(input.channelId, actor.id);
+    if (channel.kind === "dm" || channel.kind === "group_dm") {
+      throw new Error("a conversation cannot be left, only muted");
+    }
+
+    const outcome = await this.commitMutation({ scope: "channel.leave", now: input.now }, () => {
+      const removed = removeChannelMember(this.ctx.storage, channel.id, actor.id);
+      if (!removed) return { result: { left: false } };
+      return {
+        result: { left: true },
+        effects: this.channelEffects("channel.member_left", channel.id, actor, {
+          channel_kind: channel.kind,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  async archiveChannel(input: { actor: Actor; channelId: string; now: number }): Promise<{ archived: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireVisibleChannel(input.channelId, actor.id);
+    if (channel.kind === "dm" || channel.kind === "group_dm") {
+      throw new Error("a conversation cannot be archived");
+    }
+    const permitted =
+      actor.role === "owner" || actor.role === "admin" || channel.createdByMemberId === actor.id;
+    if (!permitted) throw new Error("only an admin or the room's creator may archive it");
+    if (channel.archivedAt !== null) return { archived: false };
+
+    const outcome = await this.commitMutation({ scope: "channel.archive", now: input.now }, () => {
+      archiveChannel(this.ctx.storage, channel.id, input.now);
+      return {
+        result: { archived: true },
+        effects: this.channelEffects("channel.archived", channel.id, actor, {
+          channel_kind: channel.kind,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /**
+   * Write a message. This is the plan authority check: on a Solo workspace the
+   * designated host owns content and this object must refuse, because storing
+   * the body here is exactly what the free-plan contract forbids.
+   *
+   * On a Team workspace the row, the channel and thread aggregates, the audit
+   * entry, the realtime replay entry and the delivery record commit in one
+   * transaction, and a retry under the same idempotency key returns the first
+   * message rather than writing a second one.
+   */
+  async sendMessage(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    channelId: string;
+    bodyMarkdown: string;
+    threadParentId?: string | null;
+    now: number;
+  }): Promise<SentMessage> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+
+    const channel = this.requireChannelParticipant(input.channelId, actor.id);
+    if (channel.archivedAt !== null) throw new Error("this room is archived");
+
+    const body = parseMessageBody(input.bodyMarkdown);
+    if (body === null) throw new Error("message body is empty or too long");
+
+    const parent = input.threadParentId ? readMessage(this.ctx.storage, input.threadParentId) : null;
+    if (input.threadParentId && parent === null) throw new Error("thread parent not found");
+    const placement = resolveThreadPlacement(parent, channel.id);
+    if (placement.kind === "invalid") throw new Error(placement.reason);
+    const threadRootId = placement.kind === "reply" ? placement.threadRootId : null;
+
+    const outcome = await this.commitMutation(
+      {
+        scope: "message.send",
+        idempotencyKey: input.idempotencyKey,
+        requestHash: `${actor.id}|${channel.id}|${threadRootId ?? ""}|${body.length}`,
+        now: input.now,
+      },
+      () => {
+        const messageId = crypto.randomUUID();
+        const channelSequence = nextChannelSequence(this.ctx.storage, channel.id);
+        insertMessage(this.ctx.storage, {
+          id: messageId,
+          channelId: channel.id,
+          threadRootId,
+          authorKind: "member",
+          authorId: actor.id,
+          authorDisplaySnapshot: actor.displayName,
+          bodyMarkdown: body,
+          channelSequence,
+          now: input.now,
+        });
+
+        return {
+          result: {
+            messageId,
+            channelId: channel.id,
+            threadRootId,
+            channelSequence,
+            createdAt: input.now,
+            replayed: false,
+          },
+          effects: {
+            // No body, anywhere: an audit record explains who acted, not what
+            // they said, and it is retained far longer than the message is.
+            audit: {
+              eventType: "message.created",
+              outcome: "allowed" as const,
+              requesterKind: "member" as const,
+              requesterId: actor.id,
+              subjectKind: "message",
+              subjectId: messageId,
+              metadata: {
+                channel_id: channel.id,
+                channel_kind: channel.kind,
+                in_thread: threadRootId !== null,
+                channel_sequence: channelSequence,
+              },
+            },
+            // Delivery carries identifiers; a reader fetches the message it is
+            // authorised for rather than receiving a copy in the event.
+            replay: [
+              {
+                kind: "message.created",
+                audience: [channel.id],
+                payload: {
+                  messageId,
+                  channelId: channel.id,
+                  threadRootId,
+                  channelSequence,
+                  authorId: actor.id,
+                  createdAt: input.now,
+                },
+              },
+            ],
+            outbox: [
+              {
+                id: `message.${messageId}`,
+                kind: "message_created",
+                dedupeKey: `message:${messageId}`,
+                payload: { messageId, channelId: channel.id, threadRootId },
+              },
+            ],
+          } satisfies MutationEffects,
+        };
+      },
+    );
+    return { ...outcome.result, replayed: outcome.replayed };
+  }
+
+  /** Newest-first channel history, refused outright for a room the caller cannot see. */
+  readChannelHistory(input: {
+    actor: Actor;
+    channelId: string;
+    cursor?: string | null;
+    limit?: number;
+  }): MessagePage {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireVisibleChannel(input.channelId, actor.id);
+    return listChannelHistory(this.ctx.storage, channel.id, input.cursor ?? null, input.limit);
+  }
+
+  readThreadHistory(input: {
+    actor: Actor;
+    threadRootId: string;
+    cursor?: string | null;
+    limit?: number;
+  }): MessagePage {
+    const actor = this.authorizeActor(input.actor);
+    const root = readMessage(this.ctx.storage, input.threadRootId);
+    if (root === null || root.threadRootId !== null) throw new Error("thread not found");
+    this.requireVisibleChannel(root.channelId, actor.id);
+    return listThreadHistory(this.ctx.storage, root.id, input.cursor ?? null, input.limit);
+  }
+
+  browseChannels(input: { actor: Actor; includeArchived?: boolean }): {
+    channels: readonly (ChannelRow & { isMember: boolean; participantIds: readonly string[] })[];
+  } {
+    const actor = this.authorizeActor(input.actor);
+    const channels = listVisibleChannels(
+      this.ctx.storage,
+      actor.id,
+      input.includeArchived === true,
+    ).map((channel) => ({
+      ...channel,
+      isMember: isChannelMember(this.ctx.storage, channel.id, actor.id),
+      participantIds:
+        channel.kind === "dm" || channel.kind === "group_dm"
+          ? channelMemberIds(this.ctx.storage, channel.id)
+          : [],
+    }));
+    return { channels };
+  }
+
+  /* -- authorization helpers ------------------------------------------- */
+
+  private authorizeActor(actor: Actor): ActiveMember {
+    const schema = readWorkspaceSchema(this.ctx.storage);
+    if (schema.status !== "ready") throw new Error("workspace is quarantined");
+    if (!this.authorizeMember(actor.memberId, actor.authorizationEpoch)) {
+      throw new Error("member is not authorized for this workspace");
+    }
+    const row = this.ctx.storage.sql
+      .exec<{ id: string; handle: string; display_name: string; role: MemberProjection["role"] }>(
+        "SELECT id, handle, display_name, role FROM members WHERE id = ?",
+        actor.memberId,
+      )
+      .one();
+    return { id: row.id, handle: row.handle, displayName: row.display_name, role: row.role };
+  }
+
+  /**
+   * On a Solo workspace the designated host is the authority for content; the
+   * relay must never hold a message body. Callers route through the encrypted
+   * relay instead.
+   */
+  private requireCloudContentAuthority(): void {
+    const config = this.ctx.storage.sql
+      .exec<{ storage_mode: WorkspaceStorageMode }>(
+        "SELECT storage_mode FROM workspace_config WHERE singleton = 1",
+      )
+      .toArray()[0];
+    if (!config) throw new Error("workspace is not initialized");
+    if (config.storage_mode !== "cloud") throw new Error("content_is_host_owned");
+  }
+
+  /**
+   * A room the caller may not see is reported as missing rather than forbidden:
+   * the two answers together would tell them a private room exists.
+   */
+  private requireVisibleChannel(channelId: string, memberId: string): ChannelRow {
+    const channel = readChannel(this.ctx.storage, channelId);
+    if (channel === null) throw new Error("channel not found");
+    if (channel.kind === "public") return channel;
+    if (!isChannelMember(this.ctx.storage, channel.id, memberId)) throw new Error("channel not found");
+    return channel;
+  }
+
+  private requireChannelParticipant(channelId: string, memberId: string): ChannelRow {
+    const channel = this.requireVisibleChannel(channelId, memberId);
+    if (!isChannelMember(this.ctx.storage, channel.id, memberId)) {
+      throw new Error("join this room before posting in it");
+    }
+    return channel;
+  }
+
+  private resolveActiveMemberIds(memberIds: readonly string[]): string[] {
+    const unique = [...new Set(memberIds)];
+    return unique.filter(
+      (id) =>
+        this.ctx.storage.sql
+          .exec<{ present: number }>(
+            "SELECT 1 AS present FROM members WHERE id = ? AND status = 'active'",
+            id,
+          )
+          .toArray()[0]?.present === 1,
+    );
+  }
+
+  private channelEffects(
+    eventType: string,
+    channelId: string,
+    actor: ActiveMember,
+    metadata: Record<string, string | number | boolean | null>,
+  ): MutationEffects {
+    return {
+      audit: {
+        eventType,
+        outcome: "allowed",
+        requesterKind: "member",
+        requesterId: actor.id,
+        subjectKind: "channel",
+        subjectId: channelId,
+        metadata,
+      },
+      replay: [{ kind: eventType, audience: [channelId], payload: { channelId, actorId: actor.id } }],
     };
   }
 

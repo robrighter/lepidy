@@ -1,3 +1,4 @@
+import type { MessagePage } from "../cloudflare/workspace-rooms";
 import type { ShellState, WorkspaceShellSource } from "./workspace-shell-source";
 
 /**
@@ -37,8 +38,51 @@ export class DevelopmentShellSource implements WorkspaceShellSource {
           { id: "agent-triage", handle: "a.triage", displayName: "Triage", status: "active" },
         ],
         storageMode: "local_host",
-        schemaVersion: 7,
+        schemaVersion: 8,
       },
     };
   }
+}
+
+const DEVELOPMENT_MESSAGES: Record<string, MessagePage> = {
+  "channel-eng": {
+    messages: [
+      {
+        id: "message-dev-1",
+        channelId: "channel-eng",
+        threadRootId: null,
+        authorKind: "member",
+        authorId: "member-development",
+        authorDisplaySnapshot: "Maya Chen",
+        bodyMarkdown: "Rolling the failed-charge retry out behind a flag this afternoon.",
+        createdAt: 1_800_000_000_000,
+        editedAt: null,
+        deletedAt: null,
+        channelSequence: 1,
+        replyCount: 2,
+        lastReplyAt: 1_800_000_060_000,
+      },
+      {
+        id: "message-dev-2",
+        channelId: "channel-eng",
+        threadRootId: null,
+        authorKind: "agent",
+        authorId: "agent-releasebot",
+        authorDisplaySnapshot: "a.releasebot",
+        bodyMarkdown: "Deploy `api@2.14.0` finished. 3 migrations applied, no rollbacks.",
+        createdAt: 1_800_000_120_000,
+        editedAt: null,
+        deletedAt: null,
+        channelSequence: 2,
+        replyCount: 0,
+        lastReplyAt: null,
+      },
+    ],
+    nextCursor: null,
+  },
+};
+
+/** Fixture history for the development workspace only. */
+export function developmentChannelHistory(channelId: string): MessagePage {
+  return DEVELOPMENT_MESSAGES[channelId] ?? { messages: [], nextCursor: null };
 }

@@ -125,6 +125,27 @@ test("SHELL-INT-005 applies dark mode, remembers it, and paints it before first 
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
 });
 
+test("ROOM-INT-013 renders channel history and tells a person from an agent", async ({ page }) => {
+  await page.goto("/c/eng");
+  await expect(page.getByRole("heading", { name: "#eng", level: 1 })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "#eng", level: 2 })).toBeVisible();
+
+  const messages = page.locator(".messages > li");
+  await expect(messages).toHaveCount(2);
+  await expect(messages.nth(0)).toContainText("Maya Chen");
+  await expect(messages.nth(0)).toContainText("failed-charge retry");
+  await expect(messages.nth(0)).toContainText("2 replies");
+  // An agent is visibly an agent, not a person with an odd name.
+  await expect(messages.nth(1)).toContainText("a.releasebot");
+  await expect(messages.nth(1).getByText("agent")).toBeVisible();
+  await expect(messages.nth(0).getByText("agent")).toHaveCount(0);
+
+  // A room with nothing in it says so rather than showing a blank panel.
+  await page.goto("/c/release");
+  await expect(page.getByRole("heading", { name: "No messages yet" })).toBeVisible();
+  await expect(page.getByText(/composer arrives with C04/)).toBeVisible();
+});
+
 test("SHELL-INT-006 states plainly that a surface is not built yet", async ({ page }) => {
   await page.goto("/inbox");
   await expect(page.getByRole("heading", { name: "Your inbox is not built yet" })).toBeVisible();

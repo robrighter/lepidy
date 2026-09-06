@@ -33,7 +33,7 @@ export type ControlPlaneShellDeps = {
   authenticateSession: (token: string) => Promise<{ accountId: string }>;
 };
 
-type WorkspaceRow = {
+export type WorkspaceRow = {
   id: string;
   slug: string;
   name: string;
@@ -50,6 +50,40 @@ type WorkspaceRow = {
  * request: the session names an account, D1 names its active membership, and the
  * object rechecks the membership epoch before returning anything.
  */
+/**
+ * Resolve the one workspace a session speaks for. Shared by every server-side
+ * reader so the session, the membership and the object id are looked up the same
+ * way once, rather than each surface inventing its own path to authority.
+ */
+export async function resolveViewerWorkspace(
+  deps: ControlPlaneShellDeps,
+  sessionToken: string | null,
+  workspaceSlug: string | null = null,
+): Promise<
+  { status: "ok"; row: WorkspaceRow } | { status: "signed_out" } | { status: "unavailable"; reason: string }
+> {
+  if (!sessionToken) return { status: "signed_out" };
+
+  let accountId: string;
+  try {
+    ({ accountId } = await deps.authenticateSession(sessionToken));
+  } catch {
+    return { status: "signed_out" };
+  }
+
+  const base = `SELECT w.id, w.slug, w.name, w.plan, w.jurisdiction, w.durable_object_id,
+                       m.member_id, m.authorization_epoch
+                FROM memberships m
+                JOIN workspaces w ON w.id = m.workspace_id
+                WHERE m.account_id = ? AND m.status = 'active' AND w.status = 'active'`;
+  const statement = workspaceSlug
+    ? deps.db.prepare(`${base} AND w.slug = ?`).bind(accountId, workspaceSlug)
+    : deps.db.prepare(`${base} ORDER BY m.created_at LIMIT 1`).bind(accountId);
+  const row = await statement.first<WorkspaceRow>();
+  if (!row) return { status: "unavailable", reason: "no active workspace membership" };
+  return { status: "ok", row };
+}
+
 export class ControlPlaneShellSource implements WorkspaceShellSource {
   constructor(
     private readonly deps: ControlPlaneShellDeps,
@@ -58,17 +92,9 @@ export class ControlPlaneShellSource implements WorkspaceShellSource {
   ) {}
 
   async load(): Promise<ShellState> {
-    if (!this.sessionToken) return { status: "signed_out" };
-
-    let accountId: string;
-    try {
-      ({ accountId } = await this.deps.authenticateSession(this.sessionToken));
-    } catch {
-      return { status: "signed_out" };
-    }
-
-    const row = await this.selectWorkspace(accountId);
-    if (!row) return { status: "unavailable", reason: "no active workspace membership" };
+    const resolved = await resolveViewerWorkspace(this.deps, this.sessionToken, this.workspaceSlug);
+    if (resolved.status !== "ok") return resolved;
+    const row = resolved.row;
 
     try {
       const stub = this.deps.workspaces.get(this.deps.workspaces.idFromString(row.durable_object_id));
@@ -93,18 +119,6 @@ export class ControlPlaneShellSource implements WorkspaceShellSource {
       // all states the shell must render honestly rather than crash on.
       return { status: "unavailable", reason: shellErrorReason(error) };
     }
-  }
-
-  private async selectWorkspace(accountId: string): Promise<WorkspaceRow | null> {
-    const base = `SELECT w.id, w.slug, w.name, w.plan, w.jurisdiction, w.durable_object_id,
-                         m.member_id, m.authorization_epoch
-                  FROM memberships m
-                  JOIN workspaces w ON w.id = m.workspace_id
-                  WHERE m.account_id = ? AND m.status = 'active' AND w.status = 'active'`;
-    const statement = this.workspaceSlug
-      ? this.deps.db.prepare(`${base} AND w.slug = ?`).bind(accountId, this.workspaceSlug)
-      : this.deps.db.prepare(`${base} ORDER BY m.created_at LIMIT 1`).bind(accountId);
-    return statement.first<WorkspaceRow>();
   }
 }
 

@@ -330,6 +330,29 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
        BEGIN SELECT RAISE(ABORT, 'audit log deletion requires an expired retention release'); END`,
     ],
   },
+  {
+    version: 8,
+    name: "rooms, direct messages and thread aggregates",
+    statements: [
+      // One conversation per set of people, however it is opened.
+      `ALTER TABLE channels ADD COLUMN dm_key TEXT`,
+      `CREATE UNIQUE INDEX channels_dm_key_idx ON channels(dm_key) WHERE dm_key IS NOT NULL`,
+      `ALTER TABLE channels ADD COLUMN topic TEXT`,
+      // Aggregates only. A Solo relay may hold activity counters but never content.
+      `ALTER TABLE channels ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0 CHECK (message_count >= 0)`,
+      `ALTER TABLE channels ADD COLUMN last_activity_at INTEGER`,
+      `ALTER TABLE messages ADD COLUMN reply_count INTEGER NOT NULL DEFAULT 0 CHECK (reply_count >= 0)`,
+      `ALTER TABLE messages ADD COLUMN last_reply_at INTEGER`,
+      `CREATE INDEX channels_kind_idx ON channels(kind, archived_at)`,
+      `CREATE TABLE channel_message_sequence (
+        channel_id TEXT PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+        next_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_sequence > 0)
+      ) STRICT`,
+      `ALTER TABLE messages ADD COLUMN channel_sequence INTEGER`,
+      `CREATE UNIQUE INDEX messages_channel_sequence_idx
+         ON messages(channel_id, channel_sequence) WHERE channel_sequence IS NOT NULL`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {
