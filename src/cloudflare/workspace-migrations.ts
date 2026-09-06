@@ -494,6 +494,46 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       ) STRICT`,
     ],
   },
+  {
+    version: 14,
+    name: "agent briefs, scope and queue",
+    statements: [
+      // The standing brief. NULL is the ordinary state: an agent without one
+      // still gets the preamble, which is the tier that matters.
+      `ALTER TABLE agents ADD COLUMN prompt TEXT`,
+      `ALTER TABLE agents ADD COLUMN scope_mode TEXT NOT NULL DEFAULT 'any'
+         CHECK (scope_mode IN ('any', 'listed'))`,
+      // An empty list allows nothing, so a scoped agent with no rooms is paused
+      // rather than unlimited.
+      `CREATE TABLE agent_scope_channels (
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        added_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, channel_id)
+      ) STRICT`,
+      `CREATE TABLE agent_queue (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        channel_id TEXT NOT NULL,
+        enqueued_at INTEGER NOT NULL,
+        read_at INTEGER,
+        flags_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(flags_json)),
+        UNIQUE (agent_id, message_id)
+      ) STRICT`,
+      // Keyset pagination over (enqueued_at, id): a queue is written to while it
+      // is read, and an offset walk silently skips rows.
+      `CREATE INDEX agent_queue_unread_idx ON agent_queue(agent_id, read_at, enqueued_at, id)`,
+      // An agent nobody owns is an agent nobody is accountable for.
+      `CREATE TRIGGER agent_owners_keep_last_delete
+       BEFORE DELETE ON agent_owners
+       WHEN NOT EXISTS (
+         SELECT 1 FROM agent_owners other
+         WHERE other.agent_id = OLD.agent_id AND other.member_id <> OLD.member_id
+       )
+       BEGIN SELECT RAISE(ABORT, 'an agent must keep at least one owner'); END`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

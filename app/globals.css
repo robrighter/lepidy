@@ -346,6 +346,24 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 .emoji-alias { font-size: 18px; }
 .emoji-list button { margin-left: auto; padding: 4px 8px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface); color: var(--text-3); }
 
+.agent-form { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px; margin-bottom: 16px; }
+.agent-form label { display: grid; gap: 4px; }
+.agent-form label span { font-size: 12px; font-weight: 600; }
+.agent-form label em { color: var(--text-3); font-size: 11.5px; font-style: normal; }
+.agent-form input { padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface-2); color: var(--text); }
+.agent-form .primary { margin-top: 18px; padding: 8px 14px; border: 0; border-radius: var(--r-sm); background: var(--accent); color: var(--on-accent); font-weight: 600; }
+.agent-form .primary:disabled { opacity: .55; cursor: not-allowed; }
+.agent-list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.agent-list li { display: flex; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-2); }
+.agent-name { display: flex; align-items: center; gap: 8px; margin: 0 0 3px; }
+.agent-description { margin: 0 0 4px; color: var(--text-2); font-size: 13px; }
+.agent-meta { margin: 0; color: var(--text-3); font-size: 12px; }
+.preamble { margin-top: 18px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--sunken); }
+.preamble summary { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.preamble-note { margin: 10px 0 8px; color: var(--text-2); font-size: 12.5px; }
+.preamble pre { margin: 0; padding: 12px; overflow-x: auto; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); }
+.preamble code { font-size: 12px; line-height: 1.55; white-space: pre-wrap; }
+
 /* ---------------- account pages ---------------- */
 
 .auth-page { display: grid; place-items: center; min-height: 100vh; padding: 32px 18px; }

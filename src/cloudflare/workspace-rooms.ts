@@ -1349,3 +1349,185 @@ export function customEmojiExists(storage: DurableObjectStorage, name: string): 
       .toArray()[0]?.present === 1
   );
 }
+
+/* -------------------------------------------------------------------------- */
+/* Agents                                                                      */
+/* -------------------------------------------------------------------------- */
+
+export type AgentRow = {
+  id: string;
+  handle: string;
+  displayName: string;
+  description: string | null;
+  status: "active" | "paused" | "archived";
+  prompt: string | null;
+  scopeMode: "any" | "listed";
+};
+
+const AGENT_COLUMNS = `id, handle, display_name, description, status, prompt, scope_mode`;
+
+type RawAgent = {
+  id: string;
+  handle: string;
+  display_name: string;
+  description: string | null;
+  status: AgentRow["status"];
+  prompt: string | null;
+  scope_mode: AgentRow["scopeMode"];
+};
+
+function toAgent(row: RawAgent): AgentRow {
+  return {
+    id: row.id,
+    handle: row.handle,
+    displayName: row.display_name,
+    description: row.description,
+    status: row.status,
+    prompt: row.prompt,
+    scopeMode: row.scope_mode,
+  };
+}
+
+export function readAgent(storage: DurableObjectStorage, agentId: string): AgentRow | null {
+  const row = storage.sql
+    .exec<RawAgent>(`SELECT ${AGENT_COLUMNS} FROM agents WHERE id = ?`, agentId)
+    .toArray()[0];
+  return row ? toAgent(row) : null;
+}
+
+export function readAgentByHandle(storage: DurableObjectStorage, handle: string): AgentRow | null {
+  const row = storage.sql
+    .exec<RawAgent>(`SELECT ${AGENT_COLUMNS} FROM agents WHERE handle = ?`, handle)
+    .toArray()[0];
+  return row ? toAgent(row) : null;
+}
+
+export function listAgentRows(storage: DurableObjectStorage): AgentRow[] {
+  return storage.sql
+    .exec<RawAgent>(`SELECT ${AGENT_COLUMNS} FROM agents WHERE status <> 'archived' ORDER BY handle`)
+    .toArray()
+    .map(toAgent);
+}
+
+export function agentOwnerIds(storage: DurableObjectStorage, agentId: string): string[] {
+  return storage.sql
+    .exec<{ member_id: string }>(
+      "SELECT member_id FROM agent_owners WHERE agent_id = ? ORDER BY added_at, member_id",
+      agentId,
+    )
+    .toArray()
+    .map((row) => row.member_id);
+}
+
+export function agentScopeChannelIds(storage: DurableObjectStorage, agentId: string): string[] {
+  return storage.sql
+    .exec<{ channel_id: string }>(
+      "SELECT channel_id FROM agent_scope_channels WHERE agent_id = ? ORDER BY channel_id",
+      agentId,
+    )
+    .toArray()
+    .map((row) => row.channel_id);
+}
+
+export function replaceAgentScope(
+  storage: DurableObjectStorage,
+  agentId: string,
+  channelIds: readonly string[],
+  now: number,
+): void {
+  storage.sql.exec("DELETE FROM agent_scope_channels WHERE agent_id = ?", agentId);
+  for (const channelId of channelIds) {
+    storage.sql.exec(
+      `INSERT INTO agent_scope_channels(agent_id, channel_id, added_at) VALUES (?, ?, ?)
+       ON CONFLICT(agent_id, channel_id) DO NOTHING`,
+      agentId,
+      channelId,
+      now,
+    );
+  }
+}
+
+export function enqueueAgentWork(
+  storage: DurableObjectStorage,
+  input: {
+    id: string;
+    agentId: string;
+    messageId: string;
+    channelId: string;
+    flags: readonly string[];
+    now: number;
+  },
+): boolean {
+  return (
+    storage.sql.exec(
+      `INSERT INTO agent_queue(id, agent_id, message_id, channel_id, enqueued_at, flags_json)
+       VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(agent_id, message_id) DO NOTHING`,
+      input.id,
+      input.agentId,
+      input.messageId,
+      input.channelId,
+      input.now,
+      JSON.stringify([...input.flags]),
+    ).rowsWritten > 0
+  );
+}
+
+export function agentQueueDepth(storage: DurableObjectStorage, agentId: string): number {
+  return storage.sql
+    .exec<{ depth: number }>(
+      "SELECT COUNT(*) AS depth FROM agent_queue WHERE agent_id = ? AND read_at IS NULL",
+      agentId,
+    )
+    .one().depth;
+}
+
+export type QueueItemRow = {
+  id: string;
+  messageId: string;
+  channelId: string;
+  enqueuedAt: number;
+  readAt: number | null;
+  flags: readonly string[];
+  bodyMarkdown: string;
+  authorDisplaySnapshot: string;
+};
+
+/** Keyset order, because a queue is written to while it is read. */
+export function listAgentQueue(
+  storage: DurableObjectStorage,
+  agentId: string,
+  limit: number,
+  unreadOnly: boolean,
+): QueueItemRow[] {
+  return storage.sql
+    .exec<{
+      id: string;
+      message_id: string;
+      channel_id: string;
+      enqueued_at: number;
+      read_at: number | null;
+      flags_json: string;
+      body_markdown: string;
+      author_display_snapshot: string;
+    }>(
+      `SELECT q.id, q.message_id, q.channel_id, q.enqueued_at, q.read_at, q.flags_json,
+              m.body_markdown, m.author_display_snapshot
+       FROM agent_queue q JOIN messages m ON m.id = q.message_id
+       WHERE q.agent_id = ? AND (? = 0 OR q.read_at IS NULL) AND m.deleted_at IS NULL
+       ORDER BY q.enqueued_at, q.id LIMIT ?`,
+      agentId,
+      unreadOnly ? 1 : 0,
+      limit,
+    )
+    .toArray()
+    .map((row) => ({
+      id: row.id,
+      messageId: row.message_id,
+      channelId: row.channel_id,
+      enqueuedAt: row.enqueued_at,
+      readAt: row.read_at,
+      flags: JSON.parse(row.flags_json) as string[],
+      bodyMarkdown: row.body_markdown,
+      authorDisplaySnapshot: row.author_display_snapshot,
+    }));
+}

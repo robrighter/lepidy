@@ -76,7 +76,21 @@ import {
 } from "../domain/socket-protocol";
 import { parseMentions } from "../domain/mentions";
 import { isEmojiToken, parseCustomEmojiName } from "../domain/emoji";
+import {
+  agentMayPostIn,
+  decideEnqueue,
+  flagSuspiciousContent,
+  mayRemoveOwner,
+  type AgentScope,
+} from "../domain/agent-scope";
+import {
+  SECURITY_PREAMBLE_VERSION,
+  assembleBrief,
+  parseAgentBrief,
+  type BriefTier,
+} from "../domain/agent-preamble";
 import { commandMessageBody, parseComposerInput } from "../domain/slash-commands";
+import { parseAgentHandle } from "../domain/mention-handle";
 import {
   addChannelMembers,
   addReaction,
@@ -90,12 +104,18 @@ import {
   isChannelMember,
   listChannelHistory,
   listThreadHistory,
+  agentOwnerIds,
+  agentQueueDepth,
+  agentScopeChannelIds,
   claimDueScheduledMessages,
   customEmojiExists,
   deleteCustomEmoji,
   deleteDraft,
   insertCustomEmoji,
   insertSnippet,
+  enqueueAgentWork,
+  listAgentQueue,
+  listAgentRows,
   listCustomEmoji,
   insertScheduledMessage,
   listDraftsForMember,
@@ -103,8 +123,11 @@ import {
   listSavedPointers,
   listScheduledForMember,
   nextScheduledSendAt,
+  readAgent,
+  readAgentByHandle,
   readDraft,
   readScheduledMessage,
+  replaceAgentScope,
   readSnippets,
   settleScheduledMessage,
   updateScheduledMessage,
@@ -132,8 +155,10 @@ import {
   resolveMentionTargets,
   writeChannelCursor,
   writeThreadCursor,
+  type AgentRow,
   type ChannelRow,
   type CustomEmojiRow,
+  type QueueItemRow,
   type DraftRow,
   type MessagePage,
   type MessageRow,
@@ -262,6 +287,22 @@ export type SocketAttachment = {
   /** Highest replay sequence this socket has been sent. */
   cursor: number;
   connectedAt: number;
+};
+
+export type AgentSummary = {
+  id: string;
+  handle: string;
+  displayName: string;
+  description: string | null;
+  status: "active" | "paused" | "archived";
+  scopeMode: "any" | "listed";
+  /** Only the scoped rooms this reader may see. */
+  scopeChannelIds: readonly string[];
+  scopeChannelCount: number;
+  ownerIds: readonly string[];
+  isOwner: boolean;
+  /** Only an owner sees a queue depth. */
+  queueDepth: number | null;
 };
 
 export type ComposerOutcome =
@@ -1420,6 +1461,18 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           now: input.now,
         });
         replaceMentions(this.ctx.storage, messageId, mentions, input.now);
+        // A mention becomes work in the same transaction as the message, so a
+        // queue item can never exist for a message that was rolled back.
+        const enqueued = this.enqueueAgentMentions({
+          messageId,
+          channelId: channel.id,
+          authorKind: "member",
+          authorId: actor.id,
+          bodyMarkdown: body,
+          mentions,
+          isHistorical: false,
+          now: input.now,
+        });
 
         return {
           result: {
@@ -1446,6 +1499,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                 in_thread: threadRootId !== null,
                 channel_sequence: channelSequence,
                 mention_count: mentions.length,
+                agent_work_enqueued: enqueued,
               },
             },
             // Delivery carries identifiers; a reader fetches the message it is
@@ -2656,6 +2710,445 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   listCustomEmoji(input: { actor: Actor }): { emoji: readonly CustomEmojiRow[] } {
     this.authorizeActor(input.actor);
     return { emoji: listCustomEmoji(this.ctx.storage) };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Agent identities, ownership, briefs and scope (A01)                 */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Create an agent.
+   *
+   * Anyone in the workspace may create one, and whoever does becomes its first
+   * owner, because an agent nobody owns is an agent nobody is accountable for.
+   * An agent is not a login: it has no account, no session and no membership
+   * row, and it can never be an actor.
+   */
+  async createAgent(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    handle: string;
+    displayName?: string | null;
+    description?: string | null;
+    prompt?: string | null;
+    scopeMode?: "any" | "listed";
+    scopeChannelIds?: readonly string[];
+    now: number;
+  }): Promise<{ agentId: string; handle: string; created: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    if (actor.role === "guest") throw new Error("this role cannot create agents");
+
+    const handle = parseAgentHandle(input.handle);
+    if (handle === null) throw new Error("an agent handle must be in the a. namespace");
+    const displayName = parseChannelName(input.displayName, handle.slice(2));
+    const description = parseChannelTopic(input.description);
+    const prompt = parseAgentBrief(input.prompt);
+    const scopeMode = input.scopeMode === "listed" ? "listed" : "any";
+    const scopeChannelIds =
+      scopeMode === "listed" ? this.resolveScopeChannels(input.scopeChannelIds ?? [], actor.id) : [];
+
+    const outcome = await this.commitMutation(
+      {
+        scope: "agent.create",
+        idempotencyKey: input.idempotencyKey,
+        requestHash: `${actor.id}|${handle}`,
+        now: input.now,
+      },
+      () => {
+        if (readAgentByHandle(this.ctx.storage, handle) !== null) {
+          throw new Error("that agent handle is already taken");
+        }
+        const agentId = crypto.randomUUID();
+        this.ctx.storage.sql.exec(
+          `INSERT INTO agents(id, handle, display_name, description, status, prompt, scope_mode,
+                              created_by_member_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+          agentId,
+          handle,
+          displayName,
+          description,
+          prompt,
+          scopeMode,
+          actor.id,
+          input.now,
+          input.now,
+        );
+        this.ctx.storage.sql.exec(
+          "INSERT INTO agent_owners(agent_id, member_id, added_by_member_id, added_at) VALUES (?, ?, ?, ?)",
+          agentId,
+          actor.id,
+          actor.id,
+          input.now,
+        );
+        replaceAgentScope(this.ctx.storage, agentId, scopeChannelIds, input.now);
+
+        return {
+          result: { agentId, handle, created: true },
+          effects: {
+            audit: {
+              eventType: "agent.created",
+              outcome: "allowed" as const,
+              requesterKind: "member" as const,
+              requesterId: actor.id,
+              subjectKind: "agent",
+              subjectId: agentId,
+              metadata: { agent_handle: handle, scope_mode: scopeMode, scope_size: scopeChannelIds.length },
+            },
+          } satisfies MutationEffects,
+        };
+      },
+    );
+    return { ...outcome.result, created: !outcome.replayed };
+  }
+
+  /** Owners are the agent's accountable humans, so only an owner may add one. */
+  async addAgentOwner(input: {
+    actor: Actor;
+    agentId: string;
+    memberId: string;
+    now: number;
+  }): Promise<{ added: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    if (this.resolveActiveMemberIds([input.memberId]).length !== 1) {
+      throw new Error("member is not active in this workspace");
+    }
+
+    const outcome = await this.commitMutation({ scope: "agent.add_owner", now: input.now }, () => {
+      const result = this.ctx.storage.sql.exec(
+        `INSERT INTO agent_owners(agent_id, member_id, added_by_member_id, added_at)
+         VALUES (?, ?, ?, ?) ON CONFLICT(agent_id, member_id) DO NOTHING`,
+        agent.id,
+        input.memberId,
+        actor.id,
+        input.now,
+      );
+      if (result.rowsWritten === 0) return { result: { added: false } };
+      return {
+        result: { added: true },
+        effects: this.agentEffects("agent.owner_added", agent, actor, {
+          subject_member_id: input.memberId,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /**
+   * Remove an owner, unless they are the last one.
+   *
+   * The database enforces this too, but refusing here means the caller gets a
+   * sentence rather than a constraint violation.
+   */
+  async removeAgentOwner(input: {
+    actor: Actor;
+    agentId: string;
+    memberId: string;
+    now: number;
+  }): Promise<{ removed: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    const owners = agentOwnerIds(this.ctx.storage, agent.id);
+    if (!owners.includes(input.memberId)) return { removed: false };
+    if (!mayRemoveOwner(owners, input.memberId)) {
+      throw new Error("an agent must keep at least one owner");
+    }
+
+    const outcome = await this.commitMutation({ scope: "agent.remove_owner", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM agent_owners WHERE agent_id = ? AND member_id = ?",
+        agent.id,
+        input.memberId,
+      );
+      return {
+        result: { removed: true },
+        effects: this.agentEffects("agent.owner_removed", agent, actor, {
+          subject_member_id: input.memberId,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /** The brief is tier two. Owners write it; the ceiling above it is not theirs. */
+  async setAgentBrief(input: {
+    actor: Actor;
+    agentId: string;
+    prompt: string | null;
+    now: number;
+  }): Promise<{ prompt: string | null }> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    const prompt = parseAgentBrief(input.prompt);
+
+    const outcome = await this.commitMutation({ scope: "agent.set_brief", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE agents SET prompt = ?, updated_at = ? WHERE id = ?",
+        prompt,
+        input.now,
+        agent.id,
+      );
+      return {
+        result: { prompt },
+        // The brief's length is recorded; its text is not, because an audit
+        // record outlives the thing it describes.
+        effects: this.agentEffects("agent.brief_set", agent, actor, {
+          brief_length: prompt?.length ?? 0,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /**
+   * Set the agent's scope.
+   *
+   * There is deliberately no path to this from an agent's own tools: a boundary
+   * an agent can widen is advisory. Only an owner, acting as themselves, may
+   * change it, and only to rooms that owner can actually reach.
+   */
+  async setAgentScope(input: {
+    actor: Actor;
+    agentId: string;
+    mode: "any" | "listed";
+    channelIds?: readonly string[];
+    now: number;
+  }): Promise<{ mode: "any" | "listed"; channelIds: readonly string[] }> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    const mode: "any" | "listed" = input.mode === "listed" ? "listed" : "any";
+    const channelIds = mode === "listed" ? this.resolveScopeChannels(input.channelIds ?? [], actor.id) : [];
+
+    const outcome = await this.commitMutation({ scope: "agent.set_scope", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE agents SET scope_mode = ?, updated_at = ? WHERE id = ?",
+        mode,
+        input.now,
+        agent.id,
+      );
+      replaceAgentScope(this.ctx.storage, agent.id, channelIds, input.now);
+      return {
+        result: { mode, channelIds },
+        effects: this.agentEffects("agent.scope_set", agent, actor, {
+          scope_mode: mode,
+          scope_size: channelIds.length,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  async setAgentStatus(input: {
+    actor: Actor;
+    agentId: string;
+    status: "active" | "paused" | "archived";
+    now: number;
+  }): Promise<{ status: string }> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    if (!["active", "paused", "archived"].includes(input.status)) throw new Error("unknown agent status");
+
+    const outcome = await this.commitMutation({ scope: "agent.set_status", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE agents SET status = ?, updated_at = ? WHERE id = ?",
+        input.status,
+        input.now,
+        agent.id,
+      );
+      return {
+        result: { status: input.status },
+        effects: this.agentEffects("agent.status_set", agent, actor, { agent_status: input.status }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /** The directory: every live agent, its owners, its scope and its queue depth. */
+  listAgents(input: { actor: Actor }): { agents: readonly AgentSummary[] } {
+    const actor = this.authorizeActor(input.actor);
+    const agents = listAgentRows(this.ctx.storage).map((agent) => {
+      const ownerIds = agentOwnerIds(this.ctx.storage, agent.id);
+      const scopeChannelIds = agentScopeChannelIds(this.ctx.storage, agent.id);
+      return {
+        id: agent.id,
+        handle: agent.handle,
+        displayName: agent.displayName,
+        description: agent.description,
+        status: agent.status,
+        scopeMode: agent.scopeMode,
+        // Only rooms this reader may see; an agent's scope is not a way to
+        // learn that a private room exists.
+        scopeChannelIds: scopeChannelIds.filter((channelId) => {
+          const channel = readChannel(this.ctx.storage, channelId);
+          return channel !== null && canSeeChannel(this.channelVisibility(channel, actor.id));
+        }),
+        scopeChannelCount: scopeChannelIds.length,
+        ownerIds,
+        isOwner: ownerIds.includes(actor.id),
+        queueDepth: ownerIds.includes(actor.id) ? agentQueueDepth(this.ctx.storage, agent.id) : null,
+      };
+    });
+    return { agents };
+  }
+
+  /**
+   * The three tiers, as an owner sees them on the agent's page.
+   *
+   * The preamble is returned read-only. An owner who cannot see the ceiling will
+   * eventually write a brief that argues with it and wonder why the agent
+   * refuses.
+   */
+  readAgentBrief(input: { actor: Actor; agentId: string }): {
+    tiers: readonly BriefTier[];
+    preambleVersion: number;
+  } {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    const owners = agentOwnerIds(this.ctx.storage, agent.id).map(
+      (memberId) =>
+        this.ctx.storage.sql
+          .exec<{ display_name: string }>("SELECT display_name FROM members WHERE id = ?", memberId)
+          .toArray()[0]?.display_name ?? memberId,
+    );
+    return {
+      tiers: assembleBrief({ agentBrief: agent.prompt, messageBody: "", ownerNames: owners }),
+      preambleVersion: SECURITY_PREAMBLE_VERSION,
+    };
+  }
+
+  /** An owner's view of what has been queued for their agent. */
+  readAgentQueue(input: {
+    actor: Actor;
+    agentId: string;
+    limit?: number;
+    unreadOnly?: boolean;
+  }): { items: readonly QueueItemRow[]; depth: number } {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    return {
+      items: listAgentQueue(
+        this.ctx.storage,
+        agent.id,
+        clampHistoryLimit(input.limit),
+        input.unreadOnly !== false,
+      ),
+      depth: agentQueueDepth(this.ctx.storage, agent.id),
+    };
+  }
+
+  /**
+   * Whether this agent may write into this room.
+   *
+   * The same rule the enqueue side uses. A01 wires the read side; the write
+   * side calls this from the agent's own tools in A03.
+   */
+  agentMayPost(input: { agentId: string; channelId: string }): boolean {
+    const agent = readAgent(this.ctx.storage, input.agentId);
+    if (agent === null) return false;
+    return agentMayPostIn({
+      agentStatus: agent.status,
+      scope: this.agentScope(agent),
+      channelId: input.channelId,
+    });
+  }
+
+  /* -- agent helpers ---------------------------------------------------- */
+
+  private agentScope(agent: AgentRow): AgentScope {
+    return agent.scopeMode === "any"
+      ? { mode: "any" }
+      : { mode: "listed", channelIds: agentScopeChannelIds(this.ctx.storage, agent.id) };
+  }
+
+  /**
+   * An agent an owner may administer. Somebody else's agent is reported as
+   * missing rather than forbidden, the same as a room they cannot see.
+   */
+  private requireOwnedAgent(agentId: string, memberId: string): AgentRow {
+    const agent = readAgent(this.ctx.storage, agentId);
+    if (agent === null) throw new Error("agent not found");
+    if (!agentOwnerIds(this.ctx.storage, agent.id).includes(memberId)) {
+      throw new Error("agent not found");
+    }
+    return agent;
+  }
+
+  /** An owner cannot scope an agent to a room they cannot reach themselves. */
+  private resolveScopeChannels(channelIds: readonly string[], memberId: string): string[] {
+    const unique = [...new Set(channelIds)];
+    return unique.map((channelId) => this.requireVisibleChannel(channelId, memberId).id);
+  }
+
+  private agentEffects(
+    eventType: string,
+    agent: AgentRow,
+    actor: ActiveMember,
+    metadata: Record<string, string | number | boolean | null>,
+  ): MutationEffects {
+    return {
+      audit: {
+        eventType,
+        outcome: "allowed",
+        requesterKind: "member",
+        requesterId: actor.id,
+        subjectKind: "agent",
+        subjectId: agent.id,
+        metadata: { agent_handle: agent.handle, ...metadata },
+      },
+    };
+  }
+
+  /**
+   * Turn the agent mentions on a message into queued work.
+   *
+   * Every brake lives in `decideEnqueue`, so this only supplies the facts and
+   * records what came back. An out-of-scope or agent-authored mention leaves no
+   * queue row at all: the message never reaches the agent's context and never
+   * reaches an owner's view.
+   */
+  private enqueueAgentMentions(input: {
+    messageId: string;
+    channelId: string;
+    authorKind: "member" | "agent" | "imported";
+    authorId: string;
+    bodyMarkdown: string;
+    mentions: readonly { kind: string; handle: string; resolvedId: string | null }[];
+    isHistorical: boolean;
+    now: number;
+  }): number {
+    let enqueued = 0;
+    const flags = flagSuspiciousContent(input.bodyMarkdown);
+
+    for (const mention of input.mentions) {
+      if (mention.kind !== "agent" || mention.resolvedId === null) continue;
+      const agent = readAgent(this.ctx.storage, mention.resolvedId);
+      if (agent === null) continue;
+
+      const decision = decideEnqueue({
+        authorKind: input.authorKind,
+        authorId: input.authorId,
+        agentId: agent.id,
+        agentStatus: agent.status,
+        scope: this.agentScope(agent),
+        channelId: input.channelId,
+        isHistorical: input.isHistorical,
+      });
+      if (!decision.enqueue) continue;
+
+      if (
+        enqueueAgentWork(this.ctx.storage, {
+          id: crypto.randomUUID(),
+          agentId: agent.id,
+          messageId: input.messageId,
+          channelId: input.channelId,
+          flags,
+          now: input.now,
+        })
+      ) {
+        enqueued += 1;
+      }
+    }
+    return enqueued;
   }
 
   /** Newest-first channel history, refused outright for a room the caller cannot see. */

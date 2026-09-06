@@ -1,16 +1,18 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
-
 import type { CustomEmojiRow } from "@/src/cloudflare/workspace-rooms";
 import { isFailure, shellErrorReason, viewerWorkspace } from "@/src/shell/viewer-workspace";
 
 /**
- * The action hands back the list it produced.
+ * The action hands back the list it produced, and deliberately does not
+ * revalidate the path.
  *
- * Waiting for the framework to re-render the page after a mutation makes what
- * the person sees depend on revalidation timing. Returning the new list makes
- * the change they just made appear because they made it.
+ * Waiting for the framework to re-render after a mutation makes what somebody
+ * sees depend on revalidation timing. Worse, a revalidation that lands after the
+ * client has already applied the result re-seeds the component with the props
+ * the server had *before* the write, so the change disappears again. Returning
+ * the new list and leaving the page alone removes both problems; a fresh
+ * navigation reads from the server as usual.
  */
 export type EmojiResult =
   | { ok: true; emoji: readonly CustomEmojiRow[] }
@@ -35,7 +37,6 @@ export async function createEmojiAction(input: {
       now: Date.now(),
     });
     const listed = await workspace.stub.listCustomEmoji({ actor: workspace.actor });
-    revalidatePath("/emoji");
     return { ok: true, emoji: listed.emoji };
   } catch (error) {
     return { ok: false, reason: shellErrorReason(error) };
@@ -55,7 +56,6 @@ export async function deleteEmojiAction(input: {
       now: Date.now(),
     });
     const listed = await workspace.stub.listCustomEmoji({ actor: workspace.actor });
-    revalidatePath("/emoji");
     return { ok: true, emoji: listed.emoji };
   } catch (error) {
     return { ok: false, reason: shellErrorReason(error) };

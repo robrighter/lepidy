@@ -84,7 +84,6 @@ export async function cancelScheduledAction(input: {
     // The action hands back the list it produced rather than leaving what the
     // person sees to depend on revalidation timing.
     const listed = await workspace.stub.listScheduledMessages({ actor: workspace.actor });
-    revalidatePath("/scheduled");
     return { ok: true, scheduled: listed.scheduled };
   } catch (error) {
     return { ok: false, reason: shellErrorReason(error) };
