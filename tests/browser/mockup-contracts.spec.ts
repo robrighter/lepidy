@@ -4,6 +4,14 @@ const mockups = "http://127.0.0.1:4174";
 
 test("MOCKUP-SEC-001 renders Solo local-content and online-host terms", async ({ page }) => {
   await page.goto(`${mockups}/pricing.html`);
+  await expect(
+    page.getByRole("heading", {
+      name: "Build unlimited autonomous agents. Use the AI accounts you already have.",
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Unlimited autonomous agents with your ChatGPT or Claude account"),
+  ).toHaveCount(2);
   await expect(page.getByText("Messages, files and vault ciphertext on one designated computer")).toBeVisible();
   await expect(page.getByText("Remote access while that computer is online")).toBeVisible();
 

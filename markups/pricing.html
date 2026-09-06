@@ -13,9 +13,9 @@
   <div style="max-width:1000px;width:100%">
     <div style="text-align:center;margin-bottom:34px">
       <img src="assets/img/mark.svg" width="40" height="40" alt="">
-      <h1 style="font:700 34px/1.15 var(--font-display);margin:14px 0 8px">Agents are free.<br>Humans are the meter.</h1>
+      <h1 style="font:700 34px/1.15 var(--font-display);margin:14px 0 8px">Build unlimited autonomous agents.<br>Use the AI accounts you already have.</h1>
       <p style="color:var(--text-2);max-width:440px;margin:0 auto">
-        Every plan has the vault, agents and remote access.
+        Connect your existing ChatGPT or Claude account. Lepidy does not charge per agent.
         Solo stores channel contents on your computer. Team keeps them available in the cloud.</p>
     </div>
 
@@ -61,8 +61,8 @@
 UI.mount({ page: "pricing" });
 const tick = UI.icon("check");
 const F = {
- f1: ["Channel names and access metadata in cloud", "Messages, files and vault ciphertext on one designated computer", "Remote access while that computer is online", "Full vault, approvals and unlimited agents", "Use storage available on your own computer"],
- f2: ["Cloud-hosted messages and collaboration", "5 humans included; up to 50 supported", "10 humans: $39/month · 20: $79 · 50: $199", "25 GB storage + 5 GB per seat above five", "Optional 100 GB storage packs: $5/month", "Monthly billing · no automatic usage overages"]
+ f1: ["Unlimited autonomous agents with your ChatGPT or Claude account", "Channel names and access metadata in cloud", "Messages, files and vault ciphertext on one designated computer", "Remote access while that computer is online", "Full vault and approvals", "Use storage available on your own computer"],
+ f2: ["Unlimited autonomous agents with your ChatGPT or Claude account", "Cloud-hosted messages and collaboration", "5 humans included; up to 50 supported", "10 humans: $39/month · 20: $79 · 50: $199", "25 GB storage + 5 GB per seat above five", "Optional 100 GB storage packs: $5/month", "Monthly billing · no automatic usage overages"]
 };
 for (const [id, items] of Object.entries(F))
   document.getElementById(id).innerHTML = items.map(t => `<li>${tick}<span>${t}</span></li>`).join("");
