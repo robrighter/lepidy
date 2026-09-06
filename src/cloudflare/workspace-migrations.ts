@@ -157,6 +157,51 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       ) STRICT`,
     ],
   },
+  {
+    version: 3,
+    name: "workspace membership safeguards",
+    statements: [
+      `CREATE TRIGGER members_reserve_principal_handles_insert
+       BEFORE INSERT ON members
+       WHEN lower(NEW.handle) LIKE 'a.%' OR lower(NEW.handle) LIKE 'g.%'
+       BEGIN SELECT RAISE(ABORT, 'human handle uses a reserved namespace'); END`,
+      `CREATE TRIGGER members_reserve_principal_handles_update
+       BEFORE UPDATE OF handle ON members
+       WHEN lower(NEW.handle) LIKE 'a.%' OR lower(NEW.handle) LIKE 'g.%'
+       BEGIN SELECT RAISE(ABORT, 'human handle uses a reserved namespace'); END`,
+      `CREATE TRIGGER members_keep_last_owner_update
+       BEFORE UPDATE OF role, status ON members
+       WHEN OLD.role = 'owner' AND OLD.status = 'active'
+         AND (NEW.role <> 'owner' OR NEW.status <> 'active')
+         AND NOT EXISTS (
+           SELECT 1 FROM members other
+           WHERE other.id <> OLD.id AND other.role = 'owner' AND other.status = 'active'
+         )
+       BEGIN SELECT RAISE(ABORT, 'workspace requires an active owner'); END`,
+      `CREATE TRIGGER members_keep_last_owner_delete
+       BEFORE DELETE ON members
+       WHEN OLD.role = 'owner' AND OLD.status = 'active'
+         AND NOT EXISTS (
+           SELECT 1 FROM members other
+           WHERE other.id <> OLD.id AND other.role = 'owner' AND other.status = 'active'
+         )
+       BEGIN SELECT RAISE(ABORT, 'workspace requires an active owner'); END`,
+    ],
+  },
+  {
+    version: 4,
+    name: "plan-specific workspace authority",
+    statements: [
+      `CREATE TABLE workspace_config (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        storage_mode TEXT NOT NULL CHECK (storage_mode IN ('local_host', 'cloud')),
+        host_epoch INTEGER NOT NULL DEFAULT 0 CHECK (host_epoch >= 0),
+        routing_epoch INTEGER NOT NULL DEFAULT 1 CHECK (routing_epoch > 0),
+        initialized_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      ) STRICT`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

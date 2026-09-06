@@ -9,6 +9,7 @@
     "../src/**/*.test.ts",
     "../src/cloudflare/workspace.ts",
     "../src/cloudflare/workspace-migrations.ts",
+    "../src/types/**/*.d.ts",
     "../worker-configuration.d.ts"
   ],
   "exclude": ["../node_modules"]
