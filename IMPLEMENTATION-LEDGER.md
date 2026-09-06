@@ -20,7 +20,7 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 
 | Done | ID | Task | Dependencies | Reuse | Acceptance / required output | Status | Owner | Started | Finished | Evidence |
 |---|---|---|---|---|---|---|---|---|---|---|
-| [ ] | D01 | Identity and tenant contract | — | S1,S2 | Document URL/cookie/passkey boundaries, tenant-local author IDs, linking/recovery and cross-plane revocation; reconcile specs. | todo | — | — | — | — |
+| [x] | D01 | Identity and tenant contract | — | S1,S2 | Document URL/cookie/passkey boundaries, tenant-local author IDs, linking/recovery and cross-plane revocation; reconcile specs. | done | /root | 2026-09-05 | 2026-09-05 | [D01](#d01--identity-and-tenant-contract) |
 | [ ] | D02 | Runner and queue contract | — | S2,S3,V2 | Resolve designated runner/concurrency, leases/fencing, completion, retries, idle timeout, disconnect policy and session-token scope. | todo | — | — | — | — |
 | [ ] | D03 | MCP waiting and harness spike | F01,F03,D02 | S3,V2 | Demonstrate repeated work in one harness without a permanently parked workspace request; measure idle duration and test cancellation/reconnect. | todo | — | — | — | — |
 | [ ] | D04 | Vault and approval contract | D01 | V1,V4 | Specify ACL union/intersection, provenance binding, signed project/device claims, step-up matrix, batch approvals and grant expiry semantics. | todo | — | — | — | — |
@@ -83,6 +83,17 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 ## Evidence records
 
 Append one record per completed task; use the matching task ID as its heading. For partial work, label it explicitly and retain in_progress or blocked in the table.
+
+### D01 — Identity and tenant contract
+
+- Task / owner: D01 / `/root`
+- Status / dates: done / 2026-09-05 to 2026-09-05
+- Decision delivered: path-scoped workspace URLs at `app.lepidy.com/w/{slug}`; WebAuthn RP ID `app.lepidy.com`; host-only opaque session cookie; tenant-local immutable member/agent/group authors; explicit stepped-up identity linking; recovery and versioned, fail-closed cross-plane revocation.
+- Changed files: `docs/identity-tenant-contract.md`, `PRD.md`, `HLD.md`, `IMPLEMENTATION-LEDGER.md`.
+- Reused design: `../slip-robotics-chat` commit `07508524d1b8aabc4dc12f2adb02f34779837505` handle, invitation and agent-author concepts; `../agent-vault` commit `d794820084151eddbdbb56bf9cd10b5bf3666cdc` device authority and recovery concerns. Both were adapted to a many-tenant account/member split; no source was copied.
+- Verification: `npm run verify:local` passed using the pinned Linux runtime: 8 Workers tests, 6 browser integrations with accessibility scan, TypeScript, Next.js and OpenNext builds, Wrangler dry run, zero production dependency vulnerabilities, and native Windows Tauri formatting/compile.
+- Exercised boundaries: the existing local integration gate remained green after reconciling the PRD/HLD. The contract records eight mandatory integration scenarios for F04/F05; no runtime identity behavior is claimed in this decision task.
+- Limitations / follow-ups: custom tenant domains remain outside v1. F03 implements the schema and migration boundary; F04 and F05 implement and exercise linking, onboarding, session and revocation behavior.
 
 ### F01 — Next.js/OpenNext and Tauri workspace skeleton
 

@@ -151,9 +151,9 @@ So:
 - Every subsequent request resolves `slug → do_id` from D1 (or the KV cache in front of it) and uses `idFromString()`, which does no global coordination.
 
 ```
-  acme.lepidy.app/channels/eng
+  app.lepidy.com/w/acme/channels/eng
         │
-        ├─ 1. host → workspace slug
+        ├─ 1. path → workspace slug
         ├─ 2. slug → { do_id, jurisdiction, plan } from KV, else D1
         ├─ 3. session cookie → user (§8)
         ├─ 4. membership check: is this user in this workspace?   ← control plane
@@ -399,6 +399,8 @@ The first two are control plane, the third is data plane, and no request skips a
 
 ### 8.2 Authoritative sessions and approval gestures
 
+The accepted origin, cookie, passkey, tenant-local author, linking and revocation rules are normative in [`docs/identity-tenant-contract.md`](./docs/identity-tenant-contract.md). Workspace URLs use `https://app.lepidy.com/w/{workspace_slug}/…`, the WebAuthn RP ID is `app.lepidy.com`, and the browser uses a host-only `__Host-lepidy_session` cookie. This keeps one account and passkey boundary across every workspace.
+
 Resolve sessions and workspace membership from authoritative D1 reads, without KV session caching. If read replication is enabled, authorization must explicitly use the primary/fresh path. Indexed reads are inexpensive; do not trade revocation correctness for speculative savings. The former 10-second KV TTL guarantee was invalid: KV is eventually consistent and its minimum read-cache TTL is 30 seconds. [KV documentation](https://developers.cloudflare.com/kv/api/read-key-value-pairs/)
 
 Next.js must not cache session decisions, grants, approvals, or permission-sensitive workspace responses across requests or users. Public static assets can be cached normally. Workspace content is initially fetched through authorized calls and subsequently refreshed by realtime events or explicit refetches.
@@ -411,7 +413,9 @@ Existing WebSockets need explicit revocation propagation and live checks on priv
 
 Accounts are ours (PRD §13.1). Password verification uses **Argon2id compiled to WASM, executed in the Worker** — login is not a hot path, and Workers' SubtleCrypto offers PBKDF2, which is not what should stand in front of a vault. Google is an OAuth client only; the dance returns a verified email and we do the rest.
 
-**Two login methods join to one account only when both sides present the same *verified* email.** Written as a single function in `shared/`, with tests, against the provider we add next rather than the one we have — "link by whatever email the provider claimed" is the classic account-takeover primitive and it looks entirely reasonable until it isn't.
+Verified email is required to create or add an address, but it is not sufficient to merge accounts. Linking requires a fresh authenticated session, step-up with an existing strong method, proof from the new provider and explicit confirmation. A matching verified email starts that flow; it never silently joins two accounts. The rule lives as a pure function in `shared/` with integration coverage for collisions and replay.
+
+Workspace content uses an immutable tenant-local `member_id`, never the global D1 `account_id`. D1 gates entry; the workspace copy gates content. Membership changes are versioned, durable control operations: privilege increases wait for the object's acknowledgement, while reductions fail closed at D1 and revoke sockets, delegations and grants in the object. Account recovery increments a global security epoch and remains locked until all workspace revocations acknowledge. The full protocol and test invariants are in the identity contract.
 
 ---
 
