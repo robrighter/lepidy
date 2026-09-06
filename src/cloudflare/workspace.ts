@@ -48,6 +48,21 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     };
   }
 
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname !== "/_internal/member-socket" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("Not found", { status: 404 });
+    }
+    const memberId = request.headers.get("x-lepidy-member-id") ?? "";
+    const authorizationEpoch = Number(request.headers.get("x-lepidy-authorization-epoch"));
+    if (!this.authorizeMember(memberId, authorizationEpoch)) {
+      return new Response("Forbidden", { status: 403 });
+    }
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1], [memberId]);
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
   initializeWorkspace(input: {
     storageMode: WorkspaceStorageMode;
     hostEpoch: number;
@@ -85,7 +100,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const schema = readWorkspaceSchema(this.ctx.storage);
     if (schema.status !== "ready") throw new Error("workspace is quarantined");
 
-    return this.ctx.storage.transactionSync(() => {
+    const result = this.ctx.storage.transactionSync(() => {
       const replay = this.ctx.storage.sql
         .exec<{ version: number }>(
           "SELECT version FROM applied_control_operations WHERE operation_id = ?",
@@ -138,6 +153,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       );
       return { applied: true, version: member.version };
     });
+    if (result.applied && (member.authorizationEpoch > 1 || member.status !== "active")) {
+      this.closeMemberSockets(member.memberId);
+    }
+    return result;
   }
 
   getMember(memberId: string): {
@@ -165,5 +184,23 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           controlVersion: row.control_version,
         }
       : null;
+  }
+
+  authorizeMember(memberId: string, authorizationEpoch: number): boolean {
+    const row = this.ctx.storage.sql
+      .exec<{ allowed: number }>(
+        `SELECT 1 AS allowed FROM members
+         WHERE id = ? AND status = 'active' AND authorization_epoch = ?`,
+        memberId,
+        authorizationEpoch,
+      )
+      .toArray()[0];
+    return row?.allowed === 1;
+  }
+
+  closeMemberSockets(memberId: string, reason = "membership authority changed"): number {
+    const sockets = this.ctx.getWebSockets(memberId);
+    for (const socket of sockets) socket.close(4003, reason.slice(0, 123));
+    return sockets.length;
   }
 }

@@ -111,6 +111,8 @@ Manual review and screenshots can supplement visual judgment, store review and h
 | `WORKSPACE-INT-001` | `tests/workspace.test.ts` | Direct RPC to a local SQLite Durable Object and singleton schema persistence. |
 | `RUNNER-SEC-001/002` | `src/domain/local-agent-trigger.test.ts` | Exact opaque remote trigger schema and rejection of every local launch-configuration override. |
 | `VAULT-AUTH-001–005` | `src/domain/vault-authorization.test.ts` | ACL union plus mandatory intersections, complete unattended delegation, independent reveal rights and exact grants. |
+| `SESSION-INT-001` | `tests/authorization.test.ts` | Opaque session/CSRF issuance, individual/global revocation and separation from runner-device lifecycle in real local D1. |
+| `DEVICE-INT-001/002` | `tests/authorization.test.ts` | P-256 signed request/body binding, replay and tamper rejection, device revoke, D1 plus tenant-local membership epochs and member-socket closure. |
 | `MOCKUP-SEC-001/002/003` | `tests/browser/mockup-contracts.spec.ts` | Rendered Solo storage, local-only runner configuration and user-held vault recovery disclosures. |
 | `SHELL-INT-001` | `tests/browser/shell.spec.ts` | Branded shell semantics, horizontal overflow and desktop/mobile layout. |
 | `SHELL-INT-002` | `tests/browser/shell.spec.ts` | Serious/critical accessibility scan. |

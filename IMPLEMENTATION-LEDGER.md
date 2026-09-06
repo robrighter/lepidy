@@ -34,9 +34,9 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [x] | F02 | CI and reusable-code inventory | F01 | S1–S7,V1–V4 | Record reference revisions/license notices and source-to-target map; CI builds and executes pure-rule and SQLite DO fixtures. | done | /root | 2026-09-05 | 2026-09-05 | [F02](#f02--ci-and-reusable-code-inventory) |
 | [x] | F02a | Local integration testing standard | F02 | — | Define the automated integration contract for every implementation task; add a single local verification runner and browser coverage for the existing web/Tauri shell. | done | /root | 2026-09-05 | 2026-09-05 | [F02a](#f02a--local-integration-testing-standard) |
 | [x] | F03 | Workspace storage and migrations | F01,D01 | S2 | Create D1 control plane and per-workspace SQLite schema; singleton migration version, atomic progression, quarantine and historical-fixture tests. | done | /root | 2026-09-05 | 2026-09-05 | [F03](#f03--workspace-storage-and-migrations) |
-| [ ] | F03b | Solo host content store and encrypted relay | F03,D08a,F05 | V2,V4,S2 | Implement host SQLite content schema, authenticated encrypted frames, commit-before-ack idempotency, offline errors, host-epoch fencing, transfer and Team-upgrade migration. | todo | — | — | — | — | — |
+| [ ] | F03b | Solo host content store and encrypted relay | F03,D08a,F05 | V2,V4,S2 | Implement host SQLite content schema, authenticated encrypted frames, commit-before-ack idempotency, offline errors, host-epoch fencing, transfer and Team-upgrade migration. | in_progress | /root | 2026-09-06 | — | — |
 | [x] | F04 | Identity and workspace onboarding | F03,D01,D08a | S1,S2 | Implement verified accounts, password/passkey/Google/email-link methods, safe linking, local-host or cloud workspace creation, invitations, roles and last-admin protection. | done | /root | 2026-09-05 | 2026-09-06 | [F04](#f04--identity-and-workspace-onboarding) |
-| [ ] | F05 | Session/device authorization | F04,D04 | S3,V2 | Revocable browser/device credentials, request signing/replay protection, authoritative membership checks and socket revocation; separate runner lifecycle. | in_progress | /root | 2026-09-06 | — | — |
+| [x] | F05 | Session/device authorization | F04,D04 | S3,V2 | Revocable browser/device credentials, request signing/replay protection, authoritative membership checks and socket revocation; separate runner lifecycle. | done | /root | 2026-09-06 | 2026-09-06 | [F05](#f05--session-and-device-authorization) |
 | [ ] | F06 | Alarm scheduler, outbox and audit baseline | F03,D07 | V4 | Multiplex due work; transactional pending events, idempotent retry/replay and audit; test restart, duplicates and competing deadlines. | todo | — | — | — | — |
 | [ ] | C01 | Tauri-compatible branded shell | F04 | S1 | Implement shell/navigation/theme/profile basics from mockups, Next.js data adapters, responsive layouts and desktop layout boundary. | todo | — | — | — | — |
 | [ ] | C02 | Channels, DMs and message writes | F05,F06,F03b,C01 | S1,S2 | Public/private rooms, membership, group DMs, threads and idempotent send against the plan authority; transactions include replay/outbox; authorized history reads. | todo | — | — | — | — |
@@ -84,6 +84,17 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [ ] | G05 | Release documentation and final decision | G01,G02,G03,G04,O03 | — | Reconcile PRD/HLD/mockups, publish-ready docs/marketing and support runbooks, enumerate accepted deferrals and external reviews; release only with required authorization. | todo | — | — | — | — |
 
 ## Evidence records
+
+### F05 — Session and device authorization
+
+- Task / owner: F05 / `/root`
+- Status / dates: done / 2026-09-06 to 2026-09-06
+- Implementation delivered: opaque hashed browser sessions with separate CSRF secrets and individual/global revocation; separately revocable client/runner device registrations with P-256 signing and encryption public keys; a versioned canonical request signature covering body hash, tenant/member/device epochs, nonce, idempotency id, opaque project/config revision and agent provenance; bounded timestamp/replay validation; D1 door authorization plus tenant-local membership epoch authorization; member-tagged WebSocket closure on authority change.
+- Changed files: `migrations/control/0003_session_device_authorization.sql`, `src/control/authorization.ts`, `src/cloudflare/workspace.ts`, `tests/authorization.test.ts`, `TESTING.md`, `IMPLEMENTATION-LEDGER.md`.
+- Reused design: Agent Vault's registered-client and exact project/client binding principles (V2) were adapted to P-256 signed HTTPS requests. Slipchat's tenant-scoped MCP attribution and revocation boundaries (S3) informed the signed provenance tuple. The implementation uses Lepidy's D1/DO identity contract and does not reuse legacy session middleware.
+- Integration scenarios: `SESSION-INT-001` proves opaque/CSRF-bound session use, individual and global revocation, and independence from runner-device lifecycle. `DEVICE-INT-001` signs with a real generated P-256 key, verifies D1 and DO authority, and rejects body tampering, signature tampering, nonce replay and a revoked device. `DEVICE-INT-002` opens a real local DO WebSocket, changes membership authority, observes close code 4003 and rejects the stale signed membership epoch.
+- Verification: `npm run verify:local` passed with 42 Worker/D1/SQLite/pure integration tests, 12 desktop/mobile browser tests, TypeScript, production Next.js/OpenNext/Wrangler builds, zero production dependency vulnerabilities and native Windows Tauri compilation.
+- Limitations / follow-ups: HTTP cookie/header adapters will call this service when application routes land. Nonce expiry rows are indexed for the F06 alarm sweeper. C03 will add authorized socket replay and message delivery on top of the membership-tagged connection primitive.
 
 ### D05 — Vault sharing and release contract
 
