@@ -19,8 +19,20 @@ describe("identity and workspace onboarding", () => {
     service = new OnboardingService(env.CONTROL_DB, env.WORKSPACE, () => NOW);
   });
 
+  async function register(email: string, displayName: string): Promise<string> {
+    const verification = await service.issueEmailChallenge(email, "verify_email");
+    return (
+      await service.registerPassword({
+        challengeId: verification.id,
+        token: verification.token,
+        displayName,
+        password: "correct horse battery staple",
+      })
+    ).accountId;
+  }
+
   it("IDENTITY-INT-001 verifies email, hashes a password and consumes links once", async () => {
-    const verification = await service.issueEmailChallenge(" Maya@Example.COM ", "verify_email");
+    const verification = await service.issueEmailChallenge(" Identity@One.Example ", "verify_email");
     const { accountId } = await service.registerPassword({
       challengeId: verification.id,
       token: verification.token,
@@ -36,12 +48,12 @@ describe("identity and workspace onboarding", () => {
         password: "correct horse battery staple",
       }),
     ).rejects.toThrow("challenge is invalid");
-    await expect(service.authenticatePassword("maya@example.com", "wrong password value")).resolves.toBeNull();
+    await expect(service.authenticatePassword("identity@one.example", "wrong password value")).resolves.toBeNull();
     await expect(
-      service.authenticatePassword("MAYA@example.com", "correct horse battery staple"),
+      service.authenticatePassword("IDENTITY@one.example", "correct horse battery staple"),
     ).resolves.toBe(accountId);
 
-    const emailLogin = await service.issueEmailChallenge("maya@example.com", "email_login");
+    const emailLogin = await service.issueEmailChallenge("identity@one.example", "email_login");
     await expect(service.authenticateEmailLink(emailLogin.id, emailLogin.token)).resolves.toBe(accountId);
     await expect(service.authenticateEmailLink(emailLogin.id, emailLogin.token)).rejects.toThrow(
       "challenge is invalid",
@@ -49,40 +61,43 @@ describe("identity and workspace onboarding", () => {
   });
 
   it("IDENTITY-INT-002 never auto-links a matching verified Google email", async () => {
-    const account = await env.CONTROL_DB.prepare(
-      "SELECT id FROM accounts WHERE primary_email_normalized = 'maya@example.com'",
-    ).first<{ id: string }>();
-    expect(account).not.toBeNull();
+    const accountId = await register("link@example.com", "Link Owner");
     const assertion = {
       provider: "google" as const,
       subject: "google-maya-1",
-      email: "maya@example.com",
+      email: "link@example.com",
       emailVerified: true,
     };
 
     await expect(service.authenticateGoogle(assertion)).resolves.toEqual({ status: "link_required" });
     await expect(
-      service.linkGoogle(account!.id, assertion, {
+      service.linkGoogle(accountId, assertion, {
         freshSession: true,
         stepUpVerified: false,
         confirmed: true,
       }),
     ).rejects.toThrow("step-up verification required");
-    await service.linkGoogle(account!.id, assertion, {
+    await service.linkGoogle(accountId, assertion, {
       freshSession: true,
       stepUpVerified: true,
       confirmed: true,
     });
     await expect(service.authenticateGoogle(assertion)).resolves.toEqual({
       status: "authenticated",
-      accountId: account!.id,
+      accountId,
     });
+
+    const created = await service.authenticateGoogle({
+      provider: "google",
+      subject: "google-new-1",
+      email: "new-google@example.com",
+      emailVerified: true,
+    });
+    expect(created.status).toBe("authenticated");
   });
 
   it("PASSKEY-INT-001 binds required-UV ceremonies to one account and consumes each challenge once", async () => {
-    const account = await env.CONTROL_DB.prepare(
-      "SELECT id FROM accounts WHERE primary_email_normalized = 'maya@example.com'",
-    ).first<{ id: string }>();
+    const accountId = await register("passkey@example.com", "Passkey Owner");
     const realOptions = new SimpleWebAuthnPasskeyProvider();
     const provider: PasskeyProvider = {
       registrationOptions: (input) => realOptions.registrationOptions(input),
@@ -101,7 +116,7 @@ describe("identity and workspace onboarding", () => {
     };
     const passkeys = new OnboardingService(env.CONTROL_DB, env.WORKSPACE, () => NOW, provider);
 
-    const registration = await passkeys.beginPasskeyRegistration(account!.id, {
+    const registration = await passkeys.beginPasskeyRegistration(accountId, {
       freshSession: true,
       stepUpVerified: true,
       confirmed: true,
@@ -110,46 +125,44 @@ describe("identity and workspace onboarding", () => {
     expect(registration.options.authenticatorSelection?.userVerification).toBe("required");
     await expect(
       passkeys.finishPasskeyRegistration({
-        accountId: account!.id,
+        accountId,
         challengeId: registration.id,
         response: { fixture: true },
       }),
     ).resolves.toBe("credential-alpha");
     await expect(
       passkeys.finishPasskeyRegistration({
-        accountId: account!.id,
+        accountId,
         challengeId: registration.id,
         response: { replay: true },
       }),
     ).rejects.toThrow("passkey challenge is invalid");
 
-    const authentication = await passkeys.beginPasskeyAuthentication(account!.id);
+    const authentication = await passkeys.beginPasskeyAuthentication(accountId);
     expect(authentication.options.rpId).toBe("app.lepidy.com");
     expect(authentication.options.userVerification).toBe("required");
     expect(authentication.options.allowCredentials?.[0]?.id).toBe("credential-alpha");
     await expect(
       passkeys.finishPasskeyAuthentication({
-        accountId: account!.id,
+        accountId,
         challengeId: authentication.id,
         credentialId: "credential-alpha",
         response: { fixture: true },
       }),
-    ).resolves.toBe(account!.id);
+    ).resolves.toBe(accountId);
 
     const stored = await env.CONTROL_DB.prepare(
       "SELECT sign_count FROM passkeys WHERE account_id = ?",
     )
-      .bind(account!.id)
+      .bind(accountId)
       .first<{ sign_count: number }>();
     expect(stored?.sign_count).toBe(1);
   });
 
   it("ONBOARD-INT-001 provisions one owner in D1 and the tenant object", async () => {
-    const account = await env.CONTROL_DB.prepare(
-      "SELECT id FROM accounts WHERE primary_email_normalized = 'maya@example.com'",
-    ).first<{ id: string }>();
+    const accountId = await register("solo-owner@example.com", "Solo Owner");
     const created = await service.createWorkspace({
-      accountId: account!.id,
+      accountId,
       name: "Acme Engineering",
       slug: "acme-eng",
       handle: "maya",
@@ -190,7 +203,7 @@ describe("identity and workspace onboarding", () => {
         .one();
       expect(member).toEqual({
         id: created.memberId,
-        account_id: account!.id,
+        account_id: accountId,
         handle: "maya",
         role: "owner",
         status: "active",
@@ -202,31 +215,60 @@ describe("identity and workspace onboarding", () => {
     await expect(service.changeMemberRole(created.workspaceId, created.memberId, "admin")).rejects.toThrow(
       "workspace requires an active owner",
     );
+
+    const team = await service.createWorkspace({
+      accountId,
+      name: "Acme Team",
+      slug: "acme-team",
+      handle: "maya-team",
+      jurisdiction: "global",
+      storageMode: "cloud",
+    });
+    const teamControl = await env.CONTROL_DB.prepare(
+      "SELECT storage_mode, durable_object_id FROM workspaces WHERE id = ?",
+    )
+      .bind(team.workspaceId)
+      .first<{ storage_mode: string; durable_object_id: string }>();
+    expect(teamControl?.storage_mode).toBe("cloud");
+    await runInDurableObject<Workspace, void>(
+      env.WORKSPACE.get(env.WORKSPACE.idFromString(teamControl!.durable_object_id)),
+      (_instance, state) => {
+        expect(
+          state.storage.sql
+            .exec<{ storage_mode: string }>(
+              "SELECT storage_mode FROM workspace_config WHERE singleton = 1",
+            )
+            .one().storage_mode,
+        ).toBe("cloud");
+      },
+    );
   });
 
   it("ONBOARD-INT-002 binds an invitation to its verified email and accepts it once", async () => {
-    const maya = await env.CONTROL_DB.prepare(
-      "SELECT id FROM accounts WHERE primary_email_normalized = 'maya@example.com'",
-    ).first<{ id: string }>();
-    const owner = await env.CONTROL_DB.prepare(
-      "SELECT workspace_id, member_id FROM memberships WHERE account_id = ? AND role = 'owner'",
-    )
-      .bind(maya!.id)
-      .first<{ workspace_id: string; member_id: string }>();
+    const ownerAccountId = await register("invite-owner@example.com", "Invite Owner");
+    const owner = await service.createWorkspace({
+      accountId: ownerAccountId,
+      name: "Invitation Workspace",
+      slug: "invitation-workspace",
+      handle: "invite-owner",
+      jurisdiction: "global",
+    });
+    await expect(
+      service.inviteMember({
+        workspaceId: owner.workspaceId,
+        invitedByMemberId: "not-a-member",
+        email: "nobody@example.com",
+        role: "member",
+      }),
+    ).rejects.toThrow("active owner or admin required to invite");
     const invite = await service.inviteMember({
-      workspaceId: owner!.workspace_id,
-      invitedByMemberId: owner!.member_id,
+      workspaceId: owner.workspaceId,
+      invitedByMemberId: owner.memberId,
       email: "Lee@example.com",
       role: "member",
     });
 
-    const wrongVerification = await service.issueEmailChallenge("other@example.com", "verify_email");
-    const wrong = await service.registerPassword({
-      challengeId: wrongVerification.id,
-      token: wrongVerification.token,
-      displayName: "Wrong Person",
-      password: "another correct horse battery",
-    });
+    const wrong = { accountId: await register("other@example.com", "Wrong Person") };
     await expect(
       service.acceptInvitation({
         invitationId: invite.id,
@@ -236,13 +278,7 @@ describe("identity and workspace onboarding", () => {
       }),
     ).rejects.toThrow("invitation email is not verified");
 
-    const leeVerification = await service.issueEmailChallenge("lee@example.com", "verify_email");
-    const lee = await service.registerPassword({
-      challengeId: leeVerification.id,
-      token: leeVerification.token,
-      displayName: "Lee Ortiz",
-      password: "one more correct horse battery",
-    });
+    const lee = { accountId: await register("lee@example.com", "Lee Ortiz") };
     const accepted = await service.acceptInvitation({
       invitationId: invite.id,
       token: invite.token,
@@ -265,17 +301,17 @@ describe("identity and workspace onboarding", () => {
       .first<{ role: string; status: string }>();
     expect(member).toEqual({ role: "member", status: "active" });
 
-    await service.changeMemberRole(owner!.workspace_id, accepted.memberId, "owner");
-    await service.changeMemberRole(owner!.workspace_id, owner!.member_id, "admin");
+    await service.changeMemberRole(owner.workspaceId, accepted.memberId, "owner");
+    await service.changeMemberRole(owner.workspaceId, owner.memberId, "admin");
     const roles = await env.CONTROL_DB.prepare(
       "SELECT member_id, role FROM memberships WHERE workspace_id = ? ORDER BY member_id",
     )
-      .bind(owner!.workspace_id)
+      .bind(owner.workspaceId)
       .all<{ member_id: string; role: string }>();
     expect(roles.results).toEqual(
       expect.arrayContaining([
         { member_id: accepted.memberId, role: "owner" },
-        { member_id: owner!.member_id, role: "admin" },
+        { member_id: owner.memberId, role: "admin" },
       ]),
     );
   });

@@ -335,6 +335,16 @@ export class OnboardingService {
     email: string;
     role: Exclude<WorkspaceRole, "owner">;
   }): Promise<IssuedChallenge> {
+    const inviter = await this.db
+      .prepare(
+        `SELECT role, status FROM memberships
+         WHERE workspace_id = ? AND member_id = ?`,
+      )
+      .bind(input.workspaceId, input.invitedByMemberId)
+      .first<{ role: WorkspaceRole; status: string }>();
+    if (!inviter || inviter.status !== "active" || !["owner", "admin"].includes(inviter.role)) {
+      throw new Error("active owner or admin required to invite");
+    }
     const id = crypto.randomUUID();
     const token = randomToken();
     const tokenHash = await hashOpaqueToken(token);
