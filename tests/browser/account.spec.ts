@@ -1,30 +1,6 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
-/**
- * The authenticated path, end to end against real local bindings: real D1, a
- * real workspace Durable Object and a real session cookie. Each run creates its
- * own account so the suite never depends on data a previous run left behind.
- */
-function freshAccount() {
-  const id = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
-  return {
-    email: `signup-${id}@example.test`,
-    password: "correct horse battery staple",
-    displayName: "Ada Lovelace",
-    handle: `ada${id.slice(0, 6)}`,
-    workspaceName: `Workspace ${id.slice(0, 6)}`,
-  };
-}
-
-async function signUp(page: Page, account: ReturnType<typeof freshAccount>) {
-  await page.goto("/signup");
-  await page.getByLabel("Your name").fill(account.displayName);
-  await page.getByLabel("Handle").fill(account.handle);
-  await page.getByLabel("Email").fill(account.email);
-  await page.getByLabel("Password").fill(account.password);
-  await page.getByLabel("Workspace name").fill(account.workspaceName);
-  await page.getByRole("button", { name: "Create workspace" }).click();
-}
+import { freshAccount, signUp } from "./auth-helpers";
 
 test("AUTH-INT-001 signs up into a real workspace and posts a message that persists", async ({
   page,
@@ -63,18 +39,7 @@ test("AUTH-INT-001 signs up into a real workspace and posts a message that persi
   await expect(page.locator(".messages > li").first()).toContainText(body);
 });
 
-/**
- * FIXME(F04a): revealed a real defect, not a flake.
- *
- * After signing out this lands on /signin correctly, but visiting the workspace
- * again shows the *development* workspace rather than the signed-out shell:
- * `loadShellState` still falls back to `DevelopmentShellSource` whenever
- * `ENVIRONMENT` is development, even on a deployment that can now authenticate
- * people. That fallback should apply only where there are no control-plane
- * bindings at all. Fixing it means the C01–C04 browser scenarios must sign in
- * first, which is the right end state and more than a test change.
- */
-test.fixme("AUTH-INT-002 signs out, revokes the session and refuses the workspace afterwards", async ({
+test("AUTH-INT-002 signs out, revokes the session and refuses the workspace afterwards", async ({
   page,
 }) => {
   const account = freshAccount();
@@ -100,25 +65,14 @@ test.fixme("AUTH-INT-002 signs out, revokes the session and refuses the workspac
   await expect(page.getByRole("link", { name: "Go to sign in" })).toBeVisible();
 
   // Putting the revoked token back does not restore the session.
-  if (sessionCookie) {
-    await page.context().addCookies([sessionCookie]);
-    await page.goto("/");
-    await expect(page.getByRole("heading", { name: "Sign in to Lepidy" })).toBeVisible();
-  }
+  expect(sessionCookie).toBeDefined();
+  await page.context().addCookies([sessionCookie!]);
+  await page.goto("/c/general");
+  await expect(page.getByRole("heading", { name: "Sign in to Lepidy" })).toBeVisible();
+  await expect(page.locator(".messages, .composer")).toHaveCount(0);
 });
 
-/**
- * FIXME(F04a): revealed a real defect, not a flake.
- *
- * The two refusals behave correctly and are indistinguishable, but signing back
- * in afterwards with the *correct* password is also refused. Signing in works on
- * its own (AUTH-INT-001 posts as a signed-in member), so something about the
- * preceding failed attempts leaves the next verification returning null. Worth
- * checking whether the memoised Argon2id instance survives a failed verify, and
- * whether a rejected server action leaves the next submission carrying stale
- * form state.
- */
-test.fixme("AUTH-INT-003 signs back in and refuses a wrong password without saying which half was wrong", async ({
+test("AUTH-INT-003 signs back in and refuses a wrong password without saying which half was wrong", async ({
   page,
 }) => {
   const account = freshAccount();
@@ -132,7 +86,10 @@ test.fixme("AUTH-INT-003 signs back in and refuses a wrong password without sayi
   async function attemptAndFail(email: string, password: string): Promise<string> {
     await page.getByLabel("Email").fill(email);
     await page.getByLabel("Password").fill(password);
+    const response = page.waitForResponse((response) => response.request().method() === "POST" && response.url().endsWith("/signin"));
     await page.getByRole("button", { name: "Sign in" }).click();
+    await response;
+    await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeEnabled();
     await expect(page.locator(".auth-error")).toBeVisible();
     return (await page.locator(".auth-error").textContent()) ?? "";
   }
@@ -151,4 +108,125 @@ test.fixme("AUTH-INT-003 signs back in and refuses a wrong password without sayi
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("heading", { name: account.workspaceName, level: 2 })).toBeVisible();
+});
+
+test("AUTH-INT-004 refuses sign-up outside development without creating durable state", async ({ page }) => {
+  const account = freshAccount();
+  const production = "http://127.0.0.1:3101";
+  const before = await (await page.request.get(`${production}/__fixture/counts`)).json();
+  await page.route("**/signup", async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST") return route.continue();
+    const headers = request.headers();
+    const response = await page.request.post(`${production}/signup`, {
+      headers: { "content-type": headers["content-type"], "next-action": headers["next-action"], origin: production },
+      data: request.postDataBuffer()!,
+    });
+    await route.fulfill({ response });
+  });
+  await page.goto("/signup");
+  await page.getByLabel("Your name").fill(account.displayName);
+  await page.getByLabel("Handle").fill(account.handle);
+  await page.getByLabel("Email").fill(account.email);
+  await page.getByLabel("Password").fill(account.password);
+  await page.getByLabel("Workspace name").fill(account.workspaceName);
+  await page.getByRole("button", { name: "Create workspace" }).click();
+  await expect(page.locator(".auth-error")).toContainText("Self-service sign-up needs email verification");
+  expect(await (await page.request.get(`${production}/__fixture/counts`)).json()).toEqual(before);
+  expect((await page.context().cookies()).some((cookie) => cookie.name === "lepidy_session")).toBe(false);
+  // Exactly the same account input succeeds on the allowed deployment.
+  await page.unroute("**/signup");
+  await signUp(page, account);
+});
+
+test("AUTH-INT-005 requires a session-bound CSRF token for message mutations", async ({ page, browser }) => {
+  await signUp(page, freshAccount());
+  await page.goto("/c/general");
+  const csrf = (await page.context().cookies()).find((cookie) => cookie.name === "lepidy_csrf")!;
+  expect(csrf).toBeDefined();
+  const other = await browser.newContext({ baseURL: "http://127.0.0.1:3100" });
+  let otherCsrf: string;
+  try {
+    const otherPage = await other.newPage();
+    await signUp(otherPage, freshAccount());
+    otherCsrf = (await other.cookies()).find((cookie) => cookie.name === "lepidy_csrf")!.value;
+  } finally {
+    await other.close();
+  }
+  const session = (await page.context().cookies()).find((cookie) => cookie.name === "lepidy_session")!;
+  const counts = async () => (await page.request.post("/__fixture/workspace-counts", { headers: { authorization: session.value } })).json();
+  const before = await counts();
+  const composer = page.getByRole("textbox", { name: /Message #general/ });
+  for (const value of ["", "forged-csrf", otherCsrf]) {
+    await page.context().addCookies([{ ...csrf, value }]);
+    await composer.fill(`denied csrf canary ${value || "missing"}`);
+    const response = page.waitForResponse((response) => response.request().method() === "POST");
+    await composer.press("Enter");
+    await response;
+    await expect(page.locator(".composer-error")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
+    await expect(composer).toBeFocused();
+    await page.reload();
+    await expect(page.locator(".messages > li")).toHaveCount(0);
+    expect(await counts()).toEqual(before);
+  }
+  await page.context().addCookies([csrf]);
+  await composer.fill("allowed csrf message");
+  const sent = page.waitForRequest((request) => request.method() === "POST");
+  await composer.press("Enter");
+  const request = await sent;
+  await expect(page.locator(".messages > li")).toHaveCount(1);
+  await expect(composer).toHaveValue("");
+  const afterAllowed = await counts();
+  // A foreign Origin cannot use even a valid session and CSRF token.
+  const headers = request.headers();
+  const payload = JSON.parse(request.postData()!);
+  payload[0].bodyMarkdown = "forbidden origin canary";
+  payload[0].idempotencyKey = `csrf-origin:${crypto.randomUUID()}`;
+  const denied = await page.request.post("/c/general", {
+    headers: { "content-type": headers["content-type"], "next-action": headers["next-action"], origin: "https://foreign.example.test" },
+    data: JSON.stringify(payload),
+  });
+  expect(denied.status()).toBeGreaterThanOrEqual(400);
+  expect(await counts()).toEqual(afterAllowed);
+  await page.reload();
+  await expect(page.locator(".messages > li")).toHaveCount(1);
+  await expect(page.locator(".messages > li")).toContainText("allowed csrf message");
+});
+
+test("AUTH-INT-006 refuses forged sign-out actions without revoking the session", async ({ page }) => {
+  const account = freshAccount();
+  await signUp(page, account);
+  await page.getByRole("button", { name: /Account menu for/ }).click();
+  const outgoing = page.waitForRequest((request) => request.method() === "POST");
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  const request = await outgoing;
+  await expect(page).toHaveURL(/\/signin$/);
+  await page.getByLabel("Email").fill(account.email);
+  await page.getByLabel("Password").fill(account.password);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page).toHaveURL(/\/$/);
+  const csrf = (await page.context().cookies()).find((cookie) => cookie.name === "lepidy_csrf")!;
+  const headers = request.headers();
+  for (const value of [null, "forged-signout-csrf", JSON.parse(request.postData()!)[0]]) {
+    const denied = await page.request.post("/", {
+      headers: { "content-type": headers["content-type"], "next-action": headers["next-action"], origin: "http://127.0.0.1:3100" },
+      data: JSON.stringify([value]),
+    });
+    expect(await denied.text()).toContain("Unable to sign out. Refresh and try again.");
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: account.workspaceName, level: 2 })).toBeVisible();
+  }
+  expect(csrf.value).not.toBe(JSON.parse(request.postData()!)[0]);
+  await page.context().addCookies([{ ...csrf, value: "" }]);
+  await page.getByRole("button", { name: /Account menu for/ }).click();
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await expect(page.getByRole("menu").getByRole("alert")).toContainText("Unable to sign out");
+  await page.context().addCookies([csrf]);
+  await page.reload();
+  await page.getByRole("button", { name: /Account menu for/ }).click();
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await expect(page).toHaveURL(/\/signin$/);
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Sign in to Lepidy" })).toBeVisible();
 });

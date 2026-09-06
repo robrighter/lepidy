@@ -1,6 +1,16 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 
+import { freshAccount, signUp } from "./auth-helpers";
+
+test.beforeEach(async ({ page }) => {
+  await signUp(page, { ...freshAccount(), displayName: "Maya Chen", handle: "maya" });
+  const cookie = (await page.context().cookies()).find((cookie) => cookie.name === "lepidy_session");
+  expect(cookie).toBeDefined();
+  const seeded = await page.request.post("/__fixture/seed", { headers: { authorization: cookie!.value } });
+  expect(seeded.ok(), await seeded.text()).toBe(true);
+});
+
 async function openRailIfNarrow(page: Page, projectName: string) {
   if (projectName !== "mobile-chromium") return;
   await page.getByRole("button", { name: "Open navigation" }).click();
@@ -132,13 +142,13 @@ test("ROOM-INT-013 renders channel history and tells a person from an agent", as
 
   const messages = page.locator(".messages > li");
   await expect(messages).toHaveCount(2);
-  await expect(messages.nth(0)).toContainText("Maya Chen");
-  await expect(messages.nth(0)).toContainText("failed-charge retry");
-  await expect(messages.nth(0)).toContainText("2 replies");
+  await expect(page.locator(".messages > li[data-author-kind=member]")).toContainText("Maya Chen");
+  await expect(page.locator(".messages > li[data-author-kind=member]")).toContainText("failed-charge retry");
+  await expect(page.locator(".messages > li[data-author-kind=member]")).toContainText("2 replies");
   // An agent is visibly an agent, not a person with an odd name.
-  await expect(messages.nth(1)).toContainText("a.releasebot");
-  await expect(messages.nth(1).getByText("agent")).toBeVisible();
-  await expect(messages.nth(0).getByText("agent")).toHaveCount(0);
+  await expect(page.locator(".messages > li[data-author-kind=agent]")).toContainText("a.releasebot");
+  await expect(page.locator(".messages > li[data-author-kind=agent]").getByText("agent")).toBeVisible();
+  await expect(page.locator(".messages > li[data-author-kind=member]").getByText("agent")).toHaveCount(0);
 
   // A room with nothing in it says so rather than showing a blank panel.
   await page.goto("/c/release");
@@ -148,7 +158,7 @@ test("ROOM-INT-013 renders channel history and tells a person from an agent", as
 
 test("MSG-INT-008 renders markdown as elements and never as markup", async ({ page }) => {
   await page.goto("/c/eng");
-  const agentMessage = page.locator(".messages > li").nth(1);
+  const agentMessage = page.locator(".messages > li[data-author-kind=agent]");
 
   // A fenced block is a real code element with its language shown.
   const code = agentMessage.locator("pre code");
@@ -163,7 +173,7 @@ test("MSG-INT-008 renders markdown as elements and never as markup", async ({ pa
   await expect(mention).toHaveAttribute("data-mention-kind", "member");
 
   // A reaction shows its count and is announced to a screen reader.
-  const reactions = page.locator(".messages > li").nth(0).locator(".reactions li");
+  const reactions = page.locator(".messages > li[data-author-kind=member]").locator(".reactions li");
   await expect(reactions).toHaveCount(1);
   await expect(reactions.first()).toContainText("1");
 });
@@ -189,15 +199,13 @@ test("MSG-INT-009 keeps focus, preserves a draft and separates Enter from Shift+
     "first line\nsecond line",
   );
 
-  // Enter sends. Signed out, it says so plainly and keeps both the draft and
-  // the caret so nothing typed is lost.
+  // Enter sends through the authenticated action and clears the spent draft.
   await page.getByRole("textbox", { name: /Message #eng/ }).click();
   await page.keyboard.press("Enter");
-  await expect(page.locator(".composer-error")).toContainText("Sign in to post");
+  await expect(page.locator(".messages > li")).toHaveCount(3);
+  await expect(page.locator(".messages > li").filter({ hasText: "first line" })).toContainText("second line");
   await expect(page.getByRole("textbox", { name: /Message #eng/ })).toBeFocused();
-  await expect(page.getByRole("textbox", { name: /Message #eng/ })).toHaveValue(
-    "first line\nsecond line",
-  );
+  await expect(page.getByRole("textbox", { name: /Message #eng/ })).toHaveValue("");
 });
 
 test("SHELL-INT-006 states plainly that a surface is not built yet", async ({ page }) => {
@@ -211,11 +219,10 @@ test("SHELL-INT-006 states plainly that a surface is not built yet", async ({ pa
   await expect(page.getByText(/only listed for its own members/)).toBeVisible();
 });
 
-test("SHELL-INT-007 says out loud that the development workspace is not a real one", async ({ page }) => {
+test("SHELL-INT-007 uses authenticated workspace data without a development banner", async ({ page }) => {
   await page.goto("/");
-  const notice = page.getByRole("status");
-  await expect(notice).toContainText("Development workspace");
-  await expect(notice).toContainText("not a real workspace");
+  await expect(page.getByText("Development workspace.")).toHaveCount(0);
+  await expect(page.getByText("@maya")).toBeVisible();
 });
 
 test("SHELL-INT-008 shows the viewer's own profile from the shell data", async ({ page }, testInfo) => {

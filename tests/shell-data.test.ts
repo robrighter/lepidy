@@ -1,3 +1,4 @@
+import { loadShellState } from "../src/shell/resolve-shell-source";
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
@@ -221,4 +222,14 @@ describe("workspace shell data adapter", () => {
       ).toThrow("member is not authorized for this workspace");
     });
   });
+});
+
+it("SHELL-DATA-INT-004 permits an unbound development preview but refuses configured signed-out deployments", async () => {
+  expect(await loadShellState({ ENVIRONMENT: "development" }, null)).toMatchObject({ status: "ready", authenticated: false });
+  for (const bindings of [{ CONTROL_DB: env.CONTROL_DB }, { WORKSPACE: env.WORKSPACE }, { ACCOUNTS: env.ACCOUNTS }, env]) {
+    expect(await loadShellState({ ...bindings, ENVIRONMENT: "development" }, null)).toEqual({ status: "signed_out" });
+  }
+  for (const ENVIRONMENT of [undefined, "production", "staging"]) {
+    expect(await loadShellState({ ENVIRONMENT }, null)).toEqual({ status: "signed_out" });
+  }
 });

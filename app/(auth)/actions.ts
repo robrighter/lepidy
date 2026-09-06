@@ -116,10 +116,15 @@ export async function signUpWithPassword(
 }
 
 /** Revokes the session server-side, not just the cookie in this browser. */
-export async function signOut(): Promise<void> {
+export async function signOut(csrfToken: string): Promise<AuthResult> {
   const token = await readSessionToken();
   const services = await accountServices();
   if (token && !("unavailable" in services)) {
+    try {
+      await services.authorization.authenticateBrowserSession(token, csrfToken ?? "");
+    } catch {
+      return { ok: false, reason: "Unable to sign out. Refresh and try again." };
+    }
     await services.authorization.revokeBrowserSession(token);
   }
   await clearSessionCookies();

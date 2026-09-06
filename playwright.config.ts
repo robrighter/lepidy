@@ -29,10 +29,20 @@ export default defineConfig({
       // where the connection does not survive past the first call. Running the
       // real Worker gives the suite real D1 and real objects in one process,
       // and tests the runtime the product actually ships on.
-      command: "npx wrangler dev --port 3100 --local",
+      command: "node scripts/browser-worker.mjs development",
       url: "http://127.0.0.1:3100/signin",
       reuseExistingServer: false,
       timeout: 180_000,
+      gracefulShutdown: { signal: "SIGTERM", timeout: 10_000 },
+      stdout: "ignore",
+      stderr: "pipe",
+    },
+    {
+      command: "node scripts/browser-worker.mjs production",
+      url: "http://127.0.0.1:3101/signin",
+      reuseExistingServer: false,
+      timeout: 180_000,
+      gracefulShutdown: { signal: "SIGTERM", timeout: 10_000 },
       stdout: "ignore",
       stderr: "pipe",
     },

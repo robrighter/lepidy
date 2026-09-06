@@ -9,14 +9,12 @@ import type { ShellState } from "./workspace-shell-source";
  * Resolved once per request and shared by the layout and every page in it, so a
  * single navigation never asks the control plane or the workspace object twice.
  *
- * Cloudflare bindings are only reached for when a session cookie is actually
- * present: a signed-out request has nothing to authorise, and starting the local
- * binding proxy for it makes every build worker contend for the same state.
+ * Binding discovery also runs without a cookie so a configured deployment can
+ * never mistake a signed-out request for an unbound development preview.
  */
 export const shellState = cache(async (): Promise<ShellState> => {
   const environment = process.env.ENVIRONMENT ?? process.env.NODE_ENV;
   const token = (await cookies()).get(SESSION_COOKIE)?.value ?? null;
-  if (!token) return loadShellState({ ENVIRONMENT: environment }, null);
 
   let env: ShellEnvironment = {};
   try {

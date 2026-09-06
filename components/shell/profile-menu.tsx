@@ -5,11 +5,13 @@ import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 import { signOut } from "@/app/(auth)/actions";
+import { browserCsrfToken } from "@/src/shell/browser-csrf";
 import type { ShellViewer } from "@/src/cloudflare/workspace";
 import { Avatar } from "./avatar";
 
 export function ProfileMenu({ viewer, plan }: { viewer: ShellViewer; plan: string }) {
   const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const container = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -56,12 +58,16 @@ export function ProfileMenu({ viewer, plan }: { viewer: ShellViewer; plan: strin
             <Settings size={16} aria-hidden="true" />
             Preferences
           </Link>
-          <form action={signOut} role="none">
+          <form action={async () => {
+            const result = await signOut(browserCsrfToken());
+            if (!result.ok) setError(result.reason);
+          }} role="none">
             <button role="menuitem" type="submit">
               <LogOut size={16} aria-hidden="true" />
               Sign out
             </button>
           </form>
+          {error ? <p role="alert">{error}</p> : null}
         </div>
       ) : null}
     </div>

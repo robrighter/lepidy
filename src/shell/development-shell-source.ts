@@ -2,9 +2,9 @@ import type { MessagePage } from "../cloudflare/workspace-rooms";
 import type { ShellState, WorkspaceShellSource } from "./workspace-shell-source";
 
 /**
- * A deterministic workspace for local development and for the browser suite,
- * used only when `ENVIRONMENT` is `development` and no control-plane binding or
- * session is available. It reports `authenticated: false`, and the shell renders
+ * A deterministic workspace for unbound local development,
+ * used only when `ENVIRONMENT` is `development` and no control-plane bindings are
+ * available. It reports `authenticated: false`, and the shell renders
  * a standing banner from that flag, so this content can never be mistaken for a
  * real workspace.
  */

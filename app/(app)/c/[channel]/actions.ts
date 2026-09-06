@@ -23,6 +23,7 @@ export type SendResult = { ok: true; messageId: string } | { ok: false; reason: 
  * this only carries the request to it.
  */
 export async function sendChannelMessage(input: {
+  csrfToken?: string;
   channelId: string;
   bodyMarkdown: string;
   idempotencyKey: string;
@@ -49,7 +50,7 @@ export async function sendChannelMessage(input: {
     {
       db: env.CONTROL_DB,
       workspaces: env.WORKSPACE,
-      authenticateSession: (value) => authorization.authenticateBrowserSession(value),
+      authenticateSession: (value) => authorization.authenticateBrowserSession(value, input.csrfToken ?? ""),
     },
     token,
   );

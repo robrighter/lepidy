@@ -4,6 +4,7 @@ import { CornerDownLeft, Send } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { sendChannelMessage, type SendResult } from "@/app/(app)/c/[channel]/actions";
+import { browserCsrfToken } from "@/src/shell/browser-csrf";
 
 /**
  * The composer, and the three regressions it exists to keep fixed.
@@ -67,6 +68,7 @@ export function Composer({
     if (trimmed.length === 0 || sending) return;
     setSending(true);
     const result = await sendChannelMessage({
+      csrfToken: browserCsrfToken(),
       channelId,
       bodyMarkdown: trimmed,
       // Stable per attempt, so a retried submission is not a second message.

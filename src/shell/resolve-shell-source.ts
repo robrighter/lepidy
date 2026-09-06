@@ -16,7 +16,7 @@ export type ShellEnvironment = {
  *
  * A session plus real bindings always wins. The development workspace is used
  * only when this deployment is explicitly a development one and no control-plane
- * session is available; it reports `authenticated: false`, and the shell renders
+ * bindings are available; it reports `authenticated: false`, and the shell renders
  * a standing banner from that flag so it can never pass for real data.
  */
 export async function loadShellState(
@@ -36,7 +36,9 @@ export async function loadShellState(
     return source.load();
   }
 
-  if (env.ENVIRONMENT === "development") return new DevelopmentShellSource().load();
+  if (env.ENVIRONMENT === "development" && !env.CONTROL_DB && !env.WORKSPACE && !env.ACCOUNTS) {
+    return new DevelopmentShellSource().load();
+  }
 
   return { status: "signed_out" };
 }
