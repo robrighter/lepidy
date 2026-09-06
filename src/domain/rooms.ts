@@ -156,3 +156,17 @@ export function clampHistoryLimit(value: unknown): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1) return DEFAULT_HISTORY_PAGE;
   return Math.min(value, MAX_HISTORY_PAGE);
 }
+
+/**
+ * A reaction is a short grapheme cluster, not arbitrary text. Named custom
+ * emoji arrive with C05 and use the same colon form; this keeps the column from
+ * becoming a second, unindexed message body in the meantime.
+ */
+export function parseReactionEmoji(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > 32) return null;
+  if (/[\u0000-\u001F\u007F\s]/.test(trimmed)) return null;
+  if (/^:[a-z0-9][a-z0-9_+-]{0,30}:$/.test(trimmed)) return trimmed;
+  return /\p{Extended_Pictographic}/u.test(trimmed) ? trimmed : null;
+}

@@ -379,6 +379,33 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX thread_read_state_member_idx ON thread_read_state(member_id)`,
     ],
   },
+  {
+    version: 10,
+    name: "reactions, mentions and edit history",
+    statements: [
+      `CREATE TABLE message_reactions (
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        emoji TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (message_id, member_id, emoji)
+      ) STRICT`,
+      `CREATE INDEX message_reactions_message_idx ON message_reactions(message_id, emoji)`,
+      // Addressing is recorded per message so a later reader sees what a
+      // message meant when it was written, not what the handles mean now.
+      `CREATE TABLE message_mentions (
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('member', 'agent', 'group', 'channel', 'here')),
+        handle TEXT NOT NULL,
+        resolved_id TEXT,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (message_id, kind, handle)
+      ) STRICT`,
+      `CREATE INDEX message_mentions_resolved_idx ON message_mentions(kind, resolved_id)`,
+      `ALTER TABLE messages ADD COLUMN edit_count INTEGER NOT NULL DEFAULT 0 CHECK (edit_count >= 0)`,
+      `ALTER TABLE messages ADD COLUMN deleted_by_member_id TEXT`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

@@ -38,7 +38,7 @@ export class DevelopmentShellSource implements WorkspaceShellSource {
           { id: "agent-triage", handle: "a.triage", displayName: "Triage", status: "active" },
         ],
         storageMode: "local_host",
-        schemaVersion: 9,
+        schemaVersion: 10,
       },
     };
   }
@@ -61,6 +61,9 @@ const DEVELOPMENT_MESSAGES: Record<string, MessagePage> = {
         channelSequence: 1,
         replyCount: 2,
         lastReplyAt: 1_800_000_060_000,
+        editCount: 0,
+        reactions: [{ emoji: "\u{1F440}", memberIds: ["member-development"] }],
+        mentions: [],
       },
       {
         id: "message-dev-2",
@@ -69,13 +72,17 @@ const DEVELOPMENT_MESSAGES: Record<string, MessagePage> = {
         authorKind: "agent",
         authorId: "agent-releasebot",
         authorDisplaySnapshot: "a.releasebot",
-        bodyMarkdown: "Deploy `api@2.14.0` finished. 3 migrations applied, no rollbacks.",
+        bodyMarkdown:
+          "@maya deploy `api@2.14.0` finished.\n\n```sh\nwrangler deploy --env production\n```\n\n3 migrations applied, **no rollbacks**.",
         createdAt: 1_800_000_120_000,
         editedAt: null,
         deletedAt: null,
         channelSequence: 2,
         replyCount: 0,
         lastReplyAt: null,
+        editCount: 0,
+        reactions: [],
+        mentions: [],
       },
     ],
     nextCursor: null,

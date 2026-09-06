@@ -27,6 +27,10 @@ export type ChannelRow = {
   lastActivityAt: number | null;
 };
 
+export type MessageReaction = { emoji: string; memberIds: readonly string[] };
+
+export type MessageMention = { kind: string; handle: string; resolvedId: string | null };
+
 export type MessageRow = {
   id: string;
   channelId: string;
@@ -41,6 +45,9 @@ export type MessageRow = {
   channelSequence: number | null;
   replyCount: number;
   lastReplyAt: number | null;
+  editCount: number;
+  reactions: readonly MessageReaction[];
+  mentions: readonly MessageMention[];
 };
 
 export type MessagePage = {
@@ -84,7 +91,7 @@ function toChannel(row: RawChannel): ChannelRow {
 
 const MESSAGE_COLUMNS = `id, channel_id, thread_root_id, author_kind, author_id,
                          author_display_snapshot, body_markdown, created_at, edited_at,
-                         deleted_at, channel_sequence, reply_count, last_reply_at`;
+                         deleted_at, channel_sequence, reply_count, last_reply_at, edit_count`;
 
 type RawMessage = {
   id: string;
@@ -100,6 +107,7 @@ type RawMessage = {
   channel_sequence: number | null;
   reply_count: number;
   last_reply_at: number | null;
+  edit_count: number;
 };
 
 function toMessage(row: RawMessage): MessageRow {
@@ -117,6 +125,9 @@ function toMessage(row: RawMessage): MessageRow {
     channelSequence: row.channel_sequence,
     replyCount: row.reply_count,
     lastReplyAt: row.last_reply_at,
+    editCount: row.edit_count,
+    reactions: [],
+    mentions: [],
   };
 }
 
@@ -596,5 +607,196 @@ export function latestThreadSequence(storage: DurableObjectStorage, threadRootId
         threadRootId,
       )
       .one().latest ?? 0
+  );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Reactions, mentions and edits                                               */
+/* -------------------------------------------------------------------------- */
+
+export function readReactions(
+  storage: DurableObjectStorage,
+  messageIds: readonly string[],
+): Map<string, MessageReaction[]> {
+  const byMessage = new Map<string, MessageReaction[]>();
+  if (messageIds.length === 0) return byMessage;
+  const placeholders = messageIds.map(() => "?").join(", ");
+  const rows = storage.sql
+    .exec<{ message_id: string; emoji: string; member_id: string }>(
+      `SELECT message_id, emoji, member_id FROM message_reactions
+       WHERE message_id IN (${placeholders}) ORDER BY emoji, created_at, member_id`,
+      ...messageIds,
+    )
+    .toArray();
+  for (const row of rows) {
+    const list = byMessage.get(row.message_id) ?? [];
+    const existing = list.find((entry) => entry.emoji === row.emoji);
+    if (existing) {
+      (existing.memberIds as string[]).push(row.member_id);
+    } else {
+      list.push({ emoji: row.emoji, memberIds: [row.member_id] });
+    }
+    byMessage.set(row.message_id, list);
+  }
+  return byMessage;
+}
+
+export function readMentions(
+  storage: DurableObjectStorage,
+  messageIds: readonly string[],
+): Map<string, MessageMention[]> {
+  const byMessage = new Map<string, MessageMention[]>();
+  if (messageIds.length === 0) return byMessage;
+  const placeholders = messageIds.map(() => "?").join(", ");
+  const rows = storage.sql
+    .exec<{ message_id: string; kind: string; handle: string; resolved_id: string | null }>(
+      `SELECT message_id, kind, handle, resolved_id FROM message_mentions
+       WHERE message_id IN (${placeholders}) ORDER BY kind, handle`,
+      ...messageIds,
+    )
+    .toArray();
+  for (const row of rows) {
+    const list = byMessage.get(row.message_id) ?? [];
+    list.push({ kind: row.kind, handle: row.handle, resolvedId: row.resolved_id });
+    byMessage.set(row.message_id, list);
+  }
+  return byMessage;
+}
+
+/** Attach reactions and mentions to a page in one pass per table. */
+export function annotateMessages(
+  storage: DurableObjectStorage,
+  page: MessagePage,
+): MessagePage {
+  const ids = page.messages.map((message) => message.id);
+  const reactions = readReactions(storage, ids);
+  const mentions = readMentions(storage, ids);
+  return {
+    nextCursor: page.nextCursor,
+    messages: page.messages.map((message) => ({
+      ...message,
+      reactions: reactions.get(message.id) ?? [],
+      mentions: mentions.get(message.id) ?? [],
+    })),
+  };
+}
+
+export function replaceMentions(
+  storage: DurableObjectStorage,
+  messageId: string,
+  mentions: readonly { kind: string; handle: string; resolvedId: string | null }[],
+  now: number,
+): void {
+  storage.sql.exec("DELETE FROM message_mentions WHERE message_id = ?", messageId);
+  for (const mention of mentions) {
+    storage.sql.exec(
+      `INSERT INTO message_mentions(message_id, kind, handle, resolved_id, created_at)
+       VALUES (?, ?, ?, ?, ?) ON CONFLICT(message_id, kind, handle) DO NOTHING`,
+      messageId,
+      mention.kind,
+      mention.handle,
+      mention.resolvedId,
+      now,
+    );
+  }
+}
+
+export function resolveMentionTargets(
+  storage: DurableObjectStorage,
+  mentions: readonly { kind: string; handle: string }[],
+): { kind: string; handle: string; resolvedId: string | null }[] {
+  return mentions.map((mention) => {
+    if (mention.kind === "member") {
+      const row = storage.sql
+        .exec<{ id: string }>("SELECT id FROM members WHERE handle = ? AND status = 'active'", mention.handle)
+        .toArray()[0];
+      return { ...mention, resolvedId: row?.id ?? null };
+    }
+    if (mention.kind === "agent") {
+      const row = storage.sql
+        .exec<{ id: string }>("SELECT id FROM agents WHERE handle = ? AND status <> 'archived'", mention.handle)
+        .toArray()[0];
+      return { ...mention, resolvedId: row?.id ?? null };
+    }
+    if (mention.kind === "group") {
+      const row = storage.sql
+        .exec<{ id: string }>("SELECT id FROM groups WHERE handle = ?", mention.handle)
+        .toArray()[0];
+      return { ...mention, resolvedId: row?.id ?? null };
+    }
+    return { ...mention, resolvedId: null };
+  });
+}
+
+export function applyMessageEdit(
+  storage: DurableObjectStorage,
+  messageId: string,
+  bodyMarkdown: string,
+  now: number,
+): void {
+  storage.sql.exec(
+    `UPDATE messages SET body_markdown = ?, edited_at = ?, edit_count = edit_count + 1
+     WHERE id = ? AND deleted_at IS NULL`,
+    bodyMarkdown,
+    now,
+    messageId,
+  );
+}
+
+/**
+ * A delete removes the content, not the row. The tombstone keeps the thread
+ * readable and the sequence intact; the body, its mentions and its reactions
+ * are gone from reads and from any later search index.
+ */
+export function applyMessageDelete(
+  storage: DurableObjectStorage,
+  messageId: string,
+  deletedByMemberId: string,
+  now: number,
+): void {
+  storage.sql.exec(
+    `UPDATE messages SET body_markdown = '', deleted_at = ?, deleted_by_member_id = ?
+     WHERE id = ? AND deleted_at IS NULL`,
+    now,
+    deletedByMemberId,
+    messageId,
+  );
+  storage.sql.exec("DELETE FROM message_mentions WHERE message_id = ?", messageId);
+  storage.sql.exec("DELETE FROM message_reactions WHERE message_id = ?", messageId);
+}
+
+export function addReaction(
+  storage: DurableObjectStorage,
+  messageId: string,
+  memberId: string,
+  emoji: string,
+  now: number,
+): boolean {
+  return (
+    storage.sql.exec(
+      `INSERT INTO message_reactions(message_id, member_id, emoji, created_at)
+       VALUES (?, ?, ?, ?) ON CONFLICT(message_id, member_id, emoji) DO NOTHING`,
+      messageId,
+      memberId,
+      emoji,
+      now,
+    ).rowsWritten > 0
+  );
+}
+
+export function removeReaction(
+  storage: DurableObjectStorage,
+  messageId: string,
+  memberId: string,
+  emoji: string,
+): boolean {
+  return (
+    storage.sql.exec(
+      "DELETE FROM message_reactions WHERE message_id = ? AND member_id = ? AND emoji = ?",
+      messageId,
+      memberId,
+      emoji,
+    ).rowsWritten > 0
   );
 }

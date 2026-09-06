@@ -48,6 +48,7 @@ import {
   parseChannelSlug,
   parseChannelTopic,
   parseMessageBody,
+  parseReactionEmoji,
   resolveThreadPlacement,
   type ChannelKind,
 } from "../domain/rooms";
@@ -69,8 +70,13 @@ import {
   parseClientFrame,
   type ServerFrame,
 } from "../domain/socket-protocol";
+import { parseMentions } from "../domain/mentions";
 import {
   addChannelMembers,
+  addReaction,
+  annotateMessages,
+  applyMessageDelete,
+  applyMessageEdit,
   archiveChannel,
   channelMemberIds,
   insertChannel,
@@ -90,10 +96,14 @@ import {
   readThreadCursor,
   readUnreadFacts,
   removeChannelMember,
+  removeReaction,
+  replaceMentions,
+  resolveMentionTargets,
   writeChannelCursor,
   writeThreadCursor,
   type ChannelRow,
   type MessagePage,
+  type MessageRow,
 } from "./workspace-rooms";
 import { verifySoloSnapshot, type SoloContentSnapshot } from "../domain/solo-snapshot";
 
@@ -1345,6 +1355,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       () => {
         const messageId = crypto.randomUUID();
         const channelSequence = nextChannelSequence(this.ctx.storage, channel.id);
+        const mentions = resolveMentionTargets(this.ctx.storage, parseMentions(body));
         insertMessage(this.ctx.storage, {
           id: messageId,
           channelId: channel.id,
@@ -1356,6 +1367,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           channelSequence,
           now: input.now,
         });
+        replaceMentions(this.ctx.storage, messageId, mentions, input.now);
 
         return {
           result: {
@@ -1381,6 +1393,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                 channel_kind: channel.kind,
                 in_thread: threadRootId !== null,
                 channel_sequence: channelSequence,
+                mention_count: mentions.length,
               },
             },
             // Delivery carries identifiers; a reader fetches the message it is
@@ -1427,6 +1440,199 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     return { ...outcome.result, replayed: outcome.replayed };
   }
 
+  /**
+   * Only the author may rewrite what they said. An edit keeps the message's
+   * place in the room and its sequence, re-derives who it addresses, and leaves
+   * a visible marker rather than changing the record silently.
+   */
+  async editMessage(input: {
+    actor: Actor;
+    messageId: string;
+    bodyMarkdown: string;
+    now: number;
+  }): Promise<{ messageId: string; editedAt: number }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const { message, channel } = this.requireOwnMessage(input.messageId, actor.id, "edit");
+
+    const body = parseMessageBody(input.bodyMarkdown);
+    if (body === null) throw new Error("message body is empty or too long");
+
+    const outcome = await this.commitMutation({ scope: "message.edit", now: input.now }, () => {
+      applyMessageEdit(this.ctx.storage, message.id, body, input.now);
+      const mentions = resolveMentionTargets(this.ctx.storage, parseMentions(body));
+      replaceMentions(this.ctx.storage, message.id, mentions, input.now);
+      return {
+        result: { messageId: message.id, editedAt: input.now },
+        effects: this.messageEffects("message.edited", message.id, channel, actor, {
+          mention_count: mentions.length,
+        }),
+      };
+    });
+
+    this.broadcastChannelEvent(channel, this.latestReplaySequence(), "message.edited", {
+      messageId: message.id,
+      channelId: channel.id,
+      editedAt: input.now,
+    });
+    return outcome.result;
+  }
+
+  /**
+   * A delete removes the content, not the row. The tombstone keeps the thread
+   * readable and the sequence intact; the body, its mentions and its reactions
+   * leave every read immediately. An admin may delete somebody else's message,
+   * and the audit record says who did.
+   */
+  async deleteMessage(input: {
+    actor: Actor;
+    messageId: string;
+    now: number;
+  }): Promise<{ messageId: string; deletedAt: number }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const message = readMessage(this.ctx.storage, input.messageId);
+    if (message === null || message.deletedAt !== null) throw new Error("message not found");
+    const channel = this.requireVisibleChannel(message.channelId, actor.id);
+    const moderator = actor.role === "owner" || actor.role === "admin";
+    if (message.authorId !== actor.id && !moderator) {
+      throw new Error("only the author or an admin may delete a message");
+    }
+
+    const outcome = await this.commitMutation({ scope: "message.delete", now: input.now }, () => {
+      applyMessageDelete(this.ctx.storage, message.id, actor.id, input.now);
+      return {
+        result: { messageId: message.id, deletedAt: input.now },
+        effects: this.messageEffects("message.deleted", message.id, channel, actor, {
+          by_author: message.authorId === actor.id,
+        }),
+      };
+    });
+
+    this.broadcastChannelEvent(channel, this.latestReplaySequence(), "message.deleted", {
+      messageId: message.id,
+      channelId: channel.id,
+      deletedAt: input.now,
+    });
+    return outcome.result;
+  }
+
+  /** Reacting is idempotent: one person and one emoji is one reaction. */
+  async reactToMessage(input: {
+    actor: Actor;
+    messageId: string;
+    emoji: string;
+    now: number;
+  }): Promise<{ added: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const { message, channel } = this.requireReactableMessage(input.messageId, actor.id);
+    const emoji = parseReactionEmoji(input.emoji);
+    if (emoji === null) throw new Error("invalid reaction");
+
+    const outcome = await this.commitMutation({ scope: "message.react", now: input.now }, () => {
+      const added = addReaction(this.ctx.storage, message.id, actor.id, emoji, input.now);
+      if (!added) return { result: { added: false } };
+      return {
+        result: { added: true },
+        effects: this.messageEffects("message.reacted", message.id, channel, actor, {
+          reaction_length: emoji.length,
+        }),
+      };
+    });
+
+    if (outcome.result.added) {
+      this.broadcastChannelEvent(channel, this.latestReplaySequence(), "message.reacted", {
+        messageId: message.id,
+        channelId: channel.id,
+        emoji,
+        memberId: actor.id,
+        added: true,
+      });
+    }
+    return outcome.result;
+  }
+
+  async unreactToMessage(input: {
+    actor: Actor;
+    messageId: string;
+    emoji: string;
+    now: number;
+  }): Promise<{ removed: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const { message, channel } = this.requireReactableMessage(input.messageId, actor.id);
+    const emoji = parseReactionEmoji(input.emoji);
+    if (emoji === null) throw new Error("invalid reaction");
+
+    const removed = this.ctx.storage.transactionSync(() =>
+      removeReaction(this.ctx.storage, message.id, actor.id, emoji),
+    );
+    if (removed) {
+      this.broadcastChannelEvent(channel, this.latestReplaySequence(), "message.reacted", {
+        messageId: message.id,
+        channelId: channel.id,
+        emoji,
+        memberId: actor.id,
+        added: false,
+      });
+    }
+    return { removed };
+  }
+
+  private requireOwnMessage(
+    messageId: string,
+    memberId: string,
+    verb: string,
+  ): { message: MessageRow; channel: ChannelRow } {
+    const message = readMessage(this.ctx.storage, messageId);
+    if (message === null || message.deletedAt !== null) throw new Error("message not found");
+    const channel = this.requireVisibleChannel(message.channelId, memberId);
+    if (message.authorId !== memberId || message.authorKind !== "member") {
+      throw new Error(`only the author may ${verb} a message`);
+    }
+    if (channel.archivedAt !== null) throw new Error("this room is archived");
+    return { message, channel };
+  }
+
+  private requireReactableMessage(
+    messageId: string,
+    memberId: string,
+  ): { message: MessageRow; channel: ChannelRow } {
+    const message = readMessage(this.ctx.storage, messageId);
+    if (message === null || message.deletedAt !== null) throw new Error("message not found");
+    const channel = this.requireChannelParticipant(message.channelId, memberId);
+    if (channel.archivedAt !== null) throw new Error("this room is archived");
+    return { message, channel };
+  }
+
+  private messageEffects(
+    eventType: string,
+    messageId: string,
+    channel: ChannelRow,
+    actor: ActiveMember,
+    metadata: Record<string, string | number | boolean | null>,
+  ): MutationEffects {
+    return {
+      audit: {
+        eventType,
+        outcome: "allowed",
+        requesterKind: "member",
+        requesterId: actor.id,
+        subjectKind: "message",
+        subjectId: messageId,
+        metadata: { channel_id: channel.id, ...metadata },
+      },
+      replay: [
+        {
+          kind: eventType,
+          audience: [channel.id],
+          payload: { messageId, channelId: channel.id, actorId: actor.id },
+        },
+      ],
+    };
+  }
+
   /** Newest-first channel history, refused outright for a room the caller cannot see. */
   readChannelHistory(input: {
     actor: Actor;
@@ -1436,7 +1642,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }): MessagePage {
     const actor = this.authorizeActor(input.actor);
     const channel = this.requireVisibleChannel(input.channelId, actor.id);
-    return listChannelHistory(this.ctx.storage, channel.id, input.cursor ?? null, input.limit);
+    return annotateMessages(
+      this.ctx.storage,
+      listChannelHistory(this.ctx.storage, channel.id, input.cursor ?? null, input.limit),
+    );
   }
 
   readThreadHistory(input: {
@@ -1449,7 +1658,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const root = readMessage(this.ctx.storage, input.threadRootId);
     if (root === null || root.threadRootId !== null) throw new Error("thread not found");
     this.requireVisibleChannel(root.channelId, actor.id);
-    return listThreadHistory(this.ctx.storage, root.id, input.cursor ?? null, input.limit);
+    return annotateMessages(
+      this.ctx.storage,
+      listThreadHistory(this.ctx.storage, root.id, input.cursor ?? null, input.limit),
+    );
   }
 
   browseChannels(input: { actor: Actor; includeArchived?: boolean }): {

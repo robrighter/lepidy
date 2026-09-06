@@ -143,7 +143,61 @@ test("ROOM-INT-013 renders channel history and tells a person from an agent", as
   // A room with nothing in it says so rather than showing a blank panel.
   await page.goto("/c/release");
   await expect(page.getByRole("heading", { name: "No messages yet" })).toBeVisible();
-  await expect(page.getByText(/composer arrives with C04/)).toBeVisible();
+  await expect(page.getByText(/start this room off/)).toBeVisible();
+});
+
+test("MSG-INT-008 renders markdown as elements and never as markup", async ({ page }) => {
+  await page.goto("/c/eng");
+  const agentMessage = page.locator(".messages > li").nth(1);
+
+  // A fenced block is a real code element with its language shown.
+  const code = agentMessage.locator("pre code");
+  await expect(code).toHaveText("wrangler deploy --env production");
+  await expect(agentMessage.locator("pre .code-language")).toHaveText("sh");
+  await expect(agentMessage.locator(".markdown strong")).toHaveText("no rollbacks");
+  await expect(agentMessage.locator(".markdown p code").first()).toHaveText("api@2.14.0");
+
+  // A mention is classified by its prefix, and shown as one.
+  const mention = agentMessage.locator(".mention");
+  await expect(mention).toHaveText("@maya");
+  await expect(mention).toHaveAttribute("data-mention-kind", "member");
+
+  // A reaction shows its count and is announced to a screen reader.
+  const reactions = page.locator(".messages > li").nth(0).locator(".reactions li");
+  await expect(reactions).toHaveCount(1);
+  await expect(reactions.first()).toContainText("1");
+});
+
+test("MSG-INT-009 keeps focus, preserves a draft and separates Enter from Shift+Enter", async ({ page }) => {
+  await page.goto("/c/eng");
+  const composer = page.getByRole("textbox", { name: /Message #eng/ });
+  await expect(composer).toBeVisible();
+
+  // Shift+Enter adds a line rather than sending.
+  await composer.click();
+  await composer.type("first line");
+  await page.keyboard.press("Shift+Enter");
+  await composer.type("second line");
+  await expect(composer).toHaveValue("first line\nsecond line");
+  await expect(composer).toBeFocused();
+
+  // The draft survives leaving the room and coming back.
+  await page.goto("/c/release");
+  await expect(page.getByRole("textbox", { name: /Message #release/ })).toHaveValue("");
+  await page.goto("/c/eng");
+  await expect(page.getByRole("textbox", { name: /Message #eng/ })).toHaveValue(
+    "first line\nsecond line",
+  );
+
+  // Enter sends. Signed out, it says so plainly and keeps both the draft and
+  // the caret so nothing typed is lost.
+  await page.getByRole("textbox", { name: /Message #eng/ }).click();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".composer-error")).toContainText("Sign in to post");
+  await expect(page.getByRole("textbox", { name: /Message #eng/ })).toBeFocused();
+  await expect(page.getByRole("textbox", { name: /Message #eng/ })).toHaveValue(
+    "first line\nsecond line",
+  );
 });
 
 test("SHELL-INT-006 states plainly that a surface is not built yet", async ({ page }) => {

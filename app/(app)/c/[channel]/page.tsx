@@ -1,3 +1,4 @@
+import { Composer } from "@/components/shell/composer";
 import { MessageList } from "@/components/shell/message-list";
 import { channelHistory } from "@/src/shell/channel-context";
 import { shellState } from "@/src/shell/shell-context";
@@ -44,13 +45,19 @@ export default async function ChannelPage({ params }: { params: Promise<{ channe
         <section className="empty-state">
           <h2>No messages yet</h2>
           <p>Nothing has been posted in this room.</p>
-          <span className="next-step">The composer arrives with C04 and live delivery with C03.</span>
+          <span className="next-step">Say something below to start this room off.</span>
         </section>
       ) : (
         <section className="panel">
           <MessageList messages={history.page.messages} />
         </section>
       )}
+
+      <Composer
+        channelId={channel.id}
+        channelLabel={channelLabel(channel)}
+        canPost={channel.isMember && channel.kind !== "dm"}
+      />
     </>
   );
 }
