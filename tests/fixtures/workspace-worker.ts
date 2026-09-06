@@ -1,4 +1,5 @@
 export { Workspace } from "../../src/cloudflare/workspace";
+export { MigrationFixture } from "./migration-fixture";
 
 export default {
   fetch() {

@@ -9,13 +9,25 @@
       {
         "name": "WORKSPACE",
         "class_name": "Workspace"
+      },
+      {
+        "name": "MIGRATION_FIXTURE",
+        "class_name": "MigrationFixture"
       }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["Workspace"]
+      "new_sqlite_classes": ["Workspace", "MigrationFixture"]
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "CONTROL_DB",
+      "database_name": "lepidy-control-test",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations/control"
     }
   ]
 }

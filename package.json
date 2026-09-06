@@ -22,6 +22,8 @@
     "cf:deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
     "cf:dry-run": "wrangler deploy --dry-run --outdir .wrangler/dist",
     "cf:typegen": "wrangler types --env-interface CloudflareEnv",
+    "db:migrate:local": "wrangler d1 migrations apply CONTROL_DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply CONTROL_DB --remote",
     "verify:local": "node scripts/verify-local.mjs",
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build"

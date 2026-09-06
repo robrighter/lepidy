@@ -12,6 +12,14 @@ npm run cf:typegen
 npm run dev
 ```
 
+Apply the D1 control-plane migrations to the local Wrangler database with:
+
+```bash
+npm run db:migrate:local
+```
+
+Workspace Durable Objects migrate their isolated SQLite database on first wake. A failed workspace migration is rolled back and that workspace reports a quarantined health state.
+
 Open <http://localhost:3000>. The Next.js development proxy intentionally uses `wrangler.next-dev.jsonc`; the workspace Durable Object will run in its dedicated local Worker fixture when F03 adds the storage and migration system.
 
 The complete local gate is:

@@ -1,8 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 
+import {
+  migrateWorkspaceSchema,
+  readWorkspaceSchema,
+  type WorkspaceSchemaState,
+} from "./workspace-migrations";
+
 export type WorkspaceHealth = {
-  ok: true;
+  ok: boolean;
   schemaVersion: number;
+  status: WorkspaceSchemaState["status"];
+  error: string | null;
 };
 
 export class Workspace extends DurableObject<CloudflareEnv> {
@@ -10,25 +18,18 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     super(ctx, env);
 
     ctx.blockConcurrencyWhile(async () => {
-      ctx.storage.sql.exec(`
-        CREATE TABLE IF NOT EXISTS _schema (
-          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-          version INTEGER NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        INSERT OR IGNORE INTO _schema (singleton, version, updated_at)
-        VALUES (1, 1, datetime('now'));
-      `);
+      migrateWorkspaceSchema(ctx.storage);
     });
   }
 
   health(): WorkspaceHealth {
-    const row = this.ctx.storage.sql
-      .exec<{ version: number }>(
-        "SELECT version FROM _schema WHERE singleton = 1",
-      )
-      .one();
+    const state = readWorkspaceSchema(this.ctx.storage);
 
-    return { ok: true, schemaVersion: row.version };
+    return {
+      ok: state.status === "ready",
+      schemaVersion: state.version,
+      status: state.status,
+      error: state.error,
+    };
   }
 }

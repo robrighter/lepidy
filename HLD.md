@@ -275,38 +275,30 @@ The hardest operational problem this design creates, and the one most likely to 
 
 There is no `ALTER TABLE` that reaches every tenant. Each workspace has its own SQLite, and a workspace that nobody has opened since March is a database at March's schema.
 
-**The pattern:**
+**The implemented pattern:**
 
 ```ts
 export class Workspace extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    // Schema only. Never business logic, never external I/O — a blocked
-    // constructor blocks every request to this tenant.
-    ctx.blockConcurrencyWhile(async () => this.migrate());
-  }
-
-  private migrate() {
-    const sql = this.ctx.storage.sql;
-    sql.exec(`CREATE TABLE IF NOT EXISTS _schema (version INTEGER NOT NULL)`);
-    let v = sql.exec<{ version: number }>(`SELECT version FROM _schema`).toArray()[0]?.version ?? 0;
-    for (const m of MIGRATIONS.slice(v)) {  // ordered, append-only, never edited
-      m(sql);
-      v += 1;
-      sql.exec(`INSERT OR REPLACE INTO _schema (version) VALUES (?)`, v);
-    }
+    ctx.blockConcurrencyWhile(async () => {
+      migrateWorkspaceSchema(ctx.storage);
+    });
   }
 }
 ```
 
+`migrateWorkspaceSchema` maintains exactly one `_schema` row with `version`, `status` and the last bounded error. Each numbered migration and its compare-and-set version update run inside `storage.transactionSync`. A thrown statement therefore rolls back the entire migration. A separate transaction records the failure in `_migration_failures` and marks that object `quarantined`; subsequent wakes remain quarantined until an operator applies a reviewed recovery. The concrete chain is in `src/cloudflare/workspace-migrations.ts` and the D1 deployment migrations are in `migrations/control/`.
+
 **Rules this imposes, all of them consequences rather than preferences:**
 
 - **Migrations are append-only and never edited after deploy.** A tenant that already ran migration 14 will never run it again; changing it means migration 15.
+- **Versions are contiguous and the singleton update is a compare-and-set.** A missing version or concurrent state change quarantines rather than guessing.
 - **Every migration must be fast.** It runs inside `blockConcurrencyWhile` on a user's first request after a deploy, and that user is waiting. Anything that rewrites a large table is a *background* migration: add the column, backfill on an alarm, switch the read path when the backfill completes.
 - **The read path tolerates both shapes** across a background migration. This is normal expand/contract, but here it must be written that way from the start because we cannot make the whole fleet move at once.
 - **Tenants report their version.** The daily alarm sends `schema_version` to the control plane, so we can answer "how many workspaces are behind" and "which ones failed" — a question a single shared database never has to ask.
 - **A failed migration quarantines one tenant.** It is caught, recorded, and the object serves a maintenance response rather than a broken one. Nothing else is affected, which is the blast-radius benefit of §3.8 arriving as an operational obligation.
-- **Migrations are tested against a corpus of real-shaped tenant databases**, not an empty one — the empty case is the one that always works.
+- **Migrations are tested from version zero and every historical version**, plus a deliberately failing fixture that proves partial DDL rolls back and one tenant's quarantine does not affect another.
 
 ### 5.3 Search
 
