@@ -1,4 +1,4 @@
-import { hashOpaqueToken, randomToken } from "./identity";
+import { hashOpaqueToken, randomToken } from "./opaque-tokens";
 import type { Workspace } from "../cloudflare/workspace";
 
 const encoder = new TextEncoder();

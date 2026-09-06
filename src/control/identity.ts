@@ -2,6 +2,8 @@ import argon2NonSimdModule from "argon2id/dist/no-simd.wasm";
 import argon2SimdModule from "argon2id/dist/simd.wasm";
 import setupArgon2id, { type computeHash } from "argon2id/lib/setup.js";
 
+export { hashOpaqueToken, randomToken } from "./opaque-tokens";
+
 const encoder = new TextEncoder();
 let argon2idPromise: Promise<computeHash> | undefined;
 
@@ -46,16 +48,6 @@ export function assertSafeIdentityLink(
   if (!authorization.confirmed) throw new Error("explicit confirmation required");
 }
 
-export async function hashOpaqueToken(token: string): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(token)));
-}
-
-export function randomToken(bytes = 32): string {
-  const value = crypto.getRandomValues(new Uint8Array(bytes));
-  let binary = "";
-  for (const byte of value) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-}
 
 export async function hashPassword(password: string): Promise<string> {
   if (password.length < 12) throw new Error("password must contain at least 12 characters");

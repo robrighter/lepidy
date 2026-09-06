@@ -106,6 +106,37 @@ export const RETENTION_SWEEP_WORK_ID = "system:retention_sweep";
 export const AUDIT_ANCHOR_WORK_ID = "system:audit_anchor";
 export const OUTBOX_FLUSH_WORK_ID = "system:outbox_flush";
 
+export type ShellChannel = {
+  id: string;
+  kind: "public" | "private" | "dm" | "group_dm";
+  slug: string | null;
+  name: string | null;
+  isMember: boolean;
+};
+
+export type ShellAgent = {
+  id: string;
+  handle: string;
+  displayName: string;
+  status: "active" | "paused" | "archived";
+};
+
+export type ShellViewer = {
+  memberId: string;
+  handle: string;
+  displayName: string;
+  role: MemberProjection["role"];
+  authorizationEpoch: number;
+};
+
+export type WorkspaceShellSnapshot = {
+  viewer: ShellViewer;
+  channels: readonly ShellChannel[];
+  agents: readonly ShellAgent[];
+  storageMode: WorkspaceStorageMode | null;
+  schemaVersion: number;
+};
+
 export class Workspace extends DurableObject<CloudflareEnv> {
   constructor(ctx: DurableObjectState, env: CloudflareEnv) {
     super(ctx, env);
@@ -535,6 +566,90 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       );
       return { storageMode: "cloud" as const, routingEpoch, replayed: false };
     });
+  }
+
+  /**
+   * The navigation and profile data one member may see. Visibility is applied
+   * here, in the object, rather than trusted from the caller: a private room is
+   * returned only to a member of that room, and the caller's membership epoch
+   * must still match the projection this workspace holds.
+   */
+  shellSnapshot(input: { memberId: string; authorizationEpoch: number }): WorkspaceShellSnapshot {
+    const schema = readWorkspaceSchema(this.ctx.storage);
+    if (schema.status !== "ready") throw new Error("workspace is quarantined");
+    if (!this.authorizeMember(input.memberId, input.authorizationEpoch)) {
+      throw new Error("member is not authorized for this workspace");
+    }
+
+    const viewerRow = this.ctx.storage.sql
+      .exec<{
+        id: string;
+        handle: string;
+        display_name: string;
+        role: MemberProjection["role"];
+        authorization_epoch: number;
+      }>(
+        "SELECT id, handle, display_name, role, authorization_epoch FROM members WHERE id = ?",
+        input.memberId,
+      )
+      .one();
+
+    const channels = this.ctx.storage.sql
+      .exec<{
+        id: string;
+        kind: ShellChannel["kind"];
+        slug: string | null;
+        name: string | null;
+        is_member: number;
+      }>(
+        `SELECT c.id, c.kind, c.slug, c.name,
+                CASE WHEN cm.member_id IS NULL THEN 0 ELSE 1 END AS is_member
+         FROM channels c
+         LEFT JOIN channel_members cm ON cm.channel_id = c.id AND cm.member_id = ?
+         WHERE c.archived_at IS NULL AND (c.kind = 'public' OR cm.member_id IS NOT NULL)
+         ORDER BY c.kind, COALESCE(c.slug, c.name, c.id)`,
+        input.memberId,
+      )
+      .toArray()
+      .map((row) => ({
+        id: row.id,
+        kind: row.kind,
+        slug: row.slug,
+        name: row.name,
+        isMember: row.is_member === 1,
+      }));
+
+    const agents = this.ctx.storage.sql
+      .exec<{ id: string; handle: string; display_name: string; status: ShellAgent["status"] }>(
+        "SELECT id, handle, display_name, status FROM agents WHERE status <> 'archived' ORDER BY handle",
+      )
+      .toArray()
+      .map((row) => ({
+        id: row.id,
+        handle: row.handle,
+        displayName: row.display_name,
+        status: row.status,
+      }));
+
+    const config = this.ctx.storage.sql
+      .exec<{ storage_mode: WorkspaceStorageMode }>(
+        "SELECT storage_mode FROM workspace_config WHERE singleton = 1",
+      )
+      .toArray()[0];
+
+    return {
+      viewer: {
+        memberId: viewerRow.id,
+        handle: viewerRow.handle,
+        displayName: viewerRow.display_name,
+        role: viewerRow.role,
+        authorizationEpoch: viewerRow.authorization_epoch,
+      },
+      channels,
+      agents,
+      storageMode: config?.storage_mode ?? null,
+      schemaVersion: schema.version,
+    };
   }
 
   /* ------------------------------------------------------------------ */

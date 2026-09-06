@@ -121,11 +121,11 @@ Manual review and screenshots can supplement visual judgment, store review and h
 | `OUTBOX-INT-001–008` | `tests/scheduler.test.ts` | One transaction for rows, audit, outbox, replay, deadlines and idempotency receipt; full rollback on failure; replayed request without repeated effects; transient retry, permanent and budget-exhausted dead-lettering; delivery dedupe; the real local Queue binding; membership projection over RPC. |
 | `AUDIT-INT-001–003` | `tests/scheduler.test.ts` | Append-only triggers, tamper detection after an operator drops the trigger, daily anchoring and refusal to seal a broken chain. |
 | `RETENTION-INT-001/002` | `tests/scheduler.test.ts` | Every D07 expiry class swept exactly at its boundary under a controlled clock, and audit purge limited to anchored expired sequences with the chain still verifiable afterwards. |
+| `SHELL-RULE-001–009` | `src/shell/shell-model.test.ts` | Active-section resolution, path normalisation, section and channel titles, channel links, generated initials and gradients, and theme preference/resolution/toggle rules. |
+| `SHELL-DATA-INT-001–003` | `tests/shell-data.test.ts` | The real control-plane adapter against local D1 and a real workspace object: a signed-in workspace, a private room hidden from a valid member who is not in it, archived rooms and agents excluded, and missing/forged/revoked/stale-epoch sessions refused. |
+| `SHELL-INT-001–008` | `tests/browser/shell.spec.ts` | Shell layout at both viewports, accessibility in light and dark on three routes, one current navigation item, keyboard-only operation, dark mode applied before first paint and remembered, honest not-built-yet and unavailable-channel states, the development-data banner and the viewer's profile. |
+| `DESKTOP-INT-001–003` | `tests/browser/shell.spec.ts` | Windows caption controls and drag surface, macOS overlay reserving the native traffic lights, and the rail sitting below the reserved titlebar only on desktop. |
 | `MOCKUP-SEC-001/002/003` | `tests/browser/mockup-contracts.spec.ts` | Rendered Solo storage, local-only runner configuration and user-held vault recovery disclosures. |
-| `SHELL-INT-001` | `tests/browser/shell.spec.ts` | Branded shell semantics, horizontal overflow and desktop/mobile layout. |
-| `SHELL-INT-002` | `tests/browser/shell.spec.ts` | Serious/critical accessibility scan. |
-| `DESKTOP-INT-001` | `tests/browser/shell.spec.ts` | Windows branded drag region and visible caption controls. |
-| `DESKTOP-INT-002` | `tests/browser/shell.spec.ts` | macOS overlay spacing with native-control reservation. |
 | Supporting rule cases | `src/domain/idempotency-key.test.ts` | Bounded transport-safe idempotency keys; a command integration test must consume this rule when mutation handling lands. |
 
 The desktop rendering tests cover web content under the same platform marker injected by Tauri. Actual minimize/maximize/close calls require the WebdriverIO Tauri harness and remain part of R03/P01 rather than being inferred from browser tests.
