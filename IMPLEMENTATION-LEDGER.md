@@ -23,8 +23,8 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [x] | D01 | Identity and tenant contract | — | S1,S2 | Document URL/cookie/passkey boundaries, tenant-local author IDs, linking/recovery and cross-plane revocation; reconcile specs. | done | /root | 2026-09-05 | 2026-09-05 | [D01](#d01--identity-and-tenant-contract) |
 | [ ] | D02 | Runner and queue contract | — | S2,S3,V2 | Resolve designated runner/concurrency, leases/fencing, completion, retries, idle timeout, disconnect policy and session-token scope. | todo | — | — | — | — |
 | [ ] | D03 | MCP waiting and harness spike | F01,F03,D02 | S3,V2 | Demonstrate repeated work in one harness without a permanently parked workspace request; measure idle duration and test cancellation/reconnect. | todo | — | — | — | — |
-| [ ] | D04 | Vault and approval contract | D01 | V1,V4 | Specify ACL union/intersection, provenance binding, signed project/device claims, step-up matrix, batch approvals and grant expiry semantics. | todo | — | — | — | — |
-| [ ] | D05 | Vault sharing and release contract | D04,D05a | V4 | Resolve device-mediated delivery, browser trust, per-owner wraps, removal/rekey and lost-device behavior while preserving user-held root custody. | todo | — | — | — | — |
+| [x] | D04 | Vault and approval contract | D01 | V1,V4 | Specify ACL union/intersection, provenance binding, signed project/device claims, step-up matrix, batch approvals and grant expiry semantics. | done | /root | 2026-09-06 | 2026-09-06 | [D04](#d04--vault-and-approval-contract) |
+| [ ] | D05 | Vault sharing and release contract | D04,D05a | V4 | Resolve device-mediated delivery, browser trust, per-owner wraps, removal/rekey and lost-device behavior while preserving user-held root custody. | in_progress | /root | 2026-09-06 | — | — |
 | [x] | D05a | Local execution and vault-root invariants | D01,D08a | V1,V2,V4 | Specify and reconcile local-only runner configuration plus client-generated vault unlock/recovery material that never reaches Lepidy; add schema/protocol negative tests. | done | /root | 2026-09-06 | 2026-09-06 | [D05a](#d05a--local-execution-and-vault-root-invariants) |
 | [ ] | D06 | Cloud and custom contract spike | F01 | S3 | Verify provider auth, APIs, signed callbacks, schedule budgets and reconciliation; custom replay/SSRF boundaries; record supported capabilities. | todo | — | — | — | — |
 | [ ] | D07 | Retention/residency/recovery contract | — | V4 | Specify retention by data class, export/delete/restore, EU scope, audit anchors and archive-search design. | todo | — | — | — | — |
@@ -84,6 +84,16 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [ ] | G05 | Release documentation and final decision | G01,G02,G03,G04,O03 | — | Reconcile PRD/HLD/mockups, publish-ready docs/marketing and support runbooks, enumerate accepted deferrals and external reviews; release only with required authorization. | todo | — | — | — | — |
 
 ## Evidence records
+
+### D04 — Vault and approval contract
+
+- Task / owner: D04 / `/root`
+- Status / dates: done / 2026-09-06 to 2026-09-06
+- Decision delivered: independent `use`, `reveal` and `manage` ACL verbs; union inside one verb followed by mandatory membership/device/origin/policy/delegation intersections; exactly one accountable owner/delegation per autonomous request; signed opaque project/device claims; a concrete step-up matrix; digest-bound, per-item batch approval; exact grant identity, expiry, atomic consumption and revocation triggers. Cloud authorization releases ciphertext work to a trusted device and never grants a cloud decrypt.
+- Changed files: `docs/vault-authorization-contract.md`, `src/domain/vault-authorization.ts`, `src/domain/vault-authorization.test.ts`, `PRD.md`, `HLD.md`, `IMPLEMENTATION-PLAN.md`, `TESTING.md`, `IMPLEMENTATION-LEDGER.md`.
+- Reused design: the ordered fail-closed decision pipeline, exact-client grants, delivery restrictions, single-use semantics and denial behavior were adapted from `../agent-vault/crates/av-core/src/policy.rs`, `grants.rs` and their case tables at the pinned V1 revision. Lepidy adds tenant membership, channel origin, device signatures, agents and one-owner delegation intersection.
+- Automated evidence: `VAULT-AUTH-001–005` exercise ACL union, seven mandatory deny overrides, complete unattended delegation, independent reveal rights, ask/auto behavior and exact grants. The full local gate passed with 39 Worker/D1/SQLite/pure tests, 12 desktop/mobile browser tests, TypeScript, production Next.js/OpenNext/Wrangler builds, zero production dependency vulnerabilities and native Windows Tauri compilation.
+- Limitations / follow-ups: D05 specifies multi-owner key envelopes and release-device protocols. F05 implements signed request and revocation persistence; V01/V03 implement durable policy, grants and approval races.
 
 ### D08a — Free workspace storage boundary
 

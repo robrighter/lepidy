@@ -566,6 +566,8 @@ The service validates the request and relays it end-to-end encrypted to an enrol
 
 ### 8.4 Principals, devices, and grants
 
+The normative ACL composition, delegation intersection, signed device/project claims, approval step-up matrix, batching rules and exact grant identity are defined in the [vault authorization and approval contract](./docs/vault-authorization-contract.md). Missing or stale state fails closed.
+
 `agent-vault` identifies its caller with `SO_PEERCRED` over a unix socket. Over a network there is no such thing, so identity is established once, deliberately, in a browser:
 
 **Device registration.** `lepidy login` opens a browser, the human authenticates, and the CLI receives a device-bound credential (an audience-scoped token, with a device keypair for request signing). The device gets a name, an owner, a first-seen and last-seen time, and a **revoke button in Settings that takes effect on the next request**. Every injected command names its project directory, so policy can be project-scoped exactly as the local version was.
@@ -653,6 +655,8 @@ A credential carries an ACL with three verbs, because they are genuinely differe
 | **use** | May trigger an injection or a proxied call. The broadest. |
 | **reveal** | May see the plaintext in the UI or grant a Tier-3 reveal. Rare. |
 | **manage** | May edit the value, the policy, the ACL, and delete. Owners. |
+
+The verbs are independent. `manage` never implies `use` or `reveal`; revealing requires both `use` and `reveal`. Matches union within one verb, then intersect with current membership, device signature, origin, policy and—when autonomous—one owner's delegation. An agent cannot combine rights from several owners.
 
 Holders are people, groups (`@g.backend`), **agents**, and **channels**. That last one is the synthesis worth building: *"agents working in `#billing` may use `STRIPE_TEST`."* Scope is enforced on both sides, exactly as agent scope is (§7.4) and through the same shape of shared function: a request from outside the scope is refused, and the refusal names the fix.
 

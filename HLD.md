@@ -468,6 +468,8 @@ The request contains no server-selectable header value or executable input. Redi
 
 ### 9.4 The approval path
 
+The normative policy order, ACL composition, signed request tuple, delegation intersection, step-up matrix, batch digest and grant revocation rules live in the [vault authorization and approval contract](./docs/vault-authorization-contract.md). The workspace authority evaluates metadata and records decisions; an unlocked client or release device performs any cryptographic release.
+
 Approvals are the one flow that spans a person's devices rather than a workspace's clients, and they are strongly consistent because they live in the DO:
 
 1. A request creates an `approvals` row and broadcasts to every socket belonging to any owner of the credential.
