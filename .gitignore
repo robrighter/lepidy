@@ -12,5 +12,7 @@ src-tauri/gen/
 *.log
 *.tsbuildinfo
 *:Zone.Identifier
+test-results/
+playwright-report/
 .DS_Store
 Thumbs.db

@@ -14,6 +14,14 @@ npm run dev
 
 Open <http://localhost:3000>. The Next.js development proxy intentionally uses `wrangler.next-dev.jsonc`; the workspace Durable Object will run in its dedicated local Worker fixture when F03 adds the storage and migration system.
 
+The complete local gate is:
+
+```sh
+npm run verify:local
+```
+
+Install its browser once with `npx playwright install chromium`. The required coverage and evidence rules are defined in [TESTING.md](TESTING.md).
+
 Useful checks:
 
 ```sh

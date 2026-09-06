@@ -8,8 +8,8 @@ Companion: [implementation plan](IMPLEMENTATION-PLAN.md). This file is the sourc
 2. Never change another active owner's row without coordination. Dependencies refer to completed integrated work, not another branch's intention. Claim shared-schema/contract changes explicitly before concurrent edits.
 3. Status values: todo, in_progress, blocked, done. Check the Done box only with status done. Blocked means a concrete missing decision, failed dependency, or external requirement; record the unblock condition.
 4. Preserve IDs. Split oversized work into suffixed IDs (for example C08a) and update dependencies; keep the parent incomplete until all children pass. Do not reuse deleted IDs.
-5. Before completion, integrate the change, satisfy the acceptance column, run relevant verification, and append an evidence record. Set Finished and link the evidence heading from the row. Do not record planned tests as passed.
-6. Evidence includes changed paths, reused source revision/path, actual commands/results, browser checks where relevant, remaining limitations and follow-ups. No secrets or private tokens.
+5. Before completion, integrate the change, satisfy the acceptance column, add automated integration coverage required by [TESTING.md](TESTING.md), run `npm run verify:local`, and append an evidence record. Set Finished and link the evidence heading from the row. Unit-only or manual-only verification cannot complete implemented behavior. Do not record planned tests as passed.
+6. Evidence includes scenario IDs, changed paths, reused source revision/path, actual commands/results, exercised boundaries and local doubles, supported platforms actually run, remaining limitations and follow-ups. No secrets or private tokens.
 7. Documentation preparation does not complete implementation tasks. All tasks below intentionally begin unchecked. Check a decision only when resolved, recorded and propagated to affected specs.
 8. At handoff, update active rows and evidence, identify the next ready task and exact blockers. No elapsed-time or automatic percentage-based completion.
 9. This ledger organizes work; it does not authorize deployments, purchases, messages, account changes or store submissions beyond the user's instructions.
@@ -30,6 +30,7 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [ ] | D08 | Product and commerce decisions | — | S4,S5,S7 | Resolve remaining product boundaries listed in plan §3, including proration, companion composer, file extraction and store purchase behavior. | todo | — | — | — | — |
 | [x] | F01 | Next.js/OpenNext and Tauri workspace skeleton | — | S1,S7 | Next.js builds locally and for Workers; establish Tauri v2 Rust workspace and CLI layout, typed environment bindings, dev configuration and no legacy infrastructure. | done | /root | 2026-09-05 | 2026-09-05 | [F01](#f01--nextjsopennext-and-tauri-workspace-skeleton) |
 | [x] | F02 | CI and reusable-code inventory | F01 | S1–S7,V1–V4 | Record reference revisions/license notices and source-to-target map; CI builds and executes pure-rule and SQLite DO fixtures. | done | /root | 2026-09-05 | 2026-09-05 | [F02](#f02--ci-and-reusable-code-inventory) |
+| [x] | F02a | Local integration testing standard | F02 | — | Define the automated integration contract for every implementation task; add a single local verification runner and browser coverage for the existing web/Tauri shell. | done | /root | 2026-09-05 | 2026-09-05 | [F02a](#f02a--local-integration-testing-standard) |
 | [ ] | F03 | Workspace storage and migrations | F01,D01 | S2 | Create D1 control plane and per-workspace SQLite schema; singleton migration version, atomic progression, quarantine and historical-fixture tests. | todo | — | — | — | — |
 | [ ] | F04 | Identity and workspace onboarding | F03,D01 | S1,S2 | Implement verified accounts, password/passkey/Google/email-link methods, safe linking, workspace create/invite, roles and last-admin protection. | todo | — | — | — | — |
 | [ ] | F05 | Session/device authorization | F04,D04 | S3,V2 | Revocable browser/device credentials, request signing/replay protection, authoritative membership checks and socket revocation; separate runner lifecycle. | todo | — | — | — | — |
@@ -107,6 +108,18 @@ Append one record per completed task; use the matching task ID as its heading. F
 - Limitations / user-approved deferrals: the local repository has no GitHub remote, so the authored CI workflow cannot receive a hosted run until a remote is connected and pushed. macOS compilation is represented in the CI matrix and awaits that first hosted run.
 - Follow-ups and unblock conditions: connect the repository remote to obtain the first hosted Windows/macOS CI evidence. Add adapted-source entries to each later ledger record rather than treating the inventory as blanket approval to copy code.
 
+### F02a — Local integration testing standard
+
+- Task / owner: F02a / `/root`
+- Status / dates: done / 2026-09-05 to 2026-09-05
+- Decision or implementation delivered: mandatory local integration-testing contract for every implemented behavior; one cross-platform `npm run verify:local` gate; Playwright desktop/mobile shell checks; automated accessibility scanning; Windows/macOS titlebar rendering scenarios; CI browser execution. The initial run found and corrected six WCAG contrast failures in the live shell.
+- Changed files: `TESTING.md`, `scripts/verify-local.mjs`, `playwright.config.ts`, `tests/browser/shell.spec.ts`, `tests/workspace.test.ts`, `package.json`, `package-lock.json`, `.github/workflows/ci.yml`, `.gitignore`, `README.md`, `IMPLEMENTATION-PLAN.md`, `IMPLEMENTATION-LEDGER.md`, `app/globals.css`.
+- Reused code: no reference application code was copied. Test boundaries follow the existing Lepidy architecture and current official Cloudflare, Playwright and Tauri testing facilities linked from `TESTING.md`.
+- Verification: `npm run verify:local` passed end to end with `WORKSPACE-INT-001`, 7 supporting idempotency cases, `SHELL-INT-001` at desktop/mobile, `SHELL-INT-002` at desktop/mobile, `DESKTOP-INT-001`, and `DESKTOP-INT-002`; totals were 8 Workers tests and 6 browser integration executions, zero browser retries, zero serious/critical axe violations, successful Next.js/OpenNext/Wrangler builds, zero production dependency vulnerabilities and a successful native Windows Tauri Cargo check.
+- Evidence artifacts or commit: Playwright failure traces and screenshots are emitted under ignored `test-results/`; the passing run finished with `Local verification passed.`
+- Limitations / user-approved deferrals: browser-mode desktop tests prove the platform-specific web chrome, spacing and drag/caption markup. Actual native caption command execution will be automated with WebdriverIO's embedded Tauri driver in R03/P01; those tasks cannot complete on browser-mode evidence alone.
+- Follow-ups and unblock conditions: every future implementation record must cite scenario IDs and a passing local gate. Provider sandboxes and store/platform certification remain additional release evidence after deterministic local contract coverage passes.
+
 ### Record template
 
 - Task / owner:
@@ -125,6 +138,6 @@ No stages completed. Add a dated review after each exit gate with linked task ev
 
 ## Handoff
 
-Foundation state: F01 and F02 are complete with a verified web, Worker and Windows Tauri skeleton, local Workers tests, CI definition and pinned reuse inventory.
+Foundation state: F01, F02 and F02a are complete with a verified web, Worker and Windows Tauri skeleton, mandatory local integration gate, CI definition and pinned reuse inventory.
 Ready to start: D01, D02, D06, D07, and D08. D04 and F03 become ready after D01. Run ready tasks according to actual dependencies; do not treat this list as a stale override.
 Desktop decision: **Tauri v2**, as explicitly requested by the user. Next.js is the web UI and server layer, not a replacement for the native desktop shell.

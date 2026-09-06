@@ -11,7 +11,7 @@ Accepted decisions from the conversation and HLD take precedence over older PRD 
 
 Never copy entire reference repositories into Lepidy. Reference repositories remain unchanged. Copy or adapt bounded modules with their regression tests, record their source revision and target paths in task evidence, and remove unrelated integrations. A reference spec describes intended behavior; inspect the implementation and tests before assuming it shipped.
 
-A task is complete only when its acceptance criteria pass in the integrated Lepidy checkout. A mock, stub, or isolated prototype cannot complete a production task. Partial work remains in_progress; a failed check is not waived by documenting it.
+A task is complete only when its acceptance criteria pass in the integrated Lepidy checkout. Every implemented behavior requires automated local integration coverage under [TESTING.md](TESTING.md); unit tests and manual inspection alone do not complete it. A mock, stub, or isolated prototype cannot complete a production task. Partial work remains in_progress; a failed check is not waived by documenting it.
 
 ## 2. Delivery sequence
 
@@ -86,7 +86,7 @@ Excluded imports: Slip-OS, company domain lock, Supabase, Neon/Postgres connecti
 
 ## 6. Acceptance and validation
 
-For every ledger task: implement the stated output, run relevant tests, integrate, record actual commands/results and evidence, then check completion. UI tasks require browser verification against mockups, including loading/error/empty states, narrow viewport, keyboard navigation and dark mode where applicable.
+For every ledger task: implement the stated output, add or update automated integration scenarios, run `npm run verify:local`, integrate, record scenario IDs plus actual commands/results and evidence, then check completion. UI tasks require automated browser verification against mockups, including loading/error/empty states, narrow viewport, keyboard navigation and dark mode where applicable. Manual visual review supplements these checks.
 
 CI baseline: type/lint/build checks, pure-rule case tables, real SQLite DO tests, migration fixtures, and focused Rust tests as their code lands. Do not quarantine isolation/leak failures to obtain a green build. Native and provider-dependent checks can run in dedicated release jobs, but are still mandatory before their supported lane ships.
 

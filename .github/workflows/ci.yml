@@ -25,6 +25,8 @@ jobs:
       - run: npm run build
       - run: npm run cf:build
       - run: npx wrangler deploy --dry-run --outdir .wrangler/dist
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser
 
   desktop:
     strategy:
