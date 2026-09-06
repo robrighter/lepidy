@@ -1,13 +1,15 @@
+// The workspace Durable Object, hosted as its own local worker.
+//
+// `getPlatformProxy` (which is what gives `next dev` its bindings) cannot run a
+// Durable Object itself; the documented arrangement is to define the object in a
+// separate Worker and reference it by `script_name`. This is that Worker, and it
+// exists for local development and the browser suite only.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "lepidy",
-  "main": "custom-worker.ts",
+  "name": "lepidy-workspace-dev",
+  "main": "dev-worker.ts",
   "compatibility_date": "2026-09-05",
   "compatibility_flags": ["nodejs_compat"],
-  "assets": {
-    "binding": "ASSETS",
-    "directory": ".open-next/assets"
-  },
   "durable_objects": {
     "bindings": [
       {
@@ -34,39 +36,15 @@
       "migrations_dir": "migrations/control"
     }
   ],
-  "kv_namespaces": [
-    {
-      "binding": "RATE_LIMITS",
-      "id": "00000000000000000000000000000000"
-    }
-  ],
-  "r2_buckets": [
-    {
-      "binding": "FILES",
-      "bucket_name": "lepidy-files"
-    }
-  ],
   "queues": {
     "producers": [
       {
         "binding": "EVENTS",
         "queue": "lepidy-events"
       }
-    ],
-    "consumers": [
-      {
-        "queue": "lepidy-events",
-        "max_batch_size": 10,
-        "max_batch_timeout": 5,
-        "max_retries": 3
-      }
     ]
   },
   "vars": {
     "ENVIRONMENT": "development"
-  },
-  "observability": {
-    "enabled": true,
-    "head_sampling_rate": 1
   }
 }

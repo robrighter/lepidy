@@ -7,6 +7,10 @@
   "durable_objects": {
     "bindings": [
       {
+        "name": "ACCOUNTS",
+        "class_name": "Accounts"
+      },
+      {
         "name": "WORKSPACE",
         "class_name": "Workspace"
       },
@@ -19,7 +23,7 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["Workspace", "MigrationFixture"]
+      "new_sqlite_classes": ["Accounts", "Workspace", "MigrationFixture"]
     }
   ],
   "queues": {

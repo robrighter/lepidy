@@ -1,3 +1,4 @@
+import Link from "next/link";
 import type { ReactNode } from "react";
 
 import { ShellFrame } from "@/components/shell/shell-frame";
@@ -13,7 +14,9 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
           <section className="panel empty-state">
             <h2>Sign in to Lepidy</h2>
             <p>This workspace needs a signed-in session before it can show you anything.</p>
-            <span className="next-step">The sign-in route lands with C07; F04 already holds the accounts behind it.</span>
+            <Link className="primary-link" href="/signin">
+              Go to sign in
+            </Link>
           </section>
         </div>
       </main>

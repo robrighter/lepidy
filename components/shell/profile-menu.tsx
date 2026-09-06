@@ -4,6 +4,7 @@ import { LogOut, Settings, UserRound } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
+import { signOut } from "@/app/(auth)/actions";
 import type { ShellViewer } from "@/src/cloudflare/workspace";
 import { Avatar } from "./avatar";
 
@@ -55,10 +56,12 @@ export function ProfileMenu({ viewer, plan }: { viewer: ShellViewer; plan: strin
             <Settings size={16} aria-hidden="true" />
             Preferences
           </Link>
-          <button role="menuitem" type="button" disabled title="Sign out arrives with C07">
-            <LogOut size={16} aria-hidden="true" />
-            Sign out
-          </button>
+          <form action={signOut}>
+            <button role="menuitem" type="submit">
+              <LogOut size={16} aria-hidden="true" />
+              Sign out
+            </button>
+          </form>
         </div>
       ) : null}
     </div>

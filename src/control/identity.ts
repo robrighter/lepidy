@@ -7,6 +7,16 @@ export { hashOpaqueToken, randomToken } from "./opaque-tokens";
 const encoder = new TextEncoder();
 let argon2idPromise: Promise<computeHash> | undefined;
 
+/**
+ * Argon2id ships WebAssembly whose imports are supplied at instantiation, and
+ * the Workers runtime refuses `WebAssembly.compile` at request time, so the
+ * modules must arrive as static imports resolved by the bundler.
+ *
+ * That is why this file is reached only from the Worker and Durable Object
+ * bundle. A Next.js server component that imports it drags the wasm into a
+ * bundler that cannot compile it — see `src/cloudflare/accounts.ts`, which is
+ * the object password work runs inside.
+ */
 function loadArgon2id(): Promise<computeHash> {
   argon2idPromise ??= setupArgon2id(
     async (imports) => ({

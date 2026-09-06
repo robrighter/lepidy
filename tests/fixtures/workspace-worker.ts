@@ -1,3 +1,4 @@
+export { Accounts } from "../../src/cloudflare/accounts";
 export { Workspace } from "../../src/cloudflare/workspace";
 export { MigrationFixture } from "./migration-fixture";
 

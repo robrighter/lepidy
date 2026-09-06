@@ -2,6 +2,7 @@
 // @ts-expect-error -- the adapter creates this module before bundling the Worker.
 import openNextWorker from "./.open-next/worker.js";
 
+export { Accounts } from "./src/cloudflare/accounts";
 export { Workspace } from "./src/cloudflare/workspace";
 
 export default {

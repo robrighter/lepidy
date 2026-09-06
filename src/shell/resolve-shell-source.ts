@@ -7,6 +7,7 @@ export const SESSION_COOKIE = "lepidy_session";
 export type ShellEnvironment = {
   CONTROL_DB?: D1Database;
   WORKSPACE?: CloudflareEnv["WORKSPACE"];
+  ACCOUNTS?: CloudflareEnv["ACCOUNTS"];
   ENVIRONMENT?: string;
 };
 
