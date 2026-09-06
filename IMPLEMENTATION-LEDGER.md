@@ -29,7 +29,7 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [ ] | D07 | Retention/residency/recovery contract | — | V4 | Specify retention by data class, export/delete/restore, EU scope, audit anchors and archive-search design. | todo | — | — | — | — |
 | [ ] | D08 | Product and commerce decisions | — | S4,S5,S7 | Resolve remaining product boundaries listed in plan §3, including proration, companion composer, file extraction and store purchase behavior. | todo | — | — | — | — |
 | [x] | F01 | Next.js/OpenNext and Tauri workspace skeleton | — | S1,S7 | Next.js builds locally and for Workers; establish Tauri v2 Rust workspace and CLI layout, typed environment bindings, dev configuration and no legacy infrastructure. | done | /root | 2026-09-05 | 2026-09-05 | [F01](#f01--nextjsopennext-and-tauri-workspace-skeleton) |
-| [ ] | F02 | CI and reusable-code inventory | F01 | S1–S7,V1–V4 | Record reference revisions/license notices and source-to-target map; CI builds and executes pure-rule and SQLite DO fixtures. | in_progress | /root | 2026-09-05 | — | — |
+| [x] | F02 | CI and reusable-code inventory | F01 | S1–S7,V1–V4 | Record reference revisions/license notices and source-to-target map; CI builds and executes pure-rule and SQLite DO fixtures. | done | /root | 2026-09-05 | 2026-09-05 | [F02](#f02--ci-and-reusable-code-inventory) |
 | [ ] | F03 | Workspace storage and migrations | F01,D01 | S2 | Create D1 control plane and per-workspace SQLite schema; singleton migration version, atomic progression, quarantine and historical-fixture tests. | todo | — | — | — | — |
 | [ ] | F04 | Identity and workspace onboarding | F03,D01 | S1,S2 | Implement verified accounts, password/passkey/Google/email-link methods, safe linking, workspace create/invite, roles and last-admin protection. | todo | — | — | — | — |
 | [ ] | F05 | Session/device authorization | F04,D04 | S3,V2 | Revocable browser/device credentials, request signing/replay protection, authoritative membership checks and socket revocation; separate runner lifecycle. | todo | — | — | — | — |
@@ -91,9 +91,21 @@ Append one record per completed task; use the matching task ID as its heading. F
 - Changed files: `package.json`, `package-lock.json`, `next.config.ts`, `open-next.config.ts`, `tsconfig.json`, `wrangler.jsonc`, `wrangler.next-dev.jsonc`, `worker-configuration.d.ts`, `custom-worker.ts`, `app/*`, `components/desktop-titlebar.tsx`, `src/cloudflare/workspace.ts`, `public/mark.svg`, `desktop-shell/*`, `src-tauri/*`, `.gitignore`, `README.md`, `PRD.md`.
 - Reused code: `../slip-robotics-chat` commit `07508524d1b8aabc4dc12f2adb02f34779837505`, `desktop-tauri/src-tauri/src/lib.rs`, `desktop-tauri/src-tauri/capabilities/default.json`, `src/components/desktop-titlebar.tsx` → Lepidy Tauri window builder, narrow capabilities and branded React titlebar; adapted to Lepidy tokens and removed unrelated updater/menu/notification privileges. `../agent-vault` commit `d794820084151eddbdbb56bf9cd10b5bf3666cdc` was inspected for its Tauri v2 workspace conventions; no source was transplanted in F01.
 - Verification: `npm run typecheck` passed; `npm run build` passed; `npm run cf:build` passed and generated `.open-next/worker.js`; `npx wrangler deploy --dry-run --outdir .wrangler/dist` bundled the Worker with Workspace DO, D1, KV, R2, Queue and Assets bindings; `npm audit --omit=dev` found zero vulnerabilities; `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` passed; native Windows `cargo check --manifest-path src-tauri/Cargo.toml` passed with `CARGO_INCREMENTAL=0`. Browser inspection at desktop/narrow width confirmed the responsive shell, readable content, landmark structure and controls.
-- Evidence artifacts or commit: local build artifacts under ignored `.next/`, `.open-next/`, `.wrangler/` and `src-tauri/target/`; workspace was not a Git repository when implementation began, so no target commit exists yet.
+- Evidence artifacts or commit: foundation commit `dff0d66`; local build artifacts under ignored `.next/`, `.open-next/`, `.wrangler/` and `src-tauri/target/`.
 - Limitations / user-approved deferrals: Cloudflare resource IDs remain local placeholders until environment provisioning. The release Tauri build intentionally loads a bundled connection screen; an authenticated, origin-locked production bridge is deferred to R03/P01. macOS code follows the verified Slipchat overlay pattern but could not be compiled on this Windows host.
-- Follow-ups and unblock conditions: F02 can add CI and the detailed source inventory. D01 is required before F03 implements the full workspace schema and production tenant mapping. R03 will add trusted native runner behavior without granting remote workspace content unrestricted IPC.
+- Follow-ups and unblock conditions: D01 is required before F03 implements the full workspace schema and production tenant mapping. R03 will add trusted native runner behavior without granting remote workspace content unrestricted IPC.
+
+### F02 — CI and reusable-code inventory
+
+- Task / owner: F02 / `/root`
+- Status / dates: done / 2026-09-05 to 2026-09-05
+- Decision or implementation delivered: GitHub Actions jobs for web/Worker verification and Windows/macOS Tauri checks; Cloudflare's current Vitest 4 plugin with isolated Workers runtime storage; one pure idempotency-key rule fixture; one direct-RPC SQLite Durable Object fixture; pinned, path-level source-to-target inventory and proprietary-license status for both internal reference apps.
+- Changed files: `.github/workflows/ci.yml`, `docs/reference-reuse-inventory.md`, `vitest.config.mts`, `wrangler.test.jsonc`, `tests/*`, `src/domain/idempotency-key.ts`, `src/domain/idempotency-key.test.ts`, `package.json`, `package-lock.json`, `tsconfig.json`, `.gitignore`.
+- Reused code: inventory pins `../slip-robotics-chat` at `07508524d1b8aabc4dc12f2adb02f34779837505` and `../agent-vault` at `d794820084151eddbdbb56bf9cd10b5bf3666cdc`. No additional reference implementation was copied in F02; the inventory records the planned adaptation boundary for S1–S7 and V1–V4.
+- Verification: clean `npm@11.6.2 ci` passed; `npm run cf:typegen` passed; `npm test` passed 2 files/8 tests, including a local workerd SQLite DO; `npm run typecheck`, `npm run build`, `npm run cf:build`, Wrangler deployment dry run and production dependency audit all passed; native Windows Cargo format/check passed; the CI YAML parsed with jobs `web-and-worker` and `desktop`.
+- Evidence artifacts or commit: foundation commit `dff0d66` includes the workflow, inventory and fixtures; the final ledger status is recorded in the following ledger commit.
+- Limitations / user-approved deferrals: the local repository has no GitHub remote, so the authored CI workflow cannot receive a hosted run until a remote is connected and pushed. macOS compilation is represented in the CI matrix and awaits that first hosted run.
+- Follow-ups and unblock conditions: connect the repository remote to obtain the first hosted Windows/macOS CI evidence. Add adapted-source entries to each later ledger record rather than treating the inventory as blanket approval to copy code.
 
 ### Record template
 
@@ -113,6 +125,6 @@ No stages completed. Add a dated review after each exit gate with linked task ev
 
 ## Handoff
 
-Foundation state: F01 is complete with a verified web, Worker and Windows Tauri skeleton.
-Ready to start: D01, D02, D06, D07, D08, and F02. D04 and F03 become ready after D01. Run ready tasks according to actual dependencies; do not treat this list as a stale override.
+Foundation state: F01 and F02 are complete with a verified web, Worker and Windows Tauri skeleton, local Workers tests, CI definition and pinned reuse inventory.
+Ready to start: D01, D02, D06, D07, and D08. D04 and F03 become ready after D01. Run ready tasks according to actual dependencies; do not treat this list as a stale override.
 Desktop decision: **Tauri v2**, as explicitly requested by the user. Next.js is the web UI and server layer, not a replacement for the native desktop shell.
