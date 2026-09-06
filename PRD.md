@@ -747,13 +747,15 @@ Ported from `slip-robotics-chat`, a working Slack replacement in daily use by ~1
 | | |
 |---|---|
 | **Rooms** | Public and private channels · DMs and group DMs · browse and join · archive · topic and description · pinned messages · channel bookmarks · sidebar sections with custom ordering and per-section sort |
-| **Messages** | Threads · reactions and custom emoji · edit and delete with an edit marker · quote and forward · permalinks · saved items · drafts synced across devices · scheduled send · per-channel webhooks |
+| **Messages** | Threads · reactions and custom emoji · edit and delete with an edit marker · quote and forward · permalinks · saved items · drafts synced across devices · scheduled send |
 | **Composition** | Markdown · code blocks with syntax highlighting · snippets · file and image upload · paste-to-upload · link unfurls · `@` autocomplete across the three principal types · slash commands |
 | **Finding things** | Full-text search with operators · saved searches · files view · per-channel file list |
 | **Awareness** | Presence · typing indicators · read state and unread badges · a ranked Home feed · Inbox (mentions, threads, DMs, approvals) |
 | **People** | Directory with profiles and hovercards · local time and working hours · status and custom status · user groups (`@g.`) · invitations · roles |
 | **Work queues** | Form-entry rooms · reaction-ranked feeds · owner-defined item statuses (§9.8) |
 | **Admin** | Users and roles · workspace settings · audit log · offboarding view |
+
+One ported capability is deliberately out of v1. **Incoming webhook posting into a channel** is deferred by explicit decision, because an inbound endpoint that can write into a room is a standing attack surface and a secret-rotation burden that nothing else in the product depends on. It may return later as its own scoped piece of work. This does not touch the provider webhooks the product does rely on — billing, and the Anthropic agent lifecycle.
 
 The one substantive change to the ported behaviour: **realtime stops being a polling workaround.** The reference app relays SSE through short-poll queries against Postgres because Vercel's serverless runtime gave it no other option, and it says so in the code. Durable Objects with WebSocket Hibernation are what this was always meant to be. Typing, presence, read state and delivery all move onto it, and a good deal of polling machinery gets deleted rather than ported.
 

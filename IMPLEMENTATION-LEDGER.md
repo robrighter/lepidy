@@ -56,10 +56,10 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [ ] | R03 | Tauri v2 native runner integration | R01,C01 | S7,V2 | Reuse reference Tauri patterns for tray, native local approval, runner lifecycle and stop control; narrow IPC/capabilities and trusted-origin boundary. | todo | — | — | — | — |
 | [ ] | R04 | Harness and OS matrix | R02,R03 | V2,V3 | Test Claude Code/Codex/custom binary presets and injection/process cleanup on Windows/macOS/Linux; include WSL path/process decisions and version compatibility. | todo | — | — | — | — |
 | [ ] | G01 | First end-to-end product gate | R02,V04,C04 | V3,S3 | Demonstrate two-device mention→session→approval→injection→thread reply→reuse→stop with synthetic secrets; failure and leak evidence. | todo | — | — | — | — |
-| [ ] | C05 | Daily-use message features | C04,F06,F04a | S1,S5 | Pins/bookmarks, saved items, forwarding/quotes, synced drafts, scheduled sends, snippets, slash commands, custom emoji and webhook posting. Parent remains incomplete until C05a–C05c pass. | in_progress | /root | 2026-09-06 | — | — |
+| [ ] | C05 | Daily-use message features | C04,F06,F04a | S1,S5 | Pins/bookmarks, saved items, forwarding/quotes, synced drafts, scheduled sends, snippets, slash commands and custom emoji. Incoming webhook posting is deferred; see deferrals. Parent remains incomplete until C05a–C05c pass. | in_progress | /root | 2026-09-06 | — | — |
 | [x] | C05a | Message actions and saved content | C04,F06,F04a | S1,S5 | Authenticated edit/delete, replies/reactions, pins, personal saved items, forward/quote, history pagination and scroll preservation; recheck visibility on every saved/forwarded read and write, preserve Solo content authority. | done | /root | 2026-09-06 | 2026-09-06 | [C05a](#c05a--message-actions-and-saved-content) |
 | [x] | C05b | Synced drafts and scheduled messages | C05a,F06 | S1,S5 | Member/room/thread draft synchronization with conflict protection; scheduled send/edit/cancel and due-time authorization, restart and duplicate-alarm safety; preserve Solo content authority. | done | /root | 2026-09-06 | 2026-09-06 | [C05b](#c05b--synced-drafts-and-scheduled-messages) |
-| [ ] | C05c | Message productivity and integrations | C05b | S1,S5 | Snippets, slash commands, custom emoji and revocable channel-scoped incoming webhook posting with authenticated administration and paired transport deny cases. | todo | — | — | — | — |
+| [ ] | C05c | Message productivity | C05b | S1,S5 | Snippets, slash commands and custom emoji with authenticated administration and paired deny cases. Incoming webhook posting is deferred by the user; see deferrals. | todo | — | — | — | — |
 | [ ] | C06 | Notifications, Home and Inbox | C03,V03,D08,F04a | S5 | Human/agent tiers, per-room modes, keywords, thread subscriptions, DND, broadcast gate, ranked Home and actionable Inbox; private-item filters. | todo | — | — | — | — |
 | [ ] | C07 | People, groups and administration | F04,F04a,A01,D08 | S2,S5 | Directory/status/timezone/working hours, groups, profile/hovercards, invitations, role controls, offboarding and ownership transfer. | todo | — | — | — | — |
 | [ ] | C08 | Files, uploads and previews | C02,D07,D08 | S1,S5 | R2 metadata/quotas, authorized signed transfers, upload verification/cleanup, image paste, file lists, downloads and bounded safe unfurls. | todo | — | — | — | — |
@@ -86,6 +86,19 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [ ] | G03 | Load, cost and resilience gate | O02,O03,R05,C11 | — | 50 humans/500 sockets plus agent-heavy/idle/import cases; measure p95, writes and costs; inject outages, lost replies, duplicates and approval races. | todo | — | — | — | — |
 | [ ] | G04 | Cross-platform acceptance gate | P04,B03,R05 | S7,V2 | Browser/Tauri/CLI/companion acceptance matrix, accessibility/dark mode, signatures/install/update, onboarding and platform limitations verified. | todo | — | — | — | — |
 | [ ] | G05 | Release documentation and final decision | G01,G02,G03,G04,O03 | — | Reconcile PRD/HLD/mockups, publish-ready docs/marketing and support runbooks, enumerate accepted deferrals and external reviews; release only with required authorization. | todo | — | — | — | — |
+
+## Accepted deferrals
+
+Scope the user has explicitly removed. These are not oversights and not blocked
+work: they are decisions, recorded here so a later agent restores them only on a
+new instruction, and so G05 can enumerate them at release.
+
+| Deferred | Decided | Instructed by | Scope removed | What it does not affect |
+|---|---|---|---|---|
+| Incoming webhook posting into a channel | 2026-09-06 | User | The per-channel, revocable, channel-scoped endpoint that would let an external system post a message into a room, together with its administration UI and its secret rotation. Removed from C05 and C05c. | Nothing else. **The other webhook surfaces in this product are unrelated and remain in scope**: B02's billing provider webhooks, A05/D06's Anthropic agent-lifecycle webhook and the `custom` runtime's callback, and the inbound-webhook crossing path in the G02 tenant-isolation gate. A future agent must not read this deferral as cancelling any of those. |
+
+Reinstating a deferred item requires a new instruction from the user and a new
+ledger row; it is not implied by any adjacent task.
 
 ## Evidence records
 
