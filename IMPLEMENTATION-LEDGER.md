@@ -27,7 +27,7 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [x] | D05 | Vault sharing and release contract | D04,D05a | V4 | Resolve device-mediated delivery, browser trust, per-owner wraps, removal/rekey and lost-device behavior while preserving user-held root custody. | done | /root | 2026-09-06 | 2026-09-06 | [D05](#d05--vault-sharing-and-release-contract) |
 | [x] | D05a | Local execution and vault-root invariants | D01,D08a | V1,V2,V4 | Specify and reconcile local-only runner configuration plus client-generated vault unlock/recovery material that never reaches Lepidy; add schema/protocol negative tests. | done | /root | 2026-09-06 | 2026-09-06 | [D05a](#d05a--local-execution-and-vault-root-invariants) |
 | [ ] | D06 | Cloud and custom contract spike | F01 | S3 | Verify provider auth, APIs, signed callbacks, schedule budgets and reconciliation; custom replay/SSRF boundaries; record supported capabilities. | todo | — | — | — | — |
-| [ ] | D07 | Retention/residency/recovery contract | — | V4 | Specify retention by data class, export/delete/restore, EU scope, audit anchors and archive-search design. | todo | — | — | — | — |
+| [x] | D07 | Retention/residency/recovery contract | — | V4 | Specify retention by data class, export/delete/restore, EU scope across DO/R2/control plane, audit anchors and archive-search design. | done | /root | 2026-09-06 | 2026-09-06 | [D07](#d07--retention-residency-and-recovery-contract) |
 | [ ] | D08 | Product and commerce decisions | — | S4,S5,S7 | Resolve remaining product boundaries listed in plan §3, including proration, companion composer, file extraction and store purchase behavior. | todo | — | — | — | — |
 | [x] | D08a | Free workspace storage boundary | D01,F03 | V2,V4,S2 | Specify cloud channel metadata versus host-owned content, encrypted relay, offline behavior, one-host fencing, recovery and cloud upgrade; reconcile specs and tests. | done | /root | 2026-09-06 | 2026-09-06 | [D08a](#d08a--free-workspace-storage-boundary) |
 | [x] | F01 | Next.js/OpenNext and Tauri workspace skeleton | — | S1,S7 | Next.js builds locally and for Workers; establish Tauri v2 Rust workspace and CLI layout, typed environment bindings, dev configuration and no legacy infrastructure. | done | /root | 2026-09-05 | 2026-09-05 | [F01](#f01--nextjsopennext-and-tauri-workspace-skeleton) |
@@ -84,6 +84,16 @@ Source keys S1–S7 and V1–V4 resolve in plan §4. Acceptance criteria are cum
 | [ ] | G05 | Release documentation and final decision | G01,G02,G03,G04,O03 | — | Reconcile PRD/HLD/mockups, publish-ready docs/marketing and support runbooks, enumerate accepted deferrals and external reviews; release only with required authorization. | todo | — | — | — | — |
 
 ## Evidence records
+
+### D07 — Retention, residency and recovery contract
+
+- Task / owner: D07 / `/root`
+- Status / dates: done / 2026-09-06 to 2026-09-06
+- Decision delivered: concrete retention periods for workspace content, realtime replay, idempotency, authorization challenges, outbox rows, approvals, audit metadata, revoked authority, logs and cost metrics; immediate logical deletion plus bounded object/backup cleanup; resumable encrypted export; seven-day cancellable deletion and explicit irreversible purge; replacement-authority restore that cannot revive sessions, devices, runner leases, delegations, grants, approvals or external actions; immutable default/EU residency profiles across DO, D1 and R2 with no location-hint shortcut; hash-chained audit anchors and visibility-filtered R2 archive search.
+- Changed files: `docs/retention-residency-recovery-contract.md`, `PRD.md`, `HLD.md`, `IMPLEMENTATION-PLAN.md` and `IMPLEMENTATION-LEDGER.md`.
+- Platform evidence: current Cloudflare primary documentation was checked for EU jurisdiction restrictions on SQLite Durable Objects, D1 and R2, the distinction between jurisdiction and best-effort location hints, and the 30-day Durable Object PITR window. The contract keeps Regional Services, log/metadata boundaries and subprocessors inside a separate certification gate before any complete EU-processing claim.
+- Verification: `npm run verify:local` passed with 48 Worker/D1/SQLite/crypto tests, 3 native Windows file-backed SQLite integration tests, 12 desktop/mobile browser tests, TypeScript, production Next.js/OpenNext/Wrangler builds and zero production dependency vulnerabilities.
+- Exercised boundaries and follow-ups: this is a normative decision task; no purge, export or restore runtime behavior is claimed. F06 implements expiry scheduling, transactional outbox and audit foundations. C08/C09 implement file/archive access and search. O01 implements resumable export, purge and authority-safe restore. O03 implements quarantine and jurisdiction checks. Ten mandatory controlled-clock, interruption, leak and restore scenarios are recorded in the contract.
 
 ### D02 — Runner and queue contract
 

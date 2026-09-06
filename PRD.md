@@ -677,7 +677,7 @@ Plus the ergonomics that decide adoption:
 
 ### 8.9 Audit
 
-Append-only, hash-chained (`prev_hash` per entry), in D1 with an R2 archive for anything older than the retention window. **Values are never logged, anywhere, at any level.**
+Append-only and hash-chained (`prev_hash` per entry), with metadata retained for 365 days and older hot rows moved into verified R2 archive segments in the workspace's residency profile. **Values are never logged, anywhere, at any level.** Export, purge, restore and archive verification follow the [retention, residency and recovery contract](./docs/retention-residency-recovery-contract.md).
 
 ```json
 {"ts":"2026-09-05T14:02:11Z","event":"access","credential":"GITHUB_TOKEN",
