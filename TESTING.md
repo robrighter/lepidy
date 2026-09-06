@@ -25,8 +25,8 @@ The command stops at the first failure and verifies, in order:
 2. Worker-runtime integration tests with isolated local storage;
 3. application and test type contracts;
 4. the Next.js production build;
-5. the OpenNext Worker bundle and Wrangler deployment dry run;
-6. browser integration tests at desktop and mobile sizes;
+5. the OpenNext Worker bundle, then the Wrangler deployment dry run;
+6. browser integration tests at desktop and mobile sizes, driven against the built Worker;
 7. the production dependency audit;
 8. formatting, compilation and file-backed SQLite integration tests on the native Tauri target.
 
@@ -49,7 +49,7 @@ An integration test crosses the real boundary where a defect could occur:
 | Billing/store behavior | Replay signed local fixtures through the real webhook handler and durable entitlement store. Never call a live purchase endpoint in the normal local gate. |
 | Load/recovery | Run seeded multi-tenant scenarios locally with deterministic fault injection, process restart/DO eviction and measured writes, duration and latency. |
 
-Cloudflare's test runtime supplies storage isolation and direct Durable Object access. Playwright starts the local web server from its configuration. Tauri's current recommended end-to-end route is WebdriverIO with its Tauri service; it supports an embedded driver on Windows, Linux and macOS.
+Cloudflare's test runtime supplies storage isolation and direct Durable Object access. Playwright starts the built Worker under `wrangler dev`, not `next dev`: the Next.js binding proxy cannot host a Durable Object, and a cross-worker object reached over the dev registry stops answering after the first call. Driving the real Worker also means the browser suite exercises the runtime the product ships on. Tauri's current recommended end-to-end route is WebdriverIO with its Tauri service; it supports an embedded driver on Windows, Linux and macOS.
 
 ## Required scenario families
 
@@ -133,6 +133,9 @@ Manual review and screenshots can supplement visual judgment, store review and h
 | `MD-RULE-001–013` | `src/domain/markdown.test.ts` | Fenced code with a language, everything inside a fence kept literal, block grouping, code spans winning over every inline rule, link-scheme safety, a tree that is never markup, mention classification by prefix, the email-domain case, and reaction shapes. |
 | `MSG-INT-001–007` | `tests/messages.test.ts` | Mention recording and resolution with unknown handles kept unresolved and code-fenced ones ignored, author-only edits with a re-derived address list and a visible marker, the Solo refusal to edit content, a delete that removes the body, mentions and reactions while keeping the tombstone and thread, admin deletion attributed to the admin, and idempotent reactions refused from outside the room or of the wrong shape. |
 | `MSG-INT-008/009` | `tests/browser/shell.spec.ts` | Markdown rendered as elements with a language-tagged code block and a classified mention, and the composer's three regressions: focus retained after a send attempt, a per-room draft that survives leaving and returning, and Enter sending while Shift+Enter adds a line. |
+| `ACCOUNT-INT-001–003` | `tests/accounts.test.ts` | The control-plane account object against real local D1: sign-up provisions a workspace with a starter room, an unknown address and a wrong password answer identically, addresses normalise, and a duplicate address is refused. |
+| `AUTH-INT-001` | `tests/browser/account.spec.ts` | Sign-up into a real workspace and a message posted through the composer's authenticated path, persisting across a reload, driven against the built Worker with real D1 and real Durable Objects. |
+| `AUTH-INT-002/003` | `tests/browser/account.spec.ts` | **Not passing.** Both are `test.fixme` and each names the defect it found; see the F04a ledger record. They are kept in the suite rather than deleted so the findings stay visible. |
 | `MOCKUP-SEC-001/002/003` | `tests/browser/mockup-contracts.spec.ts` | Rendered Solo storage, local-only runner configuration and user-held vault recovery disclosures. |
 | Supporting rule cases | `src/domain/idempotency-key.test.ts` | Bounded transport-safe idempotency keys; a command integration test must consume this rule when mutation handling lands. |
 

@@ -3,22 +3,6 @@
   "name": "lepidy-next-dev",
   "compatibility_date": "2026-09-05",
   "compatibility_flags": ["nodejs_compat"],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "ACCOUNTS",
-        "class_name": "Accounts",
-        "script_name": "lepidy-workspace-dev"
-      },
-      {
-        "name": "WORKSPACE",
-        "class_name": "Workspace",
-        // Hosted by wrangler.do-dev.jsonc: the dev proxy cannot run an object
-        // itself, so it reaches this one through the local dev registry.
-        "script_name": "lepidy-workspace-dev"
-      }
-    ]
-  },
   "d1_databases": [
     {
       "binding": "CONTROL_DB",

@@ -23,9 +23,10 @@ function npm(label, args) {
 npm("Generate Cloudflare binding types", ["run", "cf:typegen"]);
 npm("Workers integration tests", ["run", "test:workers"]);
 npm("TypeScript contracts", ["run", "typecheck"]);
-npm("Browser integration tests", ["run", "test:browser"]);
 npm("Next.js production build", ["run", "build"]);
 npm("OpenNext Worker build", ["run", "cf:build"]);
+// The browser suite drives the built Worker, so it runs after the bundle exists.
+npm("Browser integration tests", ["run", "test:browser"]);
 npm("Wrangler deployment bundle", ["run", "cf:dry-run"]);
 npm("Production dependency audit", ["audit", "--omit=dev"]);
 

@@ -7,7 +7,7 @@ export default defineConfig({
   retries: 0,
   reporter: [["list"], ["html", { open: "never", outputFolder: "playwright-report" }]],
   use: {
-    baseURL: "http://127.0.0.1:3000",
+    baseURL: "http://127.0.0.1:3100",
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
   },
@@ -24,10 +24,15 @@ export default defineConfig({
   ],
   webServer: [
     {
-      command: "npm run dev -- --hostname 127.0.0.1",
-      url: "http://127.0.0.1:3000",
+      // The built Worker, not `next dev`. The dev binding proxy cannot host a
+      // Durable Object and reaches one in another worker over the dev registry,
+      // where the connection does not survive past the first call. Running the
+      // real Worker gives the suite real D1 and real objects in one process,
+      // and tests the runtime the product actually ships on.
+      command: "npx wrangler dev --port 3100 --local",
+      url: "http://127.0.0.1:3100/signin",
       reuseExistingServer: false,
-      timeout: 120_000,
+      timeout: 180_000,
       stdout: "ignore",
       stderr: "pipe",
     },

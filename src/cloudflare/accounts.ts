@@ -61,7 +61,7 @@ export class Accounts extends DurableObject<CloudflareEnv> {
       displayName: input.displayName,
       password: input.password,
     });
-    const { workspaceId } = await onboarding.createWorkspace({
+    const { workspaceId, memberId } = await onboarding.createWorkspace({
       accountId,
       name: input.workspaceName,
       slug: input.workspaceSlug,
@@ -69,6 +69,26 @@ export class Accounts extends DurableObject<CloudflareEnv> {
       jurisdiction: input.jurisdiction,
       storageMode: input.storageMode,
     });
+
+    // A workspace with nowhere to talk is not a workspace. The starter room is
+    // created through the same authorized path anyone else would use.
+    const row = await this.env.CONTROL_DB.prepare(
+      "SELECT durable_object_id FROM workspaces WHERE id = ?",
+    )
+      .bind(workspaceId)
+      .first<{ durable_object_id: string }>();
+    if (row) {
+      const workspaces = this.env.WORKSPACE as DurableObjectNamespace<Workspace>;
+      await workspaces.get(workspaces.idFromString(row.durable_object_id)).createChannel({
+        actor: { memberId, authorizationEpoch: 1 },
+        idempotencyKey: `workspace:starter:${workspaceId}`.slice(0, 128),
+        kind: "public",
+        slug: "general",
+        name: "General",
+        topic: "Everything that does not have a room of its own yet.",
+        now: Date.now(),
+      });
+    }
     return { accountId, workspaceId };
   }
 }

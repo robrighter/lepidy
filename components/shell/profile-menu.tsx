@@ -56,7 +56,7 @@ export function ProfileMenu({ viewer, plan }: { viewer: ShellViewer; plan: strin
             <Settings size={16} aria-hidden="true" />
             Preferences
           </Link>
-          <form action={signOut}>
+          <form action={signOut} role="none">
             <button role="menuitem" type="submit">
               <LogOut size={16} aria-hidden="true" />
               Sign out
