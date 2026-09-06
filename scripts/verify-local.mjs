@@ -39,6 +39,8 @@ if (process.platform === "linux" && os.release().toLowerCase().includes("microso
     `cargo fmt --manifest-path '${manifest}' -- --check`,
     "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
     `cargo check --manifest-path '${manifest}'`,
+    "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+    `cargo test --manifest-path '${manifest}'`,
   ].join("; ");
   run(
     "Native Windows Tauri compile",
@@ -48,6 +50,10 @@ if (process.platform === "linux" && os.release().toLowerCase().includes("microso
 } else {
   run("Tauri formatting", "cargo", ["fmt", ...cargoArgs, "--", "--check"]);
   run("Native Tauri compile", "cargo", ["check", ...cargoArgs], {
+    ...process.env,
+    CARGO_INCREMENTAL: "0",
+  });
+  run("Native local-store integration tests", "cargo", ["test", ...cargoArgs], {
     ...process.env,
     CARGO_INCREMENTAL: "0",
   });

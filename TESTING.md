@@ -28,7 +28,7 @@ The command stops at the first failure and verifies, in order:
 5. the OpenNext Worker bundle and Wrangler deployment dry run;
 6. browser integration tests at desktop and mobile sizes;
 7. the production dependency audit;
-8. formatting and compilation of the native Tauri target.
+8. formatting, compilation and file-backed SQLite integration tests on the native Tauri target.
 
 On WSL, the final step intentionally uses the host Windows Rust toolchain so the result covers the product's Windows target without requiring Linux GTK/WebKit packages. On macOS, Windows outside WSL, and Linux with Tauri prerequisites, it uses the current host toolchain directly.
 
@@ -113,6 +113,9 @@ Manual review and screenshots can supplement visual judgment, store review and h
 | `VAULT-AUTH-001–005` | `src/domain/vault-authorization.test.ts` | ACL union plus mandatory intersections, complete unattended delegation, independent reveal rights and exact grants. |
 | `SESSION-INT-001` | `tests/authorization.test.ts` | Opaque session/CSRF issuance, individual/global revocation and separation from runner-device lifecycle in real local D1. |
 | `DEVICE-INT-001/002` | `tests/authorization.test.ts` | P-256 signed request/body binding, replay and tamper rejection, device revoke, D1 plus tenant-local membership epochs and member-socket closure. |
+| `LOCAL-CONTENT-001/002`, `SOLO-TRANSFER-001` | `src-tauri/tests/local_store_integration.rs` | File-backed native SQLite commit-before-ack, reopen/read, request replay/conflict, epoch fencing and checksummed host transfer. |
+| `SOLO-RELAY-001–003` | `src/domain/relay-crypto.test.ts`, `tests/workspace.test.ts` | Authenticated opaque content frames, tamper rejection, host lease/offline behavior, directional replay sequences and old-host fencing. |
+| `SOLO-UPGRADE-001` | `tests/workspace.test.ts` | Resumable staged snapshot verification and atomic content import/routing-epoch transition to Team. |
 | `MOCKUP-SEC-001/002/003` | `tests/browser/mockup-contracts.spec.ts` | Rendered Solo storage, local-only runner configuration and user-held vault recovery disclosures. |
 | `SHELL-INT-001` | `tests/browser/shell.spec.ts` | Branded shell semantics, horizontal overflow and desktop/mobile layout. |
 | `SHELL-INT-002` | `tests/browser/shell.spec.ts` | Serious/critical accessibility scan. |

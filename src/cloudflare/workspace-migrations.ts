@@ -202,6 +202,58 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       ) STRICT`,
     ],
   },
+  {
+    version: 5,
+    name: "solo host lease and relay metadata",
+    statements: [
+      `ALTER TABLE workspace_config ADD COLUMN designated_host_device_id TEXT`,
+      `ALTER TABLE workspace_config ADD COLUMN host_lease_expires_at INTEGER`,
+      `ALTER TABLE workspace_config ADD COLUMN relay_sequence_to_host INTEGER NOT NULL DEFAULT 0 CHECK (relay_sequence_to_host >= 0)`,
+      `ALTER TABLE workspace_config ADD COLUMN relay_sequence_from_host INTEGER NOT NULL DEFAULT 0 CHECK (relay_sequence_from_host >= 0)`,
+    ],
+  },
+  {
+    version: 6,
+    name: "resumable solo content upgrade",
+    statements: [
+      `CREATE TABLE attachments (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        file_name TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+        object_key TEXT NOT NULL,
+        sha256 TEXT NOT NULL
+      ) STRICT`,
+      `CREATE TABLE solo_upgrade_imports (
+        import_id TEXT PRIMARY KEY,
+        snapshot_checksum TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        host_epoch INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('staged', 'complete')),
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER
+      ) STRICT`,
+      `CREATE TABLE solo_upgrade_channels (
+        import_id TEXT NOT NULL REFERENCES solo_upgrade_imports(import_id) ON DELETE CASCADE,
+        record_json TEXT NOT NULL CHECK (json_valid(record_json)),
+        record_id TEXT NOT NULL,
+        PRIMARY KEY (import_id, record_id)
+      ) STRICT`,
+      `CREATE TABLE solo_upgrade_messages (
+        import_id TEXT NOT NULL REFERENCES solo_upgrade_imports(import_id) ON DELETE CASCADE,
+        record_json TEXT NOT NULL CHECK (json_valid(record_json)),
+        record_id TEXT NOT NULL,
+        PRIMARY KEY (import_id, record_id)
+      ) STRICT`,
+      `CREATE TABLE solo_upgrade_attachments (
+        import_id TEXT NOT NULL REFERENCES solo_upgrade_imports(import_id) ON DELETE CASCADE,
+        record_json TEXT NOT NULL CHECK (json_valid(record_json)),
+        record_id TEXT NOT NULL,
+        PRIMARY KEY (import_id, record_id)
+      ) STRICT`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

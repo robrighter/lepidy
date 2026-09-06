@@ -1,5 +1,7 @@
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 
+pub mod local_store;
+
 fn desktop_platform() -> &'static str {
     #[cfg(target_os = "macos")]
     return "macos";
