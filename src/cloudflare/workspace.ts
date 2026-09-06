@@ -47,6 +47,7 @@ import {
   parseChannelName,
   parseChannelSlug,
   parseChannelTopic,
+  clampHistoryLimit,
   parseMessageBody,
   parseReactionEmoji,
   resolveThreadPlacement,
@@ -84,8 +85,16 @@ import {
   isChannelMember,
   listChannelHistory,
   listThreadHistory,
+  listPinnedMessages,
+  listSavedPointers,
   listVisibleChannels,
   nextChannelSequence,
+  pinMessage,
+  pinnedMessageIds,
+  saveMessageForMember,
+  savedMessageIds,
+  unpinMessage,
+  unsaveMessageForMember,
   readChannel,
   readChannelByDirectMessageKey,
   readChannelBySlug,
@@ -1633,6 +1642,311 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     };
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Pins, saved items and forwarding (C05a)                             */
+  /* ------------------------------------------------------------------ */
+
+  /** A pin belongs to the room, so pinning requires being in it. */
+  async pinMessage(input: {
+    actor: Actor;
+    messageId: string;
+    now: number;
+  }): Promise<{ pinned: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const { message, channel } = this.requireReactableMessage(input.messageId, actor.id);
+
+    const outcome = await this.commitMutation({ scope: "message.pin", now: input.now }, () => {
+      const pinned = pinMessage(this.ctx.storage, channel.id, message.id, actor.id, input.now);
+      if (!pinned) return { result: { pinned: false } };
+      return {
+        result: { pinned: true },
+        effects: this.messageEffects("message.pinned", message.id, channel, actor, {}),
+      };
+    });
+
+    if (outcome.result.pinned) {
+      this.broadcastChannelEvent(channel, this.latestReplaySequence(), "message.pinned", {
+        messageId: message.id,
+        channelId: channel.id,
+        pinned: true,
+      });
+    }
+    return outcome.result;
+  }
+
+  async unpinMessage(input: {
+    actor: Actor;
+    messageId: string;
+    now: number;
+  }): Promise<{ unpinned: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const { message, channel } = this.requireReactableMessage(input.messageId, actor.id);
+
+    const unpinned = this.ctx.storage.transactionSync(() =>
+      unpinMessage(this.ctx.storage, channel.id, message.id),
+    );
+    if (unpinned) {
+      this.broadcastChannelEvent(channel, this.latestReplaySequence(), "message.pinned", {
+        messageId: message.id,
+        channelId: channel.id,
+        pinned: false,
+      });
+    }
+    return { unpinned };
+  }
+
+  /** The room's pins, for anybody the room is visible to. */
+  listPins(input: { actor: Actor; channelId: string; limit?: number }): { messages: readonly MessageRow[] } {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireVisibleChannel(input.channelId, actor.id);
+    const messages = listPinnedMessages(this.ctx.storage, channel.id, clampHistoryLimit(input.limit));
+    return {
+      messages: this.decorateMessages(messages, actor.id).messages,
+    };
+  }
+
+  /**
+   * Saving is private and requires being able to read the message now. It saves
+   * a pointer, not a copy and not a permission.
+   */
+  async saveMessage(input: {
+    actor: Actor;
+    messageId: string;
+    now: number;
+  }): Promise<{ saved: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const message = readMessage(this.ctx.storage, input.messageId);
+    if (message === null || message.deletedAt !== null) throw new Error("message not found");
+    // Visible, not necessarily joined: you may save something from an open room.
+    this.requireVisibleChannel(message.channelId, actor.id);
+
+    const saved = this.ctx.storage.transactionSync(() =>
+      saveMessageForMember(this.ctx.storage, actor.id, message.id, input.now),
+    );
+    return { saved };
+  }
+
+  async unsaveMessage(input: {
+    actor: Actor;
+    messageId: string;
+  }): Promise<{ removed: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    // Removing a pointer needs no visibility: it is this member's own list, and
+    // refusing would strand a saved item in a room they can no longer see.
+    const removed = this.ctx.storage.transactionSync(() =>
+      unsaveMessageForMember(this.ctx.storage, actor.id, input.messageId),
+    );
+    return { removed };
+  }
+
+  /**
+   * This member's saved messages.
+   *
+   * Every pointer is rechecked against the room as it stands now. A message
+   * saved from a room the member has since left, or that has since been
+   * deleted, is not returned — the saved list is not a way to keep reading
+   * something you can no longer read.
+   */
+  listSavedItems(input: { actor: Actor; limit?: number }): {
+    items: readonly { message: MessageRow; savedAt: number }[];
+    /** Pointers dropped because the member may no longer read them. */
+    unavailable: number;
+  } {
+    const actor = this.authorizeActor(input.actor);
+    const limit = clampHistoryLimit(input.limit);
+    const pointers = listSavedPointers(this.ctx.storage, actor.id, limit);
+
+    const readable: { message: MessageRow; savedAt: number }[] = [];
+    let unavailable = 0;
+    for (const pointer of pointers) {
+      if (pointer.message.deletedAt !== null) {
+        unavailable += 1;
+        continue;
+      }
+      const channel = readChannel(this.ctx.storage, pointer.message.channelId);
+      if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))) {
+        unavailable += 1;
+        continue;
+      }
+      readable.push(pointer);
+    }
+
+    const decorated = this.decorateMessages(
+      readable.map((entry) => entry.message),
+      actor.id,
+    ).messages;
+    return {
+      items: decorated.map((message, index) => ({ message, savedAt: readable[index].savedAt })),
+      unavailable,
+    };
+  }
+
+  /**
+   * Forward a message into another room.
+   *
+   * A forward is a new message carrying a copy, not a window into the room it
+   * came from: the copy is made by somebody who can read the original, and it
+   * is written into a room they may post in. Both are checked here, and the
+   * provenance is resolved for each reader separately when it is displayed.
+   */
+  async forwardMessage(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    messageId: string;
+    targetChannelId: string;
+    comment?: string | null;
+    now: number;
+  }): Promise<SentMessage> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+
+    const source = readMessage(this.ctx.storage, input.messageId);
+    if (source === null || source.deletedAt !== null) throw new Error("message not found");
+    // Readable by this member right now, not merely once.
+    const sourceChannel = this.requireVisibleChannel(source.channelId, actor.id);
+    const target = this.requireChannelParticipant(input.targetChannelId, actor.id);
+    if (target.archivedAt !== null) throw new Error("this room is archived");
+
+    const comment = input.comment ? parseMessageBody(input.comment) : null;
+    if (input.comment && comment === null) throw new Error("message body is empty or too long");
+    const body = parseMessageBody(comment ? `${comment}\n\n${source.bodyMarkdown}` : source.bodyMarkdown);
+    if (body === null) throw new Error("message body is empty or too long");
+
+    const outcome = await this.commitMutation(
+      {
+        scope: "message.forward",
+        idempotencyKey: input.idempotencyKey,
+        requestHash: `${actor.id}|${source.id}|${target.id}`,
+        now: input.now,
+      },
+      () => {
+        const messageId = crypto.randomUUID();
+        const channelSequence = nextChannelSequence(this.ctx.storage, target.id);
+        const mentions = resolveMentionTargets(this.ctx.storage, parseMentions(body));
+        insertMessage(this.ctx.storage, {
+          id: messageId,
+          channelId: target.id,
+          threadRootId: null,
+          authorKind: "member",
+          authorId: actor.id,
+          authorDisplaySnapshot: actor.displayName,
+          bodyMarkdown: body,
+          channelSequence,
+          forwardedFrom: {
+            messageId: source.id,
+            channelId: sourceChannel.id,
+            authorDisplaySnapshot: source.authorDisplaySnapshot,
+          },
+          now: input.now,
+        });
+        replaceMentions(this.ctx.storage, messageId, mentions, input.now);
+
+        return {
+          result: {
+            messageId,
+            channelId: target.id,
+            threadRootId: null,
+            channelSequence,
+            createdAt: input.now,
+            replayed: false,
+          },
+          effects: {
+            audit: {
+              eventType: "message.forwarded",
+              outcome: "allowed" as const,
+              requesterKind: "member" as const,
+              requesterId: actor.id,
+              subjectKind: "message",
+              subjectId: messageId,
+              metadata: {
+                channel_id: target.id,
+                source_channel_id: sourceChannel.id,
+                source_message_id: source.id,
+              },
+            },
+            replay: [
+              {
+                kind: "message.created",
+                audience: [target.id],
+                payload: {
+                  messageId,
+                  channelId: target.id,
+                  threadRootId: null,
+                  channelSequence,
+                  authorId: actor.id,
+                  createdAt: input.now,
+                },
+              },
+            ],
+            outbox: [
+              {
+                id: `message.${messageId}`,
+                kind: "message_created",
+                dedupeKey: `message:${messageId}`,
+                payload: { messageId, channelId: target.id, threadRootId: null },
+              },
+            ],
+          } satisfies MutationEffects,
+        };
+      },
+    );
+
+    if (!outcome.replayed) {
+      this.broadcastChannelEvent(target, this.latestReplaySequence(), "message.created", {
+        messageId: outcome.result.messageId,
+        channelId: target.id,
+        threadRootId: null,
+        channelSequence: outcome.result.channelSequence,
+        authorId: actor.id,
+        createdAt: input.now,
+      });
+    }
+    return { ...outcome.result, replayed: outcome.replayed };
+  }
+
+  /**
+   * Attach per-reader state to a page: reactions, mentions, whether this member
+   * pinned or saved each message, and whether they may see where a forward came
+   * from. Provenance is resolved per reader because the room a copy came from
+   * may be one this reader cannot see.
+   */
+  private decorateMessages(messages: readonly MessageRow[], memberId: string): MessagePage {
+    const annotated = annotateMessages(this.ctx.storage, { messages, nextCursor: null });
+    const saved = savedMessageIds(this.ctx.storage, memberId);
+    const pinsByChannel = new Map<string, Set<string>>();
+
+    const decorated = annotated.messages.map((message) => {
+      if (!pinsByChannel.has(message.channelId)) {
+        pinsByChannel.set(message.channelId, pinnedMessageIds(this.ctx.storage, message.channelId));
+      }
+      let forwardedFrom = message.forwardedFrom;
+      if (forwardedFrom !== null) {
+        const sourceChannel = readChannel(this.ctx.storage, forwardedFrom.channelId);
+        const visible =
+          sourceChannel !== null && canSeeChannel(this.channelVisibility(sourceChannel, memberId));
+        forwardedFrom = {
+          ...forwardedFrom,
+          sourceVisible: visible,
+          // The room's name is withheld from a reader who cannot see the room.
+          sourceChannelLabel:
+            visible && sourceChannel ? (sourceChannel.slug ?? sourceChannel.name ?? sourceChannel.id) : null,
+          channelId: visible ? forwardedFrom.channelId : "",
+        };
+      }
+      return {
+        ...message,
+        forwardedFrom,
+        isSaved: saved.has(message.id),
+        isPinned: pinsByChannel.get(message.channelId)!.has(message.id),
+      };
+    });
+
+    return { messages: decorated, nextCursor: annotated.nextCursor };
+  }
+
   /** Newest-first channel history, refused outright for a room the caller cannot see. */
   readChannelHistory(input: {
     actor: Actor;
@@ -1642,10 +1956,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }): MessagePage {
     const actor = this.authorizeActor(input.actor);
     const channel = this.requireVisibleChannel(input.channelId, actor.id);
-    return annotateMessages(
-      this.ctx.storage,
-      listChannelHistory(this.ctx.storage, channel.id, input.cursor ?? null, input.limit),
-    );
+    const page = listChannelHistory(this.ctx.storage, channel.id, input.cursor ?? null, input.limit);
+    return { ...this.decorateMessages(page.messages, actor.id), nextCursor: page.nextCursor };
   }
 
   readThreadHistory(input: {
@@ -1658,10 +1970,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const root = readMessage(this.ctx.storage, input.threadRootId);
     if (root === null || root.threadRootId !== null) throw new Error("thread not found");
     this.requireVisibleChannel(root.channelId, actor.id);
-    return annotateMessages(
-      this.ctx.storage,
-      listThreadHistory(this.ctx.storage, root.id, input.cursor ?? null, input.limit),
-    );
+    const page = listThreadHistory(this.ctx.storage, root.id, input.cursor ?? null, input.limit);
+    return { ...this.decorateMessages(page.messages, actor.id), nextCursor: page.nextCursor };
   }
 
   browseChannels(input: { actor: Actor; includeArchived?: boolean }): {

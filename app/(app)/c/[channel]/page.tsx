@@ -1,11 +1,23 @@
+import { Pin } from "lucide-react";
+
 import { Composer } from "@/components/shell/composer";
 import { MessageList } from "@/components/shell/message-list";
 import { channelHistory } from "@/src/shell/channel-context";
 import { shellState } from "@/src/shell/shell-context";
 import { channelLabel } from "@/src/shell/shell-model";
 
-export default async function ChannelPage({ params }: { params: Promise<{ channel: string }> }) {
+/** How many messages a room shows before "Show older" is offered. */
+const PAGE = 20;
+
+export default async function ChannelPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ channel: string }>;
+  searchParams: Promise<{ show?: string }>;
+}) {
   const { channel: key } = await params;
+  const { show } = await searchParams;
   const state = await shellState();
   const channel =
     state.status === "ready"
@@ -23,7 +35,18 @@ export default async function ChannelPage({ params }: { params: Promise<{ channe
     );
   }
 
-  const history = await channelHistory(channel.id);
+  // Paging widens the window rather than replacing it, so revealing older
+  // messages leaves everything already on screen exactly where it was.
+  const pages = Math.min(Math.max(Number(show ?? "1") || 1, 1), 20);
+  const history = await channelHistory(channel.id, PAGE * pages);
+  const viewerMemberId = state.status === "ready" ? state.snapshot.viewer.memberId : undefined;
+  const canPost = channel.isMember;
+  const forwardTargets =
+    state.status === "ready"
+      ? state.snapshot.channels
+          .filter((item) => item.id !== channel.id && item.isMember)
+          .map((item) => ({ id: item.id, label: channelLabel(item) }))
+      : [];
 
   return (
     <>
@@ -34,6 +57,22 @@ export default async function ChannelPage({ params }: { params: Promise<{ channe
           {channel.isMember ? "you are a member" : "you have not joined this room"}
         </p>
       </section>
+
+      {history.status === "ready" && history.pins.length > 0 ? (
+        <section className="panel pinned" aria-label="Pinned messages">
+          <h2>
+            <Pin size={14} aria-hidden="true" /> Pinned
+          </h2>
+          <ul className="pinned-list">
+            {history.pins.map((message) => (
+              <li key={message.id}>
+                <strong>{message.authorDisplaySnapshot}</strong>
+                <span>{message.bodyMarkdown.slice(0, 160)}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       {history.status === "unavailable" ? (
         <section className="empty-state">
@@ -49,14 +88,29 @@ export default async function ChannelPage({ params }: { params: Promise<{ channe
         </section>
       ) : (
         <section className="panel">
-          <MessageList messages={history.page.messages} />
+          {history.page.nextCursor ? (
+            <p className="history-more">
+              <a className="show-older" href={`?show=${pages + 1}#older-boundary`}>
+                Show older messages
+              </a>
+            </p>
+          ) : (
+            <p className="history-more muted">You have reached the start of this room.</p>
+          )}
+          <span id="older-boundary" />
+          <MessageList
+            messages={[...history.page.messages].reverse()}
+            viewerMemberId={viewerMemberId}
+            canAct={canPost}
+            forwardTargets={forwardTargets}
+          />
         </section>
       )}
 
       <Composer
         channelId={channel.id}
         channelLabel={channelLabel(channel)}
-        canPost={channel.isMember && channel.kind !== "dm"}
+        canPost={canPost && channel.kind !== "dm"}
       />
     </>
   );

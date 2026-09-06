@@ -48,6 +48,20 @@ export type MessageRow = {
   editCount: number;
   reactions: readonly MessageReaction[];
   mentions: readonly MessageMention[];
+  /** Set on a forwarded copy. Resolved for display only where the reader may see the source. */
+  forwardedFrom: MessageForwardSource | null;
+  /** Per reader, filled in by the object which knows who is asking. */
+  isSaved?: boolean;
+  isPinned?: boolean;
+};
+
+export type MessageForwardSource = {
+  messageId: string;
+  channelId: string;
+  authorDisplaySnapshot: string;
+  /** False when the reader cannot see the room the copy came from. */
+  sourceVisible: boolean;
+  sourceChannelLabel: string | null;
 };
 
 export type MessagePage = {
@@ -91,7 +105,8 @@ function toChannel(row: RawChannel): ChannelRow {
 
 const MESSAGE_COLUMNS = `id, channel_id, thread_root_id, author_kind, author_id,
                          author_display_snapshot, body_markdown, created_at, edited_at,
-                         deleted_at, channel_sequence, reply_count, last_reply_at, edit_count`;
+                         deleted_at, channel_sequence, reply_count, last_reply_at, edit_count,
+                         forwarded_from_message_id, forwarded_from_channel_id, forwarded_author_snapshot`;
 
 type RawMessage = {
   id: string;
@@ -108,6 +123,9 @@ type RawMessage = {
   reply_count: number;
   last_reply_at: number | null;
   edit_count: number;
+  forwarded_from_message_id: string | null;
+  forwarded_from_channel_id: string | null;
+  forwarded_author_snapshot: string | null;
 };
 
 function toMessage(row: RawMessage): MessageRow {
@@ -128,6 +146,17 @@ function toMessage(row: RawMessage): MessageRow {
     editCount: row.edit_count,
     reactions: [],
     mentions: [],
+    forwardedFrom:
+      row.forwarded_from_message_id === null
+        ? null
+        : {
+            messageId: row.forwarded_from_message_id,
+            channelId: row.forwarded_from_channel_id ?? "",
+            authorDisplaySnapshot: row.forwarded_author_snapshot ?? "",
+            // Resolved by the object, which knows who is reading.
+            sourceVisible: false,
+            sourceChannelLabel: null,
+          },
   };
 }
 
@@ -330,6 +359,7 @@ export function insertMessage(
     authorDisplaySnapshot: string;
     bodyMarkdown: string;
     channelSequence: number;
+    forwardedFrom?: { messageId: string; channelId: string; authorDisplaySnapshot: string } | null;
     now: number;
   },
 ): { threadSequence: number | null } {
@@ -346,8 +376,9 @@ export function insertMessage(
   storage.sql.exec(
     `INSERT INTO messages(
        id, channel_id, thread_root_id, author_kind, author_id, author_display_snapshot,
-       body_markdown, created_at, channel_sequence, thread_sequence
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       body_markdown, created_at, channel_sequence, thread_sequence,
+       forwarded_from_message_id, forwarded_from_channel_id, forwarded_author_snapshot
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     message.id,
     message.channelId,
     message.threadRootId,
@@ -358,6 +389,9 @@ export function insertMessage(
     message.now,
     message.channelSequence,
     threadSequence,
+    message.forwardedFrom?.messageId ?? null,
+    message.forwardedFrom?.channelId ?? null,
+    message.forwardedFrom?.authorDisplaySnapshot ?? null,
   );
   storage.sql.exec(
     `UPDATE channels SET message_count = message_count + 1, last_activity_at = ?, updated_at = ?
@@ -798,5 +832,138 @@ export function removeReaction(
       memberId,
       emoji,
     ).rowsWritten > 0
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Pins and saved items                                                        */
+/* -------------------------------------------------------------------------- */
+
+export function pinMessage(
+  storage: DurableObjectStorage,
+  channelId: string,
+  messageId: string,
+  memberId: string,
+  now: number,
+): boolean {
+  return (
+    storage.sql.exec(
+      `INSERT INTO channel_pins(channel_id, message_id, pinned_by_member_id, pinned_at)
+       VALUES (?, ?, ?, ?) ON CONFLICT(channel_id, message_id) DO NOTHING`,
+      channelId,
+      messageId,
+      memberId,
+      now,
+    ).rowsWritten > 0
+  );
+}
+
+export function unpinMessage(
+  storage: DurableObjectStorage,
+  channelId: string,
+  messageId: string,
+): boolean {
+  return (
+    storage.sql.exec(
+      "DELETE FROM channel_pins WHERE channel_id = ? AND message_id = ?",
+      channelId,
+      messageId,
+    ).rowsWritten > 0
+  );
+}
+
+/** Pinned messages of one room, newest pin first. Deleted messages never appear. */
+export function listPinnedMessages(
+  storage: DurableObjectStorage,
+  channelId: string,
+  limit: number,
+): MessageRow[] {
+  return storage.sql
+    .exec<RawMessage>(
+      `SELECT ${MESSAGE_COLUMNS.split(",").map((column) => `m.${column.trim()}`).join(", ")}
+       FROM channel_pins p JOIN messages m ON m.id = p.message_id
+       WHERE p.channel_id = ? AND m.deleted_at IS NULL
+       ORDER BY p.pinned_at DESC, m.id DESC LIMIT ?`,
+      channelId,
+      limit,
+    )
+    .toArray()
+    .map(toMessage);
+}
+
+export function pinnedMessageIds(storage: DurableObjectStorage, channelId: string): Set<string> {
+  return new Set(
+    storage.sql
+      .exec<{ message_id: string }>(
+        "SELECT message_id FROM channel_pins WHERE channel_id = ?",
+        channelId,
+      )
+      .toArray()
+      .map((row) => row.message_id),
+  );
+}
+
+export function saveMessageForMember(
+  storage: DurableObjectStorage,
+  memberId: string,
+  messageId: string,
+  now: number,
+): boolean {
+  return (
+    storage.sql.exec(
+      `INSERT INTO saved_items(member_id, message_id, saved_at) VALUES (?, ?, ?)
+       ON CONFLICT(member_id, message_id) DO NOTHING`,
+      memberId,
+      messageId,
+      now,
+    ).rowsWritten > 0
+  );
+}
+
+export function unsaveMessageForMember(
+  storage: DurableObjectStorage,
+  memberId: string,
+  messageId: string,
+): boolean {
+  return (
+    storage.sql.exec(
+      "DELETE FROM saved_items WHERE member_id = ? AND message_id = ?",
+      memberId,
+      messageId,
+    ).rowsWritten > 0
+  );
+}
+
+/**
+ * The raw saved pointers, newest first.
+ *
+ * These are pointers, not permissions. The caller must still decide, against the
+ * room as it is now, whether each one may be read — a message saved from a room
+ * the member has since left must not come back.
+ */
+export function listSavedPointers(
+  storage: DurableObjectStorage,
+  memberId: string,
+  limit: number,
+): { message: MessageRow; savedAt: number }[] {
+  return storage.sql
+    .exec<RawMessage & { saved_at: number }>(
+      `SELECT ${MESSAGE_COLUMNS.split(",").map((column) => `m.${column.trim()}`).join(", ")}, s.saved_at
+       FROM saved_items s JOIN messages m ON m.id = s.message_id
+       WHERE s.member_id = ?
+       ORDER BY s.saved_at DESC, m.id DESC LIMIT ?`,
+      memberId,
+      limit,
+    )
+    .toArray()
+    .map((row) => ({ message: toMessage(row), savedAt: row.saved_at }));
+}
+
+export function savedMessageIds(storage: DurableObjectStorage, memberId: string): Set<string> {
+  return new Set(
+    storage.sql
+      .exec<{ message_id: string }>("SELECT message_id FROM saved_items WHERE member_id = ?", memberId)
+      .toArray()
+      .map((row) => row.message_id),
   );
 }

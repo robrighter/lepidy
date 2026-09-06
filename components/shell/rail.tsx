@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  Bookmark,
   Hash,
   Home,
   Inbox,
@@ -27,6 +28,7 @@ import { AgentAvatar, Avatar } from "./avatar";
 const NAV_ICONS: Partial<Record<ShellSection, ReactNode>> = {
   home: <Home size={18} />,
   inbox: <Inbox size={18} />,
+  saved: <Bookmark size={18} />,
   agents: <Sparkles size={18} />,
   vault: <KeyRound size={18} />,
 };

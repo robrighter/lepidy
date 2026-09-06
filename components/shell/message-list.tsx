@@ -1,8 +1,9 @@
-import { MessageSquare, Pencil, Trash2 } from "lucide-react";
+import { CornerUpRight, MessageSquare, Pencil, Pin, Trash2 } from "lucide-react";
 
 import type { MessageRow } from "@/src/cloudflare/workspace-rooms";
 import { AgentAvatar, Avatar } from "./avatar";
 import { Markdown } from "./markdown";
+import { MessageActions, type ForwardTarget } from "./message-actions";
 
 function formatTime(timestamp: number): string {
   return new Date(timestamp).toISOString().slice(11, 16);
@@ -14,7 +15,17 @@ function formatTime(timestamp: number): string {
  * whole point of putting them in the same room. Agent output is long and
  * procedural, so a reply that lives in a thread is shown as a thread.
  */
-export function MessageList({ messages }: { messages: readonly MessageRow[] }) {
+export function MessageList({
+  messages,
+  viewerMemberId,
+  canAct = false,
+  forwardTargets = [],
+}: {
+  messages: readonly MessageRow[];
+  viewerMemberId?: string;
+  canAct?: boolean;
+  forwardTargets?: readonly ForwardTarget[];
+}) {
   return (
     <ol className="messages">
       {messages.map((message) => {
@@ -33,12 +44,27 @@ export function MessageList({ messages }: { messages: readonly MessageRow[] }) {
                 <time dateTime={new Date(message.createdAt).toISOString()}>
                   {formatTime(message.createdAt)}
                 </time>
+                {message.isPinned ? (
+                  <span className="tag" title="Pinned to this channel">
+                    <Pin size={11} aria-hidden="true" /> pinned
+                  </span>
+                ) : null}
                 {message.editedAt && !deleted ? (
                   <span className="tag" title={`Edited ${message.editCount} time(s)`}>
                     <Pencil size={11} aria-hidden="true" /> edited
                   </span>
                 ) : null}
               </p>
+
+              {message.forwardedFrom && !deleted ? (
+                <p className="message-forwarded">
+                  <CornerUpRight size={13} aria-hidden="true" />
+                  Forwarded from {message.forwardedFrom.authorDisplaySnapshot}
+                  {message.forwardedFrom.sourceVisible && message.forwardedFrom.sourceChannelLabel
+                    ? ` in #${message.forwardedFrom.sourceChannelLabel}`
+                    : ""}
+                </p>
+              ) : null}
 
               {deleted ? (
                 <p className="message-text message-deleted">
@@ -67,6 +93,16 @@ export function MessageList({ messages }: { messages: readonly MessageRow[] }) {
                   <MessageSquare size={13} aria-hidden="true" />
                   {message.replyCount} {message.replyCount === 1 ? "reply" : "replies"}
                 </p>
+              ) : null}
+
+              {viewerMemberId && !deleted ? (
+                <MessageActions
+                  message={message}
+                  canAct={canAct}
+                  isOwnMessage={message.authorKind === "member" && message.authorId === viewerMemberId}
+                  forwardTargets={forwardTargets}
+                  viewerMemberId={viewerMemberId}
+                />
               ) : null}
             </div>
           </li>

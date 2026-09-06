@@ -65,6 +65,23 @@ describe("markdown inline", () => {
     ]);
   });
 
+  it("MD-RULE-014 leaves an underscore inside a word alone", () => {
+    // A developer's identifiers survive intact; the shorthand still works when
+    // the underscore actually opens and closes a word.
+    expect(parseInline("MSG_DELETE_CANARY")).toEqual([
+      { type: "text", value: "MSG_DELETE_CANARY" },
+    ]);
+    expect(parseInline("call read_channel_history now")).toEqual([
+      { type: "text", value: "call read_channel_history now" },
+    ]);
+    expect(parseInline("_really_ good")).toEqual([
+      { type: "emphasis", children: [{ type: "text", value: "really" }] },
+      { type: "text", value: " good" },
+    ]);
+    // Asterisks still emphasise inside a word, as they always have.
+    expect(parseInline("a*b*c")[1]).toMatchObject({ type: "emphasis" });
+  });
+
   it("MD-RULE-006 links only to schemes a message may safely link to", () => {
     expect(parseInline("[docs](https://example.test/a)")).toEqual([
       {

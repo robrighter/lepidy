@@ -38,7 +38,7 @@ export class DevelopmentShellSource implements WorkspaceShellSource {
           { id: "agent-triage", handle: "a.triage", displayName: "Triage", status: "active" },
         ],
         storageMode: "local_host",
-        schemaVersion: 10,
+        schemaVersion: 11,
       },
     };
   }
@@ -64,6 +64,7 @@ const DEVELOPMENT_MESSAGES: Record<string, MessagePage> = {
         editCount: 0,
         reactions: [{ emoji: "\u{1F440}", memberIds: ["member-development"] }],
         mentions: [],
+        forwardedFrom: null,
       },
       {
         id: "message-dev-2",
@@ -83,6 +84,7 @@ const DEVELOPMENT_MESSAGES: Record<string, MessagePage> = {
         editCount: 0,
         reactions: [],
         mentions: [],
+        forwardedFrom: null,
       },
     ],
     nextCursor: null,

@@ -406,6 +406,38 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `ALTER TABLE messages ADD COLUMN deleted_by_member_id TEXT`,
     ],
   },
+  {
+    version: 11,
+    name: "pins, saved items and forwarding",
+    statements: [
+      // A pin belongs to the room, so it is visible to exactly whoever the room is.
+      `CREATE TABLE channel_pins (
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        pinned_by_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        pinned_at INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, message_id)
+      ) STRICT`,
+      `CREATE INDEX channel_pins_channel_idx ON channel_pins(channel_id, pinned_at)`,
+      // A saved item belongs to one person and is never visible to anybody else.
+      // It is only a pointer: whether it can still be read is decided at read
+      // time against the room, not at save time.
+      `CREATE TABLE saved_items (
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        saved_at INTEGER NOT NULL,
+        PRIMARY KEY (member_id, message_id)
+      ) STRICT`,
+      `CREATE INDEX saved_items_member_idx ON saved_items(member_id, saved_at)`,
+      // A forward is a new message carrying a copy, not a window into another
+      // room: the copy was made by somebody who could read the original.
+      `ALTER TABLE messages ADD COLUMN forwarded_from_message_id TEXT`,
+      `ALTER TABLE messages ADD COLUMN forwarded_from_channel_id TEXT`,
+      `ALTER TABLE messages ADD COLUMN forwarded_author_snapshot TEXT`,
+      `CREATE INDEX messages_forwarded_from_idx
+         ON messages(forwarded_from_message_id) WHERE forwarded_from_message_id IS NOT NULL`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

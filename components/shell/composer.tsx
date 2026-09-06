@@ -1,6 +1,7 @@
 "use client";
 
 import { CornerDownLeft, Send } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { sendChannelMessage, type SendResult } from "@/app/(app)/c/[channel]/actions";
@@ -48,6 +49,7 @@ export function Composer({
   const [status, setStatus] = useState<SendResult | null>(null);
   const [sending, setSending] = useState(false);
   const input = useRef<HTMLTextAreaElement>(null);
+  const router = useRouter();
 
   // Drafts are per room, so switching rooms never loses what was typed.
   useEffect(() => {
@@ -76,10 +78,15 @@ export function Composer({
     });
     setSending(false);
     setStatus(result);
-    if (result.ok) update("");
+    if (result.ok) {
+      update("");
+      // The server action revalidated the route; ask the router to actually
+      // re-render it, or the message that was just sent stays off screen.
+      router.refresh();
+    }
     // The caret goes back where the next word belongs, sent or not.
     input.current?.focus();
-  }, [body, channelId, sending, update]);
+  }, [body, channelId, router, sending, update]);
 
   if (!canPost) {
     return (

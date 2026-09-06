@@ -4,7 +4,7 @@ import { type ShellEnvironment } from "./resolve-shell-source";
 import { resolveViewerWorkspace, shellErrorReason } from "./workspace-shell-source";
 
 export type ChannelHistoryState =
-  | { status: "ready"; page: MessagePage }
+  | { status: "ready"; page: MessagePage; pins: readonly MessagePage["messages"][number][] }
   | { status: "not_found" }
   | { status: "unavailable"; reason: string };
 
@@ -38,13 +38,17 @@ export async function loadChannelHistory(
   const { row } = resolved;
   try {
     const stub = env.WORKSPACE.get(env.WORKSPACE.idFromString(row.durable_object_id));
-    const page = await stub.readChannelHistory({
-      actor: { memberId: row.member_id, authorizationEpoch: row.authorization_epoch },
-      channelId,
-      cursor: options.cursor ?? null,
-      limit: options.limit,
-    });
-    return { status: "ready", page };
+    const actor = { memberId: row.member_id, authorizationEpoch: row.authorization_epoch };
+    const [page, pins] = await Promise.all([
+      stub.readChannelHistory({
+        actor,
+        channelId,
+        cursor: options.cursor ?? null,
+        limit: options.limit,
+      }),
+      stub.listPins({ actor, channelId, limit: 10 }),
+    ]);
+    return { status: "ready", page, pins: pins.messages };
   } catch (error) {
     const reason = shellErrorReason(error);
     if (reason.includes("channel not found")) return { status: "not_found" };

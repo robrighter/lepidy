@@ -203,12 +203,18 @@ export function parseInline(source: string): InlineNode[] {
       continue;
     }
 
+    // `_` does not emphasise inside a word: snake_case_identifiers are names,
+    // not italics, and mangling them matters more here than the shorthand does.
+    const underscoreOpensWord = previous === "" || !/[A-Za-z0-9]/.test(previous);
     const emphasis = /^(\*|_)([^\n*_]+?)\1/.exec(rest);
-    if (emphasis) {
-      flush();
-      nodes.push({ type: "emphasis", children: parseInline(emphasis[2]) });
-      index += emphasis[0].length;
-      continue;
+    if (emphasis && (emphasis[1] === "*" || underscoreOpensWord)) {
+      const after = source[index + emphasis[0].length] ?? "";
+      if (emphasis[1] === "*" || !/[A-Za-z0-9]/.test(after)) {
+        flush();
+        nodes.push({ type: "emphasis", children: parseInline(emphasis[2]) });
+        index += emphasis[0].length;
+        continue;
+      }
     }
 
     text += source[index];

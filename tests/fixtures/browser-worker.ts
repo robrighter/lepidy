@@ -13,6 +13,15 @@ export class Workspace extends ProductionWorkspace {
     }
     return counts;
   }
+  /** Bulk history for pagination scenarios, written through the real authority. */
+  async seedBulkHistory(actor: { memberId: string; authorizationEpoch: number }, slug: string, count: number) {
+    const now = Date.now();
+    const channel = await this.createChannel({ actor, idempotencyKey: `browser-bulk:${slug}`, kind: "public", slug, name: slug, now });
+    for (let index = 0; index < count; index += 1) {
+      await this.sendMessage({ actor, channelId: channel.channelId, idempotencyKey: `browser-bulk:${slug}:${index}`, bodyMarkdown: `paged message ${index}`, now: now + index });
+    }
+    return { channelId: channel.channelId };
+  }
   async seedBrowserHistory(actor: { memberId: string; authorizationEpoch: number }) {
     const now = Date.now();
     const rooms = [];
@@ -45,12 +54,22 @@ export default {
       }
       return Response.json(counts);
     }
-    if (["/__fixture/seed", "/__fixture/workspace-counts"].includes(url.pathname) && request.method === "POST") {
+    if (["/__fixture/seed", "/__fixture/bulk", "/__fixture/workspace-counts"].includes(url.pathname) && request.method === "POST") {
       const authorization = new AuthorizationService(env.CONTROL_DB, env.WORKSPACE);
       const resolved = await resolveViewerWorkspace({ db: env.CONTROL_DB, workspaces: env.WORKSPACE, authenticateSession: (token) => authorization.authenticateBrowserSession(token) }, request.headers.get("authorization"));
       if (resolved.status !== "ok") return new Response("Unauthorized", { status: 401 });
       const stub = env.WORKSPACE.get(env.WORKSPACE.idFromString(resolved.row.durable_object_id)) as unknown as DurableObjectStub<Workspace>;
       if (url.pathname.endsWith("workspace-counts")) return Response.json(await stub.browserCounts());
+      if (url.pathname.endsWith("bulk")) {
+        const body = (await request.json()) as { slug: string; count: number };
+        return Response.json(
+          await stub.seedBulkHistory(
+            { memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch },
+            body.slug,
+            body.count,
+          ),
+        );
+      }
       await stub.seedBrowserHistory({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch });
       return Response.json({ ok: true });
     }
