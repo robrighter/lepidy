@@ -254,6 +254,82 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       ) STRICT`,
     ],
   },
+  {
+    version: 7,
+    name: "alarm scheduler, outbox and audit baseline",
+    statements: [
+      `CREATE TABLE due_work (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        due_at INTEGER NOT NULL,
+        interval_ms INTEGER CHECK (interval_ms IS NULL OR interval_ms > 0),
+        payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE INDEX due_work_due_idx ON due_work(due_at, id)`,
+      `CREATE TABLE due_work_failures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        error TEXT NOT NULL,
+        failed_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE INDEX due_work_failures_time_idx ON due_work_failures(failed_at)`,
+      `ALTER TABLE pending_events ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'
+         CHECK (status IN ('pending', 'delivered', 'dead'))`,
+      `ALTER TABLE pending_events ADD COLUMN dedupe_key TEXT`,
+      `ALTER TABLE pending_events ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts > 0)`,
+      `UPDATE pending_events SET status = 'delivered' WHERE completed_at IS NOT NULL`,
+      `CREATE UNIQUE INDEX pending_events_dedupe_idx ON pending_events(dedupe_key) WHERE dedupe_key IS NOT NULL`,
+      `CREATE INDEX pending_events_pending_idx ON pending_events(status, next_attempt_at)`,
+      `CREATE INDEX pending_events_retention_idx ON pending_events(status, completed_at)`,
+      `CREATE INDEX replay_events_time_idx ON replay_events(created_at)`,
+      `CREATE TABLE audit_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('allowed', 'denied', 'failed')),
+        requester_kind TEXT NOT NULL CHECK (requester_kind IN ('member', 'agent', 'runner', 'system')),
+        requester_id TEXT,
+        operating_owner_id TEXT,
+        approver_id TEXT,
+        subject_kind TEXT,
+        subject_id TEXT,
+        metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+        recorded_at INTEGER NOT NULL,
+        previous_hash TEXT NOT NULL,
+        entry_hash TEXT NOT NULL UNIQUE
+      ) STRICT`,
+      `CREATE INDEX audit_events_time_idx ON audit_events(recorded_at, sequence)`,
+      `CREATE TABLE audit_anchors (
+        day TEXT PRIMARY KEY,
+        first_sequence INTEGER NOT NULL,
+        last_sequence INTEGER NOT NULL,
+        entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
+        chain_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE TABLE audit_retention (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        purged_through_sequence INTEGER NOT NULL DEFAULT 0 CHECK (purged_through_sequence >= 0),
+        purged_through_hash TEXT NOT NULL DEFAULT '',
+        release_through_sequence INTEGER NOT NULL DEFAULT 0 CHECK (release_through_sequence >= 0),
+        updated_at INTEGER NOT NULL
+      ) STRICT`,
+      `INSERT INTO audit_retention(singleton, updated_at)
+       VALUES (1, CAST(unixepoch('subsec') * 1000 AS INTEGER))`,
+      `CREATE TRIGGER audit_events_append_only_update
+       BEFORE UPDATE ON audit_events
+       BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END`,
+      `CREATE TRIGGER audit_events_retention_only_delete
+       BEFORE DELETE ON audit_events
+       WHEN OLD.sequence > (SELECT release_through_sequence FROM audit_retention WHERE singleton = 1)
+       BEGIN SELECT RAISE(ABORT, 'audit log deletion requires an expired retention release'); END`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

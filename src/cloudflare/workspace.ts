@@ -5,6 +5,43 @@ import {
   readWorkspaceSchema,
   type WorkspaceSchemaState,
 } from "./workspace-migrations";
+import {
+  appendAuditEntry,
+  appendReplayEvents,
+  claimDueWork,
+  claimOutboxBatch,
+  completeDueWork,
+  deferDueWork,
+  enqueueOutbox,
+  ensureRecurringWork,
+  listDueWork,
+  nextDueAt,
+  nextPendingOutboxAt,
+  readAuditEntries,
+  scheduleDueWork,
+  settleOutbox,
+  sweepRetention,
+  verifyStoredAuditChain,
+  writeAuditAnchor,
+  type AppendedAudit,
+  type AuditAnchor,
+  type DueWorkInput,
+  type DueWorkRow,
+  type MutationEffects,
+  type OutboxDispatcher,
+  type OutboxEntry,
+  type OutboxOutcome,
+  type RetentionSweepReport,
+} from "./workspace-scheduler";
+import type { AuditChainVerification, AuditEntryInput, StoredAuditEntry } from "../domain/audit-chain";
+import {
+  DAY_MS,
+  DUE_WORK_BATCH_SIZE,
+  OUTBOX_BATCH_SIZE,
+  RETENTION_MS,
+  redactedError,
+} from "../domain/due-work";
+import { parseIdempotencyKey } from "../domain/idempotency-key";
 import { verifySoloSnapshot, type SoloContentSnapshot } from "../domain/solo-snapshot";
 
 export type WorkspaceHealth = {
@@ -38,12 +75,57 @@ export type OpaqueRelayFrameMetadata = {
   ciphertextBytes: number;
 };
 
+export type MutationOutcome<T> = {
+  replayed: boolean;
+  result: T;
+  audit: AppendedAudit | null;
+  outboxQueued: number;
+  alarmAt: number | null;
+};
+
+export type DueWorkReport = {
+  now: number;
+  processed: readonly string[];
+  failed: readonly { id: string; kind: string; error: string; retried: boolean }[];
+  outbox: { attempted: number; delivered: number; retried: number; dead: number };
+  retention: RetentionSweepReport | null;
+  anchor: AuditAnchor | null;
+  alarmAt: number | null;
+};
+
+export type SchedulerState = {
+  alarmAt: number | null;
+  dueWork: readonly DueWorkRow[];
+  pendingOutbox: number;
+  deadOutbox: number;
+  auditSequence: number;
+};
+
+/** Recurring work every workspace owns from the moment it exists. */
+export const RETENTION_SWEEP_WORK_ID = "system:retention_sweep";
+export const AUDIT_ANCHOR_WORK_ID = "system:audit_anchor";
+export const OUTBOX_FLUSH_WORK_ID = "system:outbox_flush";
+
 export class Workspace extends DurableObject<CloudflareEnv> {
   constructor(ctx: DurableObjectState, env: CloudflareEnv) {
     super(ctx, env);
 
     ctx.blockConcurrencyWhile(async () => {
-      migrateWorkspaceSchema(ctx.storage);
+      const schema = migrateWorkspaceSchema(ctx.storage);
+      if (schema.status !== "ready") return;
+      const now = Date.now();
+      ctx.storage.transactionSync(() => {
+        ensureRecurringWork(
+          ctx.storage,
+          [
+            { id: RETENTION_SWEEP_WORK_ID, kind: "retention_sweep", dueAt: now + DAY_MS, intervalMs: DAY_MS },
+            { id: AUDIT_ANCHOR_WORK_ID, kind: "audit_anchor", dueAt: now + DAY_MS, intervalMs: DAY_MS },
+          ],
+          now,
+        );
+      });
+      // An evicted object loses nothing: the alarm is rebuilt from durable state.
+      await this.armAlarm();
     });
   }
 
@@ -106,18 +188,18 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     });
   }
 
-  applyMembership(member: MemberProjection): { applied: boolean; version: number } {
+  async applyMembership(member: MemberProjection): Promise<{ applied: boolean; version: number }> {
     const schema = readWorkspaceSchema(this.ctx.storage);
     if (schema.status !== "ready") throw new Error("workspace is quarantined");
 
-    const result = this.ctx.storage.transactionSync(() => {
+    const outcome = await this.commitMutation({ scope: "membership", now: member.now }, () => {
       const replay = this.ctx.storage.sql
         .exec<{ version: number }>(
           "SELECT version FROM applied_control_operations WHERE operation_id = ?",
           member.operationId,
         )
         .toArray()[0];
-      if (replay) return { applied: false, version: replay.version };
+      if (replay) return { result: { applied: false, version: replay.version } };
 
       const existing = this.ctx.storage.sql
         .exec<{ control_version: number }>(
@@ -161,12 +243,47 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         member.version,
         member.now,
       );
-      return { applied: true, version: member.version };
+      const projection = {
+        memberId: member.memberId,
+        handle: member.handle,
+        role: member.role,
+        status: member.status,
+        authorizationEpoch: member.authorizationEpoch,
+        version: member.version,
+      };
+      return {
+        result: { applied: true, version: member.version },
+        effects: {
+          audit: {
+            eventType: "membership.projected",
+            outcome: "allowed",
+            requesterKind: "system",
+            subjectKind: "member",
+            subjectId: member.memberId,
+            metadata: {
+              role: member.role,
+              member_status: member.status,
+              authorization_epoch: member.authorizationEpoch,
+              control_version: member.version,
+              operation_id: member.operationId,
+            },
+          },
+          outbox: [
+            {
+              id: `member_projection.${member.operationId}`,
+              kind: "member_projection_changed",
+              dedupeKey: `member:${member.memberId}:${member.version}`,
+              payload: projection,
+            },
+          ],
+          replay: [{ kind: "member.updated", audience: ["workspace"], payload: projection }],
+        } satisfies MutationEffects,
+      };
     });
-    if (result.applied && (member.authorizationEpoch > 1 || member.status !== "active")) {
+    if (outcome.result.applied && (member.authorizationEpoch > 1 || member.status !== "active")) {
       this.closeMemberSockets(member.memberId);
     }
-    return result;
+    return outcome.result;
   }
 
   getMember(memberId: string): {
@@ -418,6 +535,280 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       );
       return { storageMode: "cloud" as const, routingEpoch, replayed: false };
     });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Alarm scheduler, transactional outbox and audit baseline (F06)      */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * The single durable transaction envelope every workspace mutation uses.
+   * The caller's rows, the audit entry, the outbox records, the realtime replay
+   * entries, the follow-up deadlines and the idempotency receipt all commit
+   * together or not at all. Delivery happens afterwards, on the alarm.
+   */
+  async commitMutation<T>(
+    input: {
+      scope: string;
+      idempotencyKey?: string | null;
+      requestHash?: string;
+      now: number;
+      idempotencyTtlMs?: number;
+    },
+    apply: () => { result: T; effects?: MutationEffects },
+  ): Promise<MutationOutcome<T>> {
+    const schema = readWorkspaceSchema(this.ctx.storage);
+    if (schema.status !== "ready") throw new Error("workspace is quarantined");
+
+    const key = input.idempotencyKey ? parseIdempotencyKey(input.idempotencyKey) : null;
+    if (input.idempotencyKey && key === null) throw new Error("invalid idempotency key");
+    const requestHash = input.requestHash ?? "";
+
+    const committed = this.ctx.storage.transactionSync(() => {
+      if (key !== null) {
+        const stored = this.ctx.storage.sql
+          .exec<{ request_hash: string; response_json: string }>(
+            "SELECT request_hash, response_json FROM idempotency_keys WHERE scope = ? AND key = ?",
+            input.scope,
+            key,
+          )
+          .toArray()[0];
+        if (stored) {
+          if (stored.request_hash !== requestHash) {
+            throw new Error("idempotency key reuse with a different request");
+          }
+          return {
+            replayed: true,
+            result: (JSON.parse(stored.response_json) as { value: T }).value,
+            audit: null,
+            outboxQueued: 0,
+          };
+        }
+      }
+
+      const { result, effects } = apply();
+      const audit = effects?.audit
+        ? appendAuditEntry(this.ctx.storage, this.workspaceKey(), effects.audit, input.now)
+        : null;
+      const outboxQueued = enqueueOutbox(this.ctx.storage, effects?.outbox ?? [], input.now);
+      appendReplayEvents(this.ctx.storage, effects?.replay ?? [], input.now);
+
+      const due: DueWorkInput[] = [...(effects?.dueWork ?? [])];
+      if (outboxQueued > 0) {
+        due.push({ id: OUTBOX_FLUSH_WORK_ID, kind: "outbox_flush", dueAt: input.now });
+      }
+      scheduleDueWork(this.ctx.storage, due, input.now);
+
+      if (key !== null) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO idempotency_keys(scope, key, request_hash, response_json, status_code, created_at, expires_at)
+           VALUES (?, ?, ?, ?, 200, ?, ?)`,
+          input.scope,
+          key,
+          requestHash,
+          JSON.stringify({ value: result }),
+          input.now,
+          input.now + (input.idempotencyTtlMs ?? RETENTION_MS.idempotencyResult),
+        );
+      }
+
+      return { replayed: false, result, audit, outboxQueued };
+    });
+
+    return { ...committed, alarmAt: await this.armAlarm() };
+  }
+
+  /** Add or advance multiplexed deadlines and re-point the object's one alarm. */
+  async scheduleWork(items: readonly DueWorkInput[], now: number): Promise<{ alarmAt: number | null }> {
+    this.ctx.storage.transactionSync(() => scheduleDueWork(this.ctx.storage, items, now));
+    return { alarmAt: await this.armAlarm() };
+  }
+
+  async schedulerState(): Promise<SchedulerState> {
+    const counts = this.ctx.storage.sql
+      .exec<{ status: string; count: number }>(
+        "SELECT status, COUNT(*) AS count FROM pending_events GROUP BY status",
+      )
+      .toArray();
+    const auditSequence =
+      this.ctx.storage.sql
+        .exec<{ sequence: number | null }>("SELECT MAX(sequence) AS sequence FROM audit_events")
+        .one().sequence ?? 0;
+    return {
+      alarmAt: await this.ctx.storage.getAlarm(),
+      dueWork: listDueWork(this.ctx.storage),
+      pendingOutbox: counts.find((row) => row.status === "pending")?.count ?? 0,
+      deadOutbox: counts.find((row) => row.status === "dead")?.count ?? 0,
+      auditSequence,
+    };
+  }
+
+  async alarm(): Promise<void> {
+    await this.runDueWork(Date.now());
+  }
+
+  /**
+   * Drain everything due at `now`. A handler that throws backs its own item off
+   * without stalling the other deadlines sharing this alarm.
+   */
+  async runDueWork(now: number, dispatcher?: OutboxDispatcher): Promise<DueWorkReport> {
+    const claimed = claimDueWork(this.ctx.storage, now, DUE_WORK_BATCH_SIZE);
+    const processed: string[] = [];
+    const failed: { id: string; kind: string; error: string; retried: boolean }[] = [];
+    let outbox = { attempted: 0, delivered: 0, retried: 0, dead: 0 };
+    let retention: RetentionSweepReport | null = null;
+    let anchor: AuditAnchor | null = null;
+
+    for (const item of claimed) {
+      try {
+        switch (item.kind) {
+          case "outbox_flush": {
+            const report = await this.drainOutbox(now, dispatcher);
+            outbox = {
+              attempted: outbox.attempted + report.attempted,
+              delivered: outbox.delivered + report.delivered,
+              retried: outbox.retried + report.retried,
+              dead: outbox.dead + report.dead,
+            };
+            break;
+          }
+          case "retention_sweep": {
+            const swept = this.ctx.storage.transactionSync(() => sweepRetention(this.ctx.storage, now));
+            // Several sweep deadlines can come due together; report their sum
+            // rather than letting the last one hide the others.
+            retention =
+              retention === null
+                ? swept
+                : (Object.fromEntries(
+                    Object.entries(swept).map(([key, value]) => [
+                      key,
+                      value + retention![key as keyof RetentionSweepReport],
+                    ]),
+                  ) as RetentionSweepReport);
+            break;
+          }
+          case "audit_anchor":
+            anchor = this.ctx.storage.transactionSync(() =>
+              writeAuditAnchor(this.ctx.storage, this.workspaceKey(), now),
+            );
+            break;
+          default:
+            throw new Error(`no handler for due work kind ${item.kind}`);
+        }
+        this.ctx.storage.transactionSync(() => completeDueWork(this.ctx.storage, item, now));
+        processed.push(item.id);
+      } catch (error) {
+        const deferred = this.ctx.storage.transactionSync(() =>
+          deferDueWork(this.ctx.storage, item, now, error),
+        );
+        failed.push({
+          id: item.id,
+          kind: item.kind,
+          error: redactedError(error),
+          retried: deferred.retried,
+        });
+      }
+    }
+
+    const stillPending = nextPendingOutboxAt(this.ctx.storage);
+    if (stillPending !== null) {
+      this.ctx.storage.transactionSync(() =>
+        scheduleDueWork(
+          this.ctx.storage,
+          [{ id: OUTBOX_FLUSH_WORK_ID, kind: "outbox_flush", dueAt: stillPending }],
+          now,
+        ),
+      );
+    }
+
+    return { now, processed, failed, outbox, retention, anchor, alarmAt: await this.armAlarm() };
+  }
+
+  /**
+   * Attempt delivery for every outbox entry whose backoff has elapsed. Delivery
+   * is at-least-once: `dedupeKey` travels with the payload so a consumer can
+   * discard a duplicate produced by a lost acknowledgement.
+   */
+  async drainOutbox(
+    now: number,
+    dispatcher: OutboxDispatcher = (entry) => this.dispatchToQueue(entry),
+    limit = OUTBOX_BATCH_SIZE,
+  ): Promise<{ attempted: number; delivered: number; retried: number; dead: number }> {
+    const batch = claimOutboxBatch(this.ctx.storage, now, limit);
+    let delivered = 0;
+    let retried = 0;
+    let dead = 0;
+
+    for (const entry of batch) {
+      let outcome: OutboxOutcome;
+      try {
+        outcome = await dispatcher(entry);
+      } catch (error) {
+        outcome = { status: "retry", error: redactedError(error) };
+      }
+      const settled = this.ctx.storage.transactionSync(() =>
+        settleOutbox(this.ctx.storage, entry, outcome, now),
+      );
+      if (settled === "delivered") delivered += 1;
+      else if (settled === "dead") dead += 1;
+      else retried += 1;
+    }
+
+    return { attempted: batch.length, delivered, retried, dead };
+  }
+
+  recordAuditEvent(entry: AuditEntryInput, now: number): AppendedAudit {
+    const schema = readWorkspaceSchema(this.ctx.storage);
+    if (schema.status !== "ready") throw new Error("workspace is quarantined");
+    return this.ctx.storage.transactionSync(() =>
+      appendAuditEntry(this.ctx.storage, this.workspaceKey(), entry, now),
+    );
+  }
+
+  auditTrail(fromSequence = 0, limit = 200): StoredAuditEntry[] {
+    return readAuditEntries(this.ctx.storage, this.workspaceKey(), fromSequence, limit);
+  }
+
+  verifyAuditTrail(): AuditChainVerification {
+    return verifyStoredAuditChain(this.ctx.storage, this.workspaceKey());
+  }
+
+  /** Stable per-tenant binding for the audit chain: the object's own id. */
+  private workspaceKey(): string {
+    return this.ctx.id.toString();
+  }
+
+  /** Point the object's one alarm at the earliest deadline it owns. */
+  private async armAlarm(): Promise<number | null> {
+    const due = nextDueAt(this.ctx.storage);
+    const current = await this.ctx.storage.getAlarm();
+    if (due === null) {
+      if (current !== null) await this.ctx.storage.deleteAlarm();
+      return null;
+    }
+    // A deadline recovered from storage can be in the past; the runtime still
+    // refuses a non-positive alarm time.
+    const target = Math.max(due, 1);
+    if (current !== target) await this.ctx.storage.setAlarm(target);
+    return target;
+  }
+
+  private async dispatchToQueue(entry: OutboxEntry): Promise<OutboxOutcome> {
+    const queue = this.env.EVENTS;
+    if (!queue) return { status: "retry", error: "events queue binding is unavailable" };
+    try {
+      await queue.send({
+        workspace: this.workspaceKey(),
+        id: entry.id,
+        kind: entry.kind,
+        dedupeKey: entry.dedupeKey,
+        attempt: entry.attempts + 1,
+        payload: entry.payload,
+      });
+      return { status: "delivered" };
+    } catch (error) {
+      return { status: "retry", error: redactedError(error) };
+    }
   }
 
   private readStagedSnapshot(importId: string): SoloContentSnapshot {

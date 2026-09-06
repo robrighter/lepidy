@@ -22,6 +22,14 @@
       "new_sqlite_classes": ["Workspace", "MigrationFixture"]
     }
   ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "EVENTS",
+        "queue": "lepidy-events-test"
+      }
+    ]
+  },
   "d1_databases": [
     {
       "binding": "CONTROL_DB",
