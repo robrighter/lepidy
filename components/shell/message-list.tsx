@@ -4,6 +4,7 @@ import type { MessageRow } from "@/src/cloudflare/workspace-rooms";
 import { AgentAvatar, Avatar } from "./avatar";
 import { Markdown } from "./markdown";
 import { MessageActions, type ForwardTarget } from "./message-actions";
+import { Snippet } from "./snippet";
 
 function formatTime(timestamp: number): string {
   return new Date(timestamp).toISOString().slice(11, 16);
@@ -71,7 +72,10 @@ export function MessageList({
                   <Trash2 size={13} aria-hidden="true" /> This message was deleted.
                 </p>
               ) : (
-                <Markdown body={message.bodyMarkdown} />
+                <>
+                  <Markdown body={message.bodyMarkdown} />
+                  {message.snippet ? <Snippet snippet={message.snippet} /> : null}
+                </>
               )}
 
               {message.reactions.length > 0 ? (

@@ -53,6 +53,8 @@ export type MessageRow = {
   /** Per reader, filled in by the object which knows who is asking. */
   isSaved?: boolean;
   isPinned?: boolean;
+  /** Present when this message carries a snippet rather than only prose. */
+  snippet?: SnippetRow | null;
 };
 
 export type MessageForwardSource = {
@@ -1245,5 +1247,105 @@ export function settleScheduledMessage(
       now,
       id,
     ).rowsWritten > 0
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Snippets and custom emoji                                                   */
+/* -------------------------------------------------------------------------- */
+
+export type SnippetRow = {
+  messageId: string;
+  title: string;
+  language: string | null;
+  body: string;
+  lineCount: number;
+};
+
+export function insertSnippet(
+  storage: DurableObjectStorage,
+  snippet: SnippetRow,
+): void {
+  storage.sql.exec(
+    `INSERT INTO message_snippets(message_id, title, language, body, line_count)
+     VALUES (?, ?, ?, ?, ?)`,
+    snippet.messageId,
+    snippet.title,
+    snippet.language,
+    snippet.body,
+    snippet.lineCount,
+  );
+}
+
+export function readSnippets(
+  storage: DurableObjectStorage,
+  messageIds: readonly string[],
+): Map<string, SnippetRow> {
+  const byMessage = new Map<string, SnippetRow>();
+  if (messageIds.length === 0) return byMessage;
+  const placeholders = messageIds.map(() => "?").join(", ");
+  for (const row of storage.sql
+    .exec<{
+      message_id: string;
+      title: string;
+      language: string | null;
+      body: string;
+      line_count: number;
+    }>(
+      `SELECT message_id, title, language, body, line_count FROM message_snippets
+       WHERE message_id IN (${placeholders})`,
+      ...messageIds,
+    )
+    .toArray()) {
+    byMessage.set(row.message_id, {
+      messageId: row.message_id,
+      title: row.title,
+      language: row.language,
+      body: row.body,
+      lineCount: row.line_count,
+    });
+  }
+  return byMessage;
+}
+
+export type CustomEmojiRow = { name: string; aliasEmoji: string; createdAt: number };
+
+export function insertCustomEmoji(
+  storage: DurableObjectStorage,
+  name: string,
+  aliasEmoji: string,
+  createdByMemberId: string,
+  now: number,
+): boolean {
+  return (
+    storage.sql.exec(
+      `INSERT INTO custom_emoji(name, alias_emoji, created_by_member_id, created_at)
+       VALUES (?, ?, ?, ?) ON CONFLICT(name) DO NOTHING`,
+      name,
+      aliasEmoji,
+      createdByMemberId,
+      now,
+    ).rowsWritten > 0
+  );
+}
+
+export function deleteCustomEmoji(storage: DurableObjectStorage, name: string): boolean {
+  return storage.sql.exec("DELETE FROM custom_emoji WHERE name = ?", name).rowsWritten > 0;
+}
+
+export function listCustomEmoji(storage: DurableObjectStorage): CustomEmojiRow[] {
+  return storage.sql
+    .exec<{ name: string; alias_emoji: string; created_at: number }>(
+      "SELECT name, alias_emoji, created_at FROM custom_emoji ORDER BY name",
+    )
+    .toArray()
+    .map((row) => ({ name: row.name, aliasEmoji: row.alias_emoji, createdAt: row.created_at }));
+}
+
+export function customEmojiExists(storage: DurableObjectStorage, name: string): boolean {
+  return (
+    storage.sql
+      .exec<{ present: number }>("SELECT 1 AS present FROM custom_emoji WHERE name = ?", name)
+      .toArray()[0]?.present === 1
   );
 }

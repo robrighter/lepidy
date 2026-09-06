@@ -170,3 +170,51 @@ export function parseReactionEmoji(value: unknown): string | null {
   if (/^:[a-z0-9][a-z0-9_+-]{0,30}:$/.test(trimmed)) return trimmed;
   return /\p{Extended_Pictographic}/u.test(trimmed) ? trimmed : null;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Snippets                                                                    */
+/* -------------------------------------------------------------------------- */
+
+export const MAX_SNIPPET_TITLE_LENGTH = 120;
+export const MAX_SNIPPET_BODY_LENGTH = 64_000;
+export const MAX_SNIPPET_LANGUAGE_LENGTH = 24;
+
+export type Snippet = { title: string; language: string | null; body: string; lineCount: number };
+
+/**
+ * A snippet is what a message becomes when it is longer than a message.
+ *
+ * Its body is kept verbatim, including the leading whitespace that makes code
+ * mean what it means, so only the characters that cannot survive a log are
+ * removed. It is deliberately allowed to be far longer than a message.
+ */
+export function parseSnippet(input: {
+  title?: unknown;
+  language?: unknown;
+  body?: unknown;
+}): Snippet | null {
+  if (typeof input.body !== "string") return null;
+  const body = input.body
+    .replaceAll("\r\n", "\n")
+    .replaceAll("\r", "\n")
+    .replaceAll(FORBIDDEN_CONTROL_CHARACTERS, "")
+    .replace(/\s+$/, "");
+  if (body.length === 0 || body.length > MAX_SNIPPET_BODY_LENGTH) return null;
+
+  const rawTitle = typeof input.title === "string" ? input.title.trim().replaceAll(/\s+/g, " ") : "";
+  const title = (rawTitle.length === 0 ? "Snippet" : rawTitle).slice(0, MAX_SNIPPET_TITLE_LENGTH);
+
+  const rawLanguage = typeof input.language === "string" ? input.language.trim().toLowerCase() : "";
+  const language =
+    rawLanguage.length > 0 && /^[a-z0-9+#._-]{1,24}$/.test(rawLanguage) ? rawLanguage : null;
+
+  return { title, language, body, lineCount: body.split("\n").length };
+}
+
+/** What the message itself says; the snippet travels beside it, not inside it. */
+export function snippetMessageBody(snippet: Snippet): string {
+  const lines = `${snippet.lineCount} ${snippet.lineCount === 1 ? "line" : "lines"}`;
+  return snippet.language
+    ? `**${snippet.title}** · ${snippet.language} · ${lines}`
+    : `**${snippet.title}** · ${lines}`;
+}

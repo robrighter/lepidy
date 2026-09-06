@@ -3,6 +3,15 @@ import { defineConfig, devices } from "@playwright/test";
 export default defineConfig({
   testDir: "./tests/browser",
   fullyParallel: true,
+  // One local Worker serves the whole suite, and every scenario signs up, which
+  // means an Argon2id hash. Left to one worker per core the sign-ups alone
+  // saturate it and unrelated tests fail on a timeout. This is the real capacity
+  // of the single-process harness, not a flake to retry away.
+  workers: 3,
+  // Assertions still wait on observed state rather than sleeping; the budget is
+  // simply larger because every scenario is served by one local Worker doing
+  // real Argon2id hashing and real Durable Object work.
+  expect: { timeout: 10_000 },
   forbidOnly: true,
   retries: 0,
   reporter: [["list"], ["html", { open: "never", outputFolder: "playwright-report" }]],

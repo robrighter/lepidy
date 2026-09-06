@@ -243,6 +243,9 @@ test("SCHED-MSG-INT-008 schedules a message for later and can take it back", asy
   await expect(entry.locator(".tag")).toHaveText("scheduled");
 
   await entry.getByRole("button", { name: /^Cancel the message scheduled/ }).click();
+  // Gone from the list at once, and still gone on a fresh load.
+  await expect(page.locator(".scheduled-list li")).toHaveCount(0);
+  await page.reload();
   await expect(page.getByRole("heading", { name: "Nothing scheduled" })).toBeVisible();
 
   // Cancelling means it never arrives in the room.

@@ -471,6 +471,29 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX scheduled_messages_member_idx ON scheduled_messages(member_id, send_at)`,
     ],
   },
+  {
+    version: 13,
+    name: "snippets and custom emoji",
+    statements: [
+      // A snippet travels beside its message rather than inside it, so history
+      // stays readable without loading every long body with it.
+      `CREATE TABLE message_snippets (
+        message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        language TEXT,
+        body TEXT NOT NULL,
+        line_count INTEGER NOT NULL CHECK (line_count > 0)
+      ) STRICT`,
+      // One name, one meaning, workspace-wide. The name is the primary key so a
+      // second definition cannot change what an old message meant.
+      `CREATE TABLE custom_emoji (
+        name TEXT PRIMARY KEY,
+        alias_emoji TEXT NOT NULL,
+        created_by_member_id TEXT REFERENCES members(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL
+      ) STRICT`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

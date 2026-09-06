@@ -51,7 +51,9 @@ import {
   clampHistoryLimit,
   parseMessageBody,
   parseReactionEmoji,
+  parseSnippet,
   resolveThreadPlacement,
+  snippetMessageBody,
   type ChannelKind,
 } from "../domain/rooms";
 import {
@@ -73,6 +75,8 @@ import {
   type ServerFrame,
 } from "../domain/socket-protocol";
 import { parseMentions } from "../domain/mentions";
+import { isEmojiToken, parseCustomEmojiName } from "../domain/emoji";
+import { commandMessageBody, parseComposerInput } from "../domain/slash-commands";
 import {
   addChannelMembers,
   addReaction,
@@ -87,7 +91,12 @@ import {
   listChannelHistory,
   listThreadHistory,
   claimDueScheduledMessages,
+  customEmojiExists,
+  deleteCustomEmoji,
   deleteDraft,
+  insertCustomEmoji,
+  insertSnippet,
+  listCustomEmoji,
   insertScheduledMessage,
   listDraftsForMember,
   listPinnedMessages,
@@ -96,6 +105,7 @@ import {
   nextScheduledSendAt,
   readDraft,
   readScheduledMessage,
+  readSnippets,
   settleScheduledMessage,
   updateScheduledMessage,
   writeDraft,
@@ -123,6 +133,7 @@ import {
   writeChannelCursor,
   writeThreadCursor,
   type ChannelRow,
+  type CustomEmojiRow,
   type DraftRow,
   type MessagePage,
   type MessageRow,
@@ -252,6 +263,11 @@ export type SocketAttachment = {
   cursor: number;
   connectedAt: number;
 };
+
+export type ComposerOutcome =
+  | { kind: "sent"; messageId: string }
+  | { kind: "acted"; command: "join" | "leave" | "archive" }
+  | { kind: "rejected"; reason: string };
 
 export type DraftSaveResult =
   | { status: "saved"; draft: DraftRow }
@@ -1563,8 +1579,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const actor = this.authorizeActor(input.actor);
     this.requireCloudContentAuthority();
     const { message, channel } = this.requireReactableMessage(input.messageId, actor.id);
-    const emoji = parseReactionEmoji(input.emoji);
-    if (emoji === null) throw new Error("invalid reaction");
+    const emoji = this.requireUsableReaction(input.emoji);
 
     const outcome = await this.commitMutation({ scope: "message.react", now: input.now }, () => {
       const added = addReaction(this.ctx.storage, message.id, actor.id, emoji, input.now);
@@ -1598,6 +1613,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const actor = this.authorizeActor(input.actor);
     this.requireCloudContentAuthority();
     const { message, channel } = this.requireReactableMessage(input.messageId, actor.id);
+    // Removing is allowed even for a name since withdrawn, so a reaction cannot
+    // be stranded by an admin deleting the emoji.
     const emoji = parseReactionEmoji(input.emoji);
     if (emoji === null) throw new Error("invalid reaction");
 
@@ -1614,6 +1631,22 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       });
     }
     return { removed };
+  }
+
+  /**
+   * A reaction is a literal emoji, or the name of one this workspace has
+   * defined. An unnamed `:token:` is refused rather than stored, or the column
+   * becomes a second message body nobody indexed.
+   */
+  private requireUsableReaction(value: string): string {
+    const emoji = parseReactionEmoji(value);
+    if (emoji === null) throw new Error("invalid reaction");
+    if (!isEmojiToken(emoji)) return emoji;
+    const name = parseCustomEmojiName(emoji);
+    if (name === null || !customEmojiExists(this.ctx.storage, name)) {
+      throw new Error("no custom emoji by that name");
+    }
+    return emoji;
   }
 
   private requireOwnMessage(
@@ -1943,6 +1976,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   private decorateMessages(messages: readonly MessageRow[], memberId: string): MessagePage {
     const annotated = annotateMessages(this.ctx.storage, { messages, nextCursor: null });
     const saved = savedMessageIds(this.ctx.storage, memberId);
+    const snippets = readSnippets(
+      this.ctx.storage,
+      messages.map((message) => message.id),
+    );
     const pinsByChannel = new Map<string, Set<string>>();
 
     const decorated = annotated.messages.map((message) => {
@@ -1968,6 +2005,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         forwardedFrom,
         isSaved: saved.has(message.id),
         isPinned: pinsByChannel.get(message.channelId)!.has(message.id),
+        snippet: snippets.get(message.id) ?? null,
       };
     });
 
@@ -2331,6 +2369,293 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       throw new Error("thread not found");
     }
     return root.id;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Snippets, slash commands and custom emoji (C05c)                    */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Post a snippet: a message whose real content is too long to be one.
+   *
+   * The message itself carries a one-line summary so history stays readable;
+   * the body travels beside it and is loaded with the page that shows it.
+   */
+  async sendSnippet(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    channelId: string;
+    title?: string | null;
+    language?: string | null;
+    body: string;
+    threadParentId?: string | null;
+    now: number;
+  }): Promise<SentMessage> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const channel = this.requireChannelParticipant(input.channelId, actor.id);
+    if (channel.archivedAt !== null) throw new Error("this room is archived");
+
+    const snippet = parseSnippet({
+      title: input.title,
+      language: input.language,
+      body: input.body,
+    });
+    if (snippet === null) throw new Error("snippet is empty or too long");
+
+    const parent = input.threadParentId ? readMessage(this.ctx.storage, input.threadParentId) : null;
+    if (input.threadParentId && parent === null) throw new Error("thread parent not found");
+    const placement = resolveThreadPlacement(parent, channel.id);
+    if (placement.kind === "invalid") throw new Error(placement.reason);
+    const threadRootId = placement.kind === "reply" ? placement.threadRootId : null;
+
+    const summary = snippetMessageBody(snippet);
+
+    const outcome = await this.commitMutation(
+      {
+        scope: "message.snippet",
+        idempotencyKey: input.idempotencyKey,
+        requestHash: `${actor.id}|${channel.id}|${snippet.body.length}`,
+        now: input.now,
+      },
+      () => {
+        const messageId = crypto.randomUUID();
+        const channelSequence = nextChannelSequence(this.ctx.storage, channel.id);
+        insertMessage(this.ctx.storage, {
+          id: messageId,
+          channelId: channel.id,
+          threadRootId,
+          authorKind: "member",
+          authorId: actor.id,
+          authorDisplaySnapshot: actor.displayName,
+          bodyMarkdown: summary,
+          channelSequence,
+          now: input.now,
+        });
+        insertSnippet(this.ctx.storage, { messageId, ...snippet });
+
+        return {
+          result: {
+            messageId,
+            channelId: channel.id,
+            threadRootId,
+            channelSequence,
+            createdAt: input.now,
+            replayed: false,
+          },
+          effects: {
+            audit: {
+              eventType: "message.snippet_created",
+              outcome: "allowed" as const,
+              requesterKind: "member" as const,
+              requesterId: actor.id,
+              subjectKind: "message",
+              subjectId: messageId,
+              // Counts and a language, never the snippet itself.
+              metadata: {
+                channel_id: channel.id,
+                line_count: snippet.lineCount,
+                language: snippet.language,
+              },
+            },
+            replay: [
+              {
+                kind: "message.created",
+                audience: [channel.id],
+                payload: {
+                  messageId,
+                  channelId: channel.id,
+                  threadRootId,
+                  channelSequence,
+                  authorId: actor.id,
+                  createdAt: input.now,
+                },
+              },
+            ],
+            outbox: [
+              {
+                id: `message.${messageId}`,
+                kind: "message_created",
+                dedupeKey: `message:${messageId}`,
+                payload: { messageId, channelId: channel.id, threadRootId },
+              },
+            ],
+          } satisfies MutationEffects,
+        };
+      },
+    );
+
+    if (!outcome.replayed) {
+      this.broadcastChannelEvent(channel, this.latestReplaySequence(), "message.created", {
+        messageId: outcome.result.messageId,
+        channelId: channel.id,
+        threadRootId,
+        channelSequence: outcome.result.channelSequence,
+        authorId: actor.id,
+        createdAt: input.now,
+      });
+    }
+    return { ...outcome.result, replayed: outcome.replayed };
+  }
+
+  /**
+   * Run what somebody typed into the composer.
+   *
+   * Parsing decided only what was meant. Everything a command does goes through
+   * the same authorized method the button would have called, so a command can
+   * never reach further than the person typing it already could.
+   */
+  async runComposerInput(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    channelId: string;
+    raw: string;
+    threadParentId?: string | null;
+    now: number;
+  }): Promise<ComposerOutcome> {
+    const parsed = parseComposerInput(input.raw);
+
+    switch (parsed.kind) {
+      case "empty":
+        return { kind: "rejected", reason: "There is nothing to send." };
+
+      case "unknown_command":
+        // Refused, not posted: somebody who mistypes a command did not mean to
+        // say it out loud to the room.
+        return {
+          kind: "rejected",
+          reason: `${parsed.typed} is not a command. Start a message with // to say it literally.`,
+        };
+
+      case "message": {
+        const sent = await this.sendMessage({
+          actor: input.actor,
+          idempotencyKey: input.idempotencyKey,
+          channelId: input.channelId,
+          bodyMarkdown: parsed.bodyMarkdown,
+          threadParentId: input.threadParentId ?? null,
+          now: input.now,
+        });
+        return { kind: "sent", messageId: sent.messageId };
+      }
+
+      case "command": {
+        const body = commandMessageBody(parsed.name, parsed.argument);
+        if (body !== null) {
+          const sent = await this.sendMessage({
+            actor: input.actor,
+            idempotencyKey: input.idempotencyKey,
+            channelId: input.channelId,
+            bodyMarkdown: body,
+            threadParentId: input.threadParentId ?? null,
+            now: input.now,
+          });
+          return { kind: "sent", messageId: sent.messageId };
+        }
+
+        switch (parsed.name) {
+          case "join":
+            await this.joinChannel({
+              actor: input.actor,
+              channelId: input.channelId,
+              now: input.now,
+            });
+            return { kind: "acted", command: "join" };
+          case "leave":
+            await this.leaveChannel({
+              actor: input.actor,
+              channelId: input.channelId,
+              now: input.now,
+            });
+            return { kind: "acted", command: "leave" };
+          case "archive":
+            await this.archiveChannel({
+              actor: input.actor,
+              channelId: input.channelId,
+              now: input.now,
+            });
+            return { kind: "acted", command: "archive" };
+          default:
+            return { kind: "rejected", reason: "That command needs something to say." };
+        }
+      }
+    }
+  }
+
+  /** Naming an emoji is workspace administration, not an ordinary member action. */
+  async createCustomEmoji(input: {
+    actor: Actor;
+    name: string;
+    aliasEmoji: string;
+    now: number;
+  }): Promise<{ created: boolean; name: string }> {
+    const actor = this.authorizeActor(input.actor);
+    if (actor.role !== "owner" && actor.role !== "admin") {
+      throw new Error("only an admin may name a custom emoji");
+    }
+    const name = parseCustomEmojiName(input.name);
+    if (name === null) throw new Error("invalid custom emoji name");
+    const alias = parseReactionEmoji(input.aliasEmoji);
+    if (alias === null || isEmojiToken(alias)) throw new Error("a custom emoji needs a real emoji");
+
+    const outcome = await this.commitMutation({ scope: "emoji.create", now: input.now }, () => {
+      const created = insertCustomEmoji(this.ctx.storage, name, alias, actor.id, input.now);
+      if (!created) return { result: { created: false, name } };
+      return {
+        result: { created: true, name },
+        effects: {
+          audit: {
+            eventType: "emoji.created",
+            outcome: "allowed" as const,
+            requesterKind: "member" as const,
+            requesterId: actor.id,
+            subjectKind: "custom_emoji",
+            subjectId: name,
+            metadata: {},
+          },
+        } satisfies MutationEffects,
+      };
+    });
+    return outcome.result;
+  }
+
+  async deleteCustomEmoji(input: {
+    actor: Actor;
+    name: string;
+    now: number;
+  }): Promise<{ deleted: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    if (actor.role !== "owner" && actor.role !== "admin") {
+      throw new Error("only an admin may remove a custom emoji");
+    }
+    const name = parseCustomEmojiName(input.name);
+    if (name === null) throw new Error("invalid custom emoji name");
+
+    const outcome = await this.commitMutation({ scope: "emoji.delete", now: input.now }, () => {
+      const deleted = deleteCustomEmoji(this.ctx.storage, name);
+      if (!deleted) return { result: { deleted: false } };
+      return {
+        result: { deleted: true },
+        effects: {
+          audit: {
+            eventType: "emoji.deleted",
+            outcome: "allowed" as const,
+            requesterKind: "member" as const,
+            requesterId: actor.id,
+            subjectKind: "custom_emoji",
+            subjectId: name,
+            metadata: {},
+          },
+        } satisfies MutationEffects,
+      };
+    });
+    return outcome.result;
+  }
+
+  /** Every member can read the workspace's emoji; only admins can change them. */
+  listCustomEmoji(input: { actor: Actor }): { emoji: readonly CustomEmojiRow[] } {
+    this.authorizeActor(input.actor);
+    return { emoji: listCustomEmoji(this.ctx.storage) };
   }
 
   /** Newest-first channel history, refused outright for a room the caller cannot see. */

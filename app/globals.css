@@ -281,6 +281,14 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 .history-more.muted { color: var(--text-3); }
 .show-older { color: var(--accent); font-weight: 600; text-decoration: underline; }
 
+.snippet { margin: 8px 0 0; padding: 0; border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--sunken); overflow: hidden; }
+.snippet figcaption { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); color: var(--text-2); font-size: 12.5px; }
+.snippet figcaption strong { color: var(--text); }
+.snippet-lines { margin-left: auto; color: var(--text-3); font-size: 11.5px; }
+.snippet pre { margin: 0; padding: 12px; overflow-x: auto; background: none; border: 0; }
+.snippet pre code { font-size: 12.5px; line-height: 1.55; }
+.snippet > button { display: flex; align-items: center; gap: 6px; width: 100%; padding: 7px 12px; border: 0; border-top: 1px solid var(--line); background: var(--surface-2); color: var(--accent); font-size: 12.5px; font-weight: 600; }
+
 /* ---------------- composer ---------------- */
 
 .composer { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--line-strong); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--sh-1); }
@@ -304,6 +312,10 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 
 .rail-backdrop { display: none; }
 
+.composer-snippet { display: flex; flex-wrap: wrap; gap: 10px; }
+.composer-snippet label { display: grid; gap: 4px; }
+.composer-snippet label span { font-size: 12px; font-weight: 600; }
+.composer-snippet input { padding: 6px 9px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface-2); color: var(--text); }
 .composer-schedule { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px; border: 1px dashed var(--line-strong); border-radius: var(--r-md); background: var(--sunken); }
 .composer-schedule label { font-size: 12.5px; font-weight: 600; }
 .composer-schedule input { padding: 6px 9px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface); color: var(--text); }
@@ -322,6 +334,17 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 .scheduled-body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .scheduled-reason { margin: 5px 0 0; color: var(--text-2); font-size: 12.5px; }
 .scheduled-list button { padding: 5px 11px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface); font-size: 12.5px; }
+
+.emoji-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-bottom: 14px; }
+.emoji-form label { display: grid; gap: 4px; }
+.emoji-form label span { font-size: 12px; font-weight: 600; }
+.emoji-form input { padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface-2); color: var(--text); }
+.emoji-form .primary { padding: 8px 14px; border: 0; border-radius: var(--r-sm); background: var(--accent); color: var(--on-accent); font-weight: 600; }
+.emoji-form .primary:disabled { opacity: .55; cursor: not-allowed; }
+.emoji-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.emoji-list li { display: flex; align-items: center; gap: 10px; padding: 7px 11px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); }
+.emoji-alias { font-size: 18px; }
+.emoji-list button { margin-left: auto; padding: 4px 8px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface); color: var(--text-3); }
 
 /* ---------------- account pages ---------------- */
 

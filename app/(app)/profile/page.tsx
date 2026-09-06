@@ -19,6 +19,15 @@ export default async function ProfilePage() {
         </ul>
       </section>
 
+      <section className="panel">
+        <h2>Workspace</h2>
+        <ul className="list">
+          <li>
+            <a href="/emoji">Custom emoji<span className="tag">admin</span></a>
+          </li>
+        </ul>
+      </section>
+
       <section className="panel" id="preferences">
         <h2>Preferences</h2>
         <p>

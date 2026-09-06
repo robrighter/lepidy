@@ -12,7 +12,10 @@ import {
 } from "@/src/shell/workspace-shell-source";
 import { parseIdempotencyKey } from "@/src/domain/idempotency-key";
 
-export type SendResult = { ok: true; messageId: string } | { ok: false; reason: string };
+export type SendResult =
+  | { ok: true; messageId: string }
+  | { ok: true; acted: "join" | "leave" | "archive" }
+  | { ok: false; reason: string };
 
 /**
  * Post a message as the signed-in viewer.
@@ -60,19 +63,23 @@ export async function sendChannelMessage(input: {
 
   try {
     const stub = env.WORKSPACE.get(env.WORKSPACE.idFromString(resolved.row.durable_object_id));
-    const sent = await stub.sendMessage({
+    // Whatever was typed goes through the composer entry point, so a slash
+    // command reaches exactly the authority the equivalent button would.
+    const outcome = await stub.runComposerInput({
       actor: {
         memberId: resolved.row.member_id,
         authorizationEpoch: resolved.row.authorization_epoch,
       },
       idempotencyKey: key,
       channelId: input.channelId,
-      bodyMarkdown: input.bodyMarkdown,
+      raw: input.bodyMarkdown,
       threadParentId: input.threadParentId ?? null,
       now: Date.now(),
     });
     revalidatePath("/c/[channel]", "page");
-    return { ok: true, messageId: sent.messageId };
+    if (outcome.kind === "rejected") return { ok: false, reason: outcome.reason };
+    if (outcome.kind === "acted") return { ok: true, acted: outcome.command };
+    return { ok: true, messageId: outcome.messageId };
   } catch (error) {
     return { ok: false, reason: shellErrorReason(error) };
   }

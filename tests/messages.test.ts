@@ -324,6 +324,13 @@ describe("reactions", () => {
       emoji: "\u{1F525}",
       now: NOW + 4,
     });
+    // A named reaction must name an emoji this workspace has defined (C05c).
+    await seeded.stub.createCustomEmoji({
+      actor: seeded.owner,
+      name: "shipit",
+      aliasEmoji: "\u{1F680}",
+      now: NOW + 4,
+    });
     await seeded.stub.reactToMessage({
       actor: seeded.member,
       messageId: sent.messageId,

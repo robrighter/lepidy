@@ -1,6 +1,5 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useState, useTransition } from "react";
 
 import { cancelScheduledAction } from "@/app/(app)/c/[channel]/draft-actions";
@@ -8,13 +7,22 @@ import type { ScheduledMessageRow } from "@/src/cloudflare/workspace-rooms";
 import { browserCsrfToken } from "@/src/shell/browser-csrf";
 
 export function ScheduledList({ scheduled }: { scheduled: readonly ScheduledMessageRow[] }) {
-  const router = useRouter();
+  // Seeded by the server, then advanced by what the action returns.
+  const [current, setCurrent] = useState(scheduled);
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
 
+  if (current.length === 0) {
+    return (
+      <p className="notice" role="status">
+        <span>Nothing scheduled. Messages you schedule for later will wait here.</span>
+      </p>
+    );
+  }
+
   return (
     <ul className="scheduled-list">
-      {scheduled.map((entry) => (
+      {current.map((entry) => (
         <li key={entry.id} data-status={entry.status}>
           <div>
             <p className="scheduled-when">
@@ -42,7 +50,13 @@ export function ScheduledList({ scheduled }: { scheduled: readonly ScheduledMess
                     id: entry.id,
                   });
                   if (!result.ok) setError(result.reason);
-                  else router.refresh();
+                  else {
+                    setCurrent(
+                      result.scheduled.filter(
+                        (entry) => entry.status === "scheduled" || entry.status === "failed",
+                      ),
+                    );
+                  }
                 })
               }
             >

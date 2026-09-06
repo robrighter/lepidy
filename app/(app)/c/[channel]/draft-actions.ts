@@ -3,12 +3,15 @@
 import { revalidatePath } from "next/cache";
 
 import type { DraftSaveResult } from "@/src/cloudflare/workspace";
+import type { ScheduledMessageRow } from "@/src/cloudflare/workspace-rooms";
 import { parseIdempotencyKey } from "@/src/domain/idempotency-key";
 import { isFailure, shellErrorReason, viewerWorkspace } from "@/src/shell/viewer-workspace";
 
 export type DraftResult = { ok: true; saved: DraftSaveResult } | { ok: false; reason: string };
 export type ScheduleResult = { ok: true; id: string; sendAt: number } | { ok: false; reason: string };
-export type CancelResult = { ok: true } | { ok: false; reason: string };
+export type CancelResult =
+  | { ok: true; scheduled: readonly ScheduledMessageRow[] }
+  | { ok: false; reason: string };
 
 /**
  * Drafts follow a person between devices, so they are stored server-side. The
@@ -78,8 +81,11 @@ export async function cancelScheduledAction(input: {
       id: input.id,
       now: Date.now(),
     });
+    // The action hands back the list it produced rather than leaving what the
+    // person sees to depend on revalidation timing.
+    const listed = await workspace.stub.listScheduledMessages({ actor: workspace.actor });
     revalidatePath("/scheduled");
-    return { ok: true };
+    return { ok: true, scheduled: listed.scheduled };
   } catch (error) {
     return { ok: false, reason: shellErrorReason(error) };
   }

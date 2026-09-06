@@ -1,6 +1,6 @@
 "use client";
 
-import { CalendarClock, CloudCheck, CornerDownLeft, Send } from "lucide-react";
+import { CalendarClock, CloudCheck, CornerDownLeft, FileCode2, Send } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -9,6 +9,7 @@ import {
   saveDraftAction,
   scheduleMessageAction,
 } from "@/app/(app)/c/[channel]/draft-actions";
+import { sendSnippetAction } from "@/app/(app)/c/[channel]/snippet-actions";
 import { browserCsrfToken } from "@/src/shell/browser-csrf";
 
 /**
@@ -65,6 +66,9 @@ export function Composer({
   const [draftError, setDraftError] = useState<string | null>(null);
   const [scheduling, setScheduling] = useState(false);
   const [sendAt, setSendAt] = useState("");
+  const [snippetMode, setSnippetMode] = useState(false);
+  const [snippetTitle, setSnippetTitle] = useState("");
+  const [snippetLanguage, setSnippetLanguage] = useState("");
   const input = useRef<HTMLTextAreaElement>(null);
   // What the server last confirmed. Comparing against this is what stops a
   // successful save — which advances the revision — from triggering the next.
@@ -155,6 +159,32 @@ export function Composer({
     input.current?.focus();
   }, [body, channelId, router, sending, update]);
 
+  const postSnippet = useCallback(async () => {
+    if (body.trim().length === 0) return;
+    setSending(true);
+    const result = await sendSnippetAction({
+      csrfToken: browserCsrfToken(),
+      channelId,
+      title: snippetTitle,
+      language: snippetLanguage,
+      body,
+      idempotencyKey: `snippet:${channelId}:${crypto.randomUUID()}`.slice(0, 128),
+    });
+    setSending(false);
+    if (!result.ok) {
+      setStatus(result);
+      return;
+    }
+    setStatus(null);
+    setSnippetMode(false);
+    setSnippetTitle("");
+    setSnippetLanguage("");
+    update("");
+    revisionRef.current = undefined;
+    syncedBody.current = "";
+    router.refresh();
+  }, [body, channelId, router, snippetLanguage, snippetTitle, update]);
+
   const schedule = useCallback(async () => {
     const trimmed = body.trim();
     if (trimmed.length === 0 || sendAt === "") return;
@@ -193,22 +223,44 @@ export function Composer({
       className="composer"
       onSubmit={(event) => {
         event.preventDefault();
-        void submit();
+        void (snippetMode ? postSnippet() : submit());
       }}
     >
       <label className="visually-hidden" htmlFor="composer-input">
         Message #{channelLabel}
       </label>
+      {snippetMode ? (
+        <div className="composer-snippet">
+          <label>
+            <span>Title</span>
+            <input
+              value={snippetTitle}
+              onChange={(event) => setSnippetTitle(event.target.value)}
+              placeholder="Deploy script"
+            />
+          </label>
+          <label>
+            <span>Language</span>
+            <input
+              value={snippetLanguage}
+              onChange={(event) => setSnippetLanguage(event.target.value)}
+              placeholder="sh"
+            />
+          </label>
+        </div>
+      ) : null}
+
       <textarea
         id="composer-input"
         ref={input}
-        rows={2}
+        rows={snippetMode ? 8 : 2}
         value={body}
-        placeholder={`Message #${channelLabel}`}
+        placeholder={snippetMode ? "Paste the snippet here" : `Message #${channelLabel}`}
         onChange={(event) => update(event.target.value)}
         onKeyDown={(event) => {
-          // Enter sends; Shift+Enter is how a code block gets typed at all.
-          if (event.key === "Enter" && !event.shiftKey) {
+          // Enter sends; Shift+Enter is how a code block gets typed at all. In
+          // snippet mode every newline is content, so Enter never sends.
+          if (event.key === "Enter" && !event.shiftKey && !snippetMode) {
             event.preventDefault();
             void submit();
           }
@@ -241,13 +293,22 @@ export function Composer({
       <div className="composer-actions">
         <span className="composer-hint">
           <CornerDownLeft size={12} aria-hidden="true" /> to send · Shift + Enter for a new line ·
-          Markdown and ``` code
+          Markdown, ``` code and /commands
         </span>
         {draftState === "synced" ? (
           <span className="draft-state" role="status">
             <CloudCheck size={12} aria-hidden="true" /> Draft saved
           </span>
         ) : null}
+        <button
+          type="button"
+          className="schedule-toggle"
+          aria-label="Post this as a snippet"
+          aria-expanded={snippetMode}
+          onClick={() => setSnippetMode((open) => !open)}
+        >
+          <FileCode2 size={15} aria-hidden="true" />
+        </button>
         <button
           type="button"
           className="schedule-toggle"
@@ -259,7 +320,7 @@ export function Composer({
         </button>
         <button type="submit" className="primary" disabled={sending || body.trim().length === 0}>
           <Send size={15} aria-hidden="true" />
-          {sending ? "Sending" : "Send"}
+          {sending ? "Sending" : snippetMode ? "Post snippet" : "Send"}
         </button>
       </div>
 
