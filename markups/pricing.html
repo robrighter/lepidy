@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pricing · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="center" style="align-items:start">
+  <div style="max-width:1000px;width:100%">
+    <div style="text-align:center;margin-bottom:34px">
+      <img src="assets/img/mark.svg" width="40" height="40" alt="">
+      <h1 style="font:700 34px/1.15 var(--font-display);margin:14px 0 8px">Agents are free.<br>Humans are the meter.</h1>
+      <p style="color:var(--text-2);max-width:440px;margin:0 auto">
+        Every plan has the whole product — the vault, the agents, the lot.
+        Solo is free. Team starts at $19/month with five people included.</p>
+    </div>
+
+    <div class="plans">
+      <div class="plan">
+        <div class="plan-n">Solo</div>
+        <div class="plan-p">$0</div>
+        <div class="xs muted">1 person · unlimited agents</div>
+        <ul id="f1"></ul>
+        <span class="spacer"></span>
+        <a class="btn" href="signin.html">Start free</a>
+      </div>
+
+      <div class="plan feature">
+        <div class="flexrow gap6"><div class="plan-n">Team</div><span class="pill pill-agent">Popular</span></div>
+        <div class="plan-p">$19 <small>/ month</small></div>
+        <div class="xs muted">5 included · +$4/month per additional person</div>
+        <ul id="f2"></ul>
+        <span class="spacer"></span>
+        <a class="btn btn-primary" href="signin.html">Choose Team</a>
+      </div>
+
+    </div>
+    <div class="grid g3 mt24">
+      <div class="panel"><div class="panel-b">
+        <b style="font:var(--t-h3)">The free plan isn't a trial</b>
+        <p class="small muted mt6">One person gets the entire vault, unlimited agents, local sessions and the
+          full audit trail. The thing you can't do is invite a second human.</p></div></div>
+      <div class="panel"><div class="panel-b">
+        <b style="font:var(--t-h3)">Agents never count</b>
+        <p class="small muted mt6">Nor do deactivated accounts. Published traffic and concurrency limits apply;
+          you pay your agent provider directly for compute.</p></div></div>
+      <div class="panel"><div class="panel-b">
+        <b style="font:var(--t-h3)">A lapsed plan never eats your keys</b>
+        <p class="small muted mt6">Billing stops, agent access switches off, the workspace goes read-only.
+          Nothing is deleted. A vault that loses your credentials when a card expires isn't a vault.</p></div></div>
+    </div>
+  </div>
+</div>
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ page: "pricing" });
+const tick = UI.icon("check");
+const F = {
+ f1: ["Full vault, approvals and audit export", "Unlimited agent identities", "Local runners and customer-funded cloud agents", "Channels, DMs and threads", "1 GB attachment storage"],
+ f2: ["All core features, security and offboarding", "5 humans included; up to 50 supported", "10 humans: $39/month · 20: $79 · 50: $199", "25 GB storage + 5 GB per seat above five", "Optional 100 GB storage packs: $5/month", "Monthly billing · no automatic usage overages"]
+};
+for (const [id, items] of Object.entries(F))
+  document.getElementById(id).innerHTML = items.map(t => `<li>${tick}<span>${t}</span></li>`).join("");
+</script>
+</body>
+</html>

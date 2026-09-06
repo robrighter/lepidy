@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Support queue · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app has-aside">
+  <div data-rail></div>
+
+  <div class="col">
+    <div data-topbar></div>
+
+    <div class="qtabs">
+      <button class="qtab is-active">Main <span class="n">12</span></button>
+      <button class="qtab">Triage <span class="n">4</span></button>
+      <button class="qtab">Planned <span class="n">3</span></button>
+      <button class="qtab" data-icon-before="lock">Security <span class="n">2</span></button>
+      <button class="qtab">Shipped <span class="n">28</span></button>
+      <button class="qtab">Won't do <span class="n">9</span></button>
+    </div>
+
+    <div class="body">
+      <div class="pad" style="padding-top:16px">
+
+        <div class="panel wash mb14">
+          <div class="panel-b" style="padding:16px 18px">
+            <div class="flexrow gap10 wrap">
+              <div style="flex:1;min-width:220px">
+                <div class="strong">Something broken, or something missing?</div>
+                <div class="xs muted mt6">File it here and the team will see it. Vote with 🔥 on anything
+                  you'd also like fixed — one vote each, and the board sorts itself.</div>
+              </div>
+              <button class="btn btn-primary">Submit an entry</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="flexrow gap10 mb14 wrap">
+          <span class="xs muted">Sorted by 🔥, most first</span>
+          <span class="spacer"></span>
+          <div class="seg">
+            <button class="is-active">Ranked</button>
+            <button>Newest</button>
+          </div>
+        </div>
+
+        <div class="item is-sel">
+          <button class="vote voted"><span class="e">🔥</span><span class="c">24</span></button>
+          <div>
+            <div class="item-t">Bulk CSV export for the charges table</div>
+            <dl class="item-f">
+              <dt>Area</dt><dd>Billing</dd>
+              <dt>Impact</dt><dd>Ops team, daily</dd>
+            </dl>
+            <div class="item-m mt10">
+              <span data-av="Priya Singh"></span> Priya Singh · 2 days ago
+              <span>·</span> <a href="#">7 replies</a>
+              <span class="spacer"></span>
+              <button class="statusbtn set pill pill-warn">Triage ▾</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="item">
+          <button class="vote"><span class="e">🔥</span><span class="c">18</span></button>
+          <div>
+            <div class="item-t">Retries silently drop the idempotency key</div>
+            <dl class="item-f">
+              <dt>Area</dt><dd>Payments</dd>
+              <dt>Impact</dt><dd>Duplicate charges, rare but real</dd>
+            </dl>
+            <div class="item-m mt10">
+              <span data-av="Daniel Park"></span> Daniel Park · 4 days ago
+              <span>·</span> <a href="#">21 replies</a>
+              <span class="spacer"></span>
+              <button class="statusbtn set pill pill-info">Planned ▾</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="item">
+          <button class="vote voted"><span class="e">🔥</span><span class="c">18</span></button>
+          <div>
+            <div class="item-t">Let me mute a thread without leaving the channel</div>
+            <dl class="item-f">
+              <dt>Area</dt><dd>Notifications</dd>
+              <dt>Impact</dt><dd>Everyone in #eng</dd>
+            </dl>
+            <div class="item-m mt10">
+              <span data-av="Maya Chen"></span> Maya Chen · 4 days ago
+              <span>·</span> <a href="#">3 replies</a>
+              <span class="spacer"></span>
+              <button class="statusbtn">Set status ▾</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="item">
+          <button class="vote"><span class="e">🔥</span><span class="c">6</span></button>
+          <div>
+            <div class="item-t">Dark mode washes out the code blocks</div>
+            <dl class="item-f">
+              <dt>Area</dt><dd>Design</dd>
+              <dt>Impact</dt><dd>Anyone reading logs at night</dd>
+            </dl>
+            <div class="item-m mt10">
+              <span data-av="Sam Ortiz"></span> Sam Ortiz · yesterday
+              <span>·</span> <span class="muted">no replies yet</span>
+              <span class="spacer"></span>
+              <button class="statusbtn">Set status ▾</button>
+            </div>
+          </div>
+        </div>
+
+        <p class="xs muted mt14">Ties are broken newest-first, so the order is stable while people vote.
+          Each tab is its own leaderboard.</p>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- item detail + thread -->
+  <div class="aside">
+    <div class="aside-h flexrow gap10">
+      <span style="flex:1">Bulk CSV export</span>
+      <button class="iconbtn" data-icon="x"></button>
+    </div>
+    <div class="aside-b">
+      <div class="panel mb14"><div class="panel-b" style="padding:14px">
+        <div class="flexrow gap10 mb10">
+          <span data-av="Priya Singh"></span>
+          <div style="flex:1"><div class="row-t" style="font-size:13px">Priya Singh</div>
+            <div class="xs muted">Submitted 2 days ago</div></div>
+          <span class="pill pill-quiet">Form entry</span>
+        </div>
+        <dl class="item-f" style="margin-top:4px">
+          <dt>Area</dt><dd>Billing</dd>
+          <dt>Impact</dt><dd>Ops team, daily</dd>
+          <dt>Details</dt><dd>We export one row at a time. For the monthly close that's about
+            four hours of clicking. A bulk export of the charges table with a date range would
+            take it to zero.</dd>
+        </dl>
+      </div></div>
+
+      <div class="meta">Status</div>
+      <div class="flexrow gap6 wrap mb6">
+        <span class="pill pill-warn">Triage</span>
+        <span class="xs muted">set by @a.triage, 2 days ago</span>
+      </div>
+      <button class="btn btn-sm mt6">Change status</button>
+
+      <div class="meta">Thread</div>
+      <div class="stack gap14">
+        <div class="msg" style="padding:0;grid-template-columns:30px 1fr">
+          <span data-agentav="30"></span>
+          <div>
+            <div class="msg-hd"><span class="msg-who" style="font-size:12.5px">Triage</span>
+              <span class="pill pill-agent">AGENT</span></div>
+            <div class="prov mb6"><b>a.triage</b><span class="via">via priya</span></div>
+            <div class="msg-b" style="font-size:13px">Two older entries ask for the same thing
+              (#412, #388). I've linked them and moved this one to <b>Triage</b> as the one to keep.
+              The other two are now <b>Won't do — duplicate</b>.</div>
+          </div>
+        </div>
+
+        <div class="msg" style="padding:0;grid-template-columns:30px 1fr">
+          <span data-av="Daniel Park"></span>
+          <div>
+            <div class="msg-hd"><span class="msg-who" style="font-size:12.5px">Daniel Park</span>
+              <span class="msg-t">yesterday</span></div>
+            <div class="msg-b" style="font-size:13px">Nice. The export endpoint already exists for
+              invoices — this is mostly plumbing.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="notice notice-quiet mt18">
+        <span data-icon="agent"></span>
+        <div><b>An agent triaged this while nobody was looking.</b>
+          It read the entry, found the duplicates, replied here and set the status — so the board
+          sorted itself overnight. Nobody copied anything into another tool.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "support-queue", page: "queue",
+  topbar: { icon: "hash", title: "support-queue",
+    pill: '<span class="pill pill-quiet">Form entries</span><span class="pill pill-quiet">Ranked by 🔥</span>',
+    actions: '<button class="btn btn-sm">Room settings</button>' } });
+document.querySelectorAll("[data-agentav]").forEach(n => n.outerHTML = UI.agentAv(+n.dataset.agentav));
+document.querySelectorAll("[data-av]").forEach(n => n.outerHTML = UI.av(n.dataset.av, 22, true));
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+document.querySelectorAll("[data-icon-before]").forEach(n =>
+  n.insertAdjacentHTML("afterbegin", UI.icon(n.dataset.iconBefore)));
+// voting re-ranks the board, which is the whole point of the room
+document.querySelectorAll(".vote").forEach(v => v.addEventListener("click", () => {
+  const c = v.querySelector(".c"), on = v.classList.toggle("voted");
+  c.textContent = +c.textContent + (on ? 1 : -1);
+  const list = v.closest(".pad");
+  [...list.querySelectorAll(".item")]
+    .sort((a, b) => +b.querySelector(".c").textContent - +a.querySelector(".c").textContent)
+    .forEach(n => list.insertBefore(n, list.querySelector("p.xs")));
+}));
+document.querySelectorAll(".qtab, .seg button").forEach(t => t.addEventListener("click", () => {
+  t.parentElement.querySelectorAll("button").forEach(n => n.classList.toggle("is-active", n === t));
+}));
+</script>
+</body>
+</html>

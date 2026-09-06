@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agents · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div data-rail></div>
+  <div class="col">
+    <div data-topbar></div>
+    <div class="body">
+      <div class="pad">
+
+        <div class="notice notice-info mb18">
+          <span data-icon="agent"></span>
+          <div><b>An agent is a member of the workspace, not a plugin.</b>
+          It has a handle you can <span class="mono">@</span>, humans who own it, a brief it works to, and
+          a boundary you can read on one page. Anyone can make one.</div>
+        </div>
+
+        <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(330px,1fr))" id="agentGrid"></div>
+
+        <h2 class="mt24 mb10" style="font:var(--t-h2)">Archived</h2>
+        <div class="panel"><div class="panel-b">
+          <div class="flexrow gap10">
+            <span data-agentav="30" style="opacity:.5"></span>
+            <div style="flex:1"><div class="row-t muted">@a.standup</div>
+              <div class="row-s">Archived by Daniel Park, 12 Aug. Its messages stay; the handle stays taken.</div></div>
+            <button class="btn btn-sm">Restore</button>
+          </div>
+        </div></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "agents", page: "agents",
+  topbar: { icon: "agent", title: "Agents", sub: "4 live · 1 archived",
+    actions: '<button class="btn btn-sm btn-primary">Create agent</button>' } });
+
+const RUNTIME = {
+  local:        { label: "Local session", cls: "pill-agent" },
+  claude_cloud: { label: "Claude Cloud",  cls: "pill-info"  },
+  connected:    { label: "Connected",     cls: "pill-quiet" }
+};
+
+document.getElementById("agentGrid").innerHTML = LEPIDY.AGENTS.map(a => {
+  const live = a.session === "waiting";
+  const rt = RUNTIME[a.runtime];
+  const where = a.runtime === "local"
+    ? `${a.harness} on <span class="mono">${a.runner}</span>`
+    : (a.schedule ? `${a.harness} · ${a.schedule}` : `${a.harness} · on mention`);
+  return `
+  <a class="panel ${live ? "livecard" : ""}" href="agent.html" style="display:block">
+    <div class="panel-b">
+      <div class="flexrow gap10 mb10">
+        ${UI.agentAv(38)}
+        <div style="flex:1;min-width:0">
+          <div class="row-t">${a.name}
+            ${live ? '<span class="pill pill-agent">Live</span>' : ""}</div>
+          <div class="xs muted mono">@${a.handle}</div>
+        </div>
+        ${a.queue ? `<span class="badge ${live ? "" : "gray"}">${a.queue}</span>` : ""}
+      </div>
+      <div class="small" style="color:var(--text-2);min-height:38px">${a.desc}</div>
+      ${live ? '<div class="flight mt10 mb10"></div>' : '<div class="mt10"></div>'}
+      <div class="tagrow mb10">
+        <span class="pill ${rt.cls}">${rt.label}</span>
+        <span class="pill pill-quiet">${a.scope === "any" ? "Any room its owners can reach" : a.rooms.join(" · ")}</span>
+      </div>
+      <div class="xs muted">${where}</div>
+      <hr class="sep" style="margin:12px 0">
+      <div class="flexrow gap6 xs muted">
+        <span>Owned by</span>
+        <span class="avstack">${a.owners.map(o => UI.av(o, 20, true)).join("")}</span>
+        <span>${a.owners.join(", ")}</span>
+      </div>
+    </div>
+  </a>`;
+}).join("");
+
+document.querySelectorAll("[data-agentav]").forEach(n => n.outerHTML = UI.agentAv(+n.dataset.agentav));
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+</script>
+</body>
+</html>

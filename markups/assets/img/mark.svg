@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Lepidy">
+  <defs>
+    <linearGradient id="lu" x1=".1" y1="1" x2=".9" y2="0">
+      <stop offset="0" stop-color="#6D28D9"/><stop offset="1" stop-color="#7AA2F7"/></linearGradient>
+    <linearGradient id="ll" x1=".2" y1="0" x2=".9" y2="1">
+      <stop offset="0" stop-color="#7C3AED"/><stop offset="1" stop-color="#C4B5FD"/></linearGradient>
+    <linearGradient id="ru" x1=".9" y1="1" x2=".1" y2="0">
+      <stop offset="0" stop-color="#FF7A9C"/><stop offset="1" stop-color="#FFC2B0"/></linearGradient>
+    <linearGradient id="rl" x1=".8" y1="0" x2=".1" y2="1">
+      <stop offset="0" stop-color="#FF8FA3"/><stop offset="1" stop-color="#FFD8CC"/></linearGradient>
+  </defs>
+  <g>
+    <path d="M31 33 C29 17 21 4 11 6 C1 8 1 24 12 31 C18 35 26 36 31 33 Z" fill="url(#lu)"/>
+    <path d="M31 33 C28 42 22 56 14 55 C6 54 6 41 15 36 C20 33 27 31 31 33 Z" fill="url(#ll)"/>
+    <path d="M33 33 C35 17 43 4 53 6 C63 8 63 24 52 31 C46 35 38 36 33 33 Z" fill="url(#ru)"/>
+    <path d="M33 33 C36 42 42 56 50 55 C58 54 58 41 49 36 C44 33 37 31 33 33 Z" fill="url(#rl)"/>
+  </g>
+</svg>

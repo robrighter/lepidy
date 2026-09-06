@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>People · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div data-rail></div>
+  <div class="col">
+    <div data-topbar></div>
+    <div class="tabs">
+      <button class="tab is-active">People <span class="badge gray" style="margin-left:6px">9</span></button>
+      <button class="tab">Groups</button>
+      <a class="tab" href="agents.html">Agents</a>
+      <button class="tab">Invitations</button>
+    </div>
+    <div class="body">
+      <div class="pad">
+        <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))" id="peopleGrid"></div>
+
+        <h2 class="mt24 mb10" style="font:var(--t-h2)">Groups</h2>
+        <div class="panel mb18">
+          <div class="rows">
+            <div class="row"><span data-icon="agent" class="muted"></span>
+              <div class="row-main"><div class="row-t mono">@g.backend</div>
+                <div class="row-s">4 people · may use STRIPE_LIVE_KEY and STAGING_DB_URL</div></div>
+              <div class="row-r"><span class="avstack" data-avstack="Maya Chen,Daniel Park,Sam Ortiz,Lena Vogt"></span></div></div>
+            <div class="row"><span data-icon="agent" class="muted"></span>
+              <div class="row-main"><div class="row-t mono">@g.support</div>
+                <div class="row-s">3 people · owns @a.triage</div></div>
+              <div class="row-r"><span class="avstack" data-avstack="Priya Singh,Tom Reid,Ana Silva"></span></div></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-h"><b style="font:var(--t-h3)">Waiting to join</b>
+            <span class="spacer"></span>
+            <span class="pill pill-warn">5 seats included on Team</span></div>
+          <div class="rows">
+            <div class="row"><span data-av="Lena Vogt"></span>
+              <div class="row-main"><div class="row-t">lena@acme.dev</div>
+                <div class="row-s">Invited by Maya Chen, 2 days ago · #eng, #release</div></div>
+              <div class="row-r"><button class="btn btn-sm">Resend</button>
+                <button class="btn btn-sm btn-ghost">Cancel</button></div></div>
+          </div>
+          <div class="panel-f flexrow gap10">
+            <span class="xs muted">Adding a sixth person raises Team from $19 to $23/month. The invitation
+              is held, not lost, until an admin confirms.</span>
+            <span class="spacer"></span>
+            <button class="btn btn-sm btn-primary">Invite people</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "", page: "people",
+  topbar: { title: "People", sub: "Acme workspace · 5 of 5 seats",
+    actions: '<button class="btn btn-sm btn-primary">Invite people</button>' } });
+
+const PPL = [
+  { n: "Maya Chen",   r: "Engineering", tz: "Berlin · 18:06", s: "on",   st: "Shipping the payments fix", owns: "2 agents" },
+  { n: "Daniel Park", r: "Engineering", tz: "Berlin · 18:06", s: "busy", st: "Focus until 09:00", owns: "2 agents" },
+  { n: "Priya Singh", r: "Support",     tz: "London · 17:06", s: "on",   st: "On the queue", owns: "1 agent" },
+  { n: "Sam Ortiz",   r: "Design",      tz: "Lisbon · 17:06", s: "off",  st: "Away until Monday", owns: "—" },
+  { n: "Ana Silva",   r: "Support",     tz: "São Paulo · 13:06", s: "on", st: "", owns: "—" },
+  { n: "Tom Reid",    r: "Support",     tz: "London · 17:06", s: "off", st: "", owns: "—" }
+];
+const DOT = { on: "Active", busy: "Focus", off: "Away" };
+document.getElementById("peopleGrid").innerHTML = PPL.map(p => `
+  <a class="panel" href="dm.html" style="display:block">
+    <div class="panel-b">
+      <div class="flexrow gap10 mb10">
+        ${UI.av(p.n, 40, true)}
+        <div style="flex:1;min-width:0">
+          <div class="row-t">${p.n}</div>
+          <div class="xs muted">${p.r}</div>
+        </div>
+        <span class="dot ${p.s}" title="${DOT[p.s]}"></span>
+      </div>
+      ${p.st ? `<div class="small" style="color:var(--text-2)">${p.st}</div>` : `<div class="small muted">—</div>`}
+      <hr class="sep" style="margin:12px 0">
+      <div class="flexrow gap10 xs muted"><span>${p.tz}</span><span class="spacer"></span><span>${p.owns}</span></div>
+    </div>
+  </a>`).join("");
+
+document.querySelectorAll("[data-av]").forEach(n => n.outerHTML = UI.av(n.dataset.av, 30, true));
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+document.querySelectorAll("[data-avstack]").forEach(n =>
+  n.innerHTML = n.dataset.avstack.split(",").map(x => UI.av(x, 24, true)).join(""));
+</script>
+</body>
+</html>

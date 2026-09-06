@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Approve on your phone · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="center">
+  <div style="text-align:center;max-width:520px">
+    <img src="assets/img/mark.svg" width="42" height="42" alt="" style="margin-bottom:14px">
+    <h1 style="font:700 26px/1.2 var(--font-display);margin-bottom:8px">Ask from anywhere. Approve with your face.</h1>
+    <p class="small muted mb18">You're out. The session runs on the desktop at home. Both of those are fine.</p>
+
+    <div class="phone">
+      <div class="phone-notch"><span></span></div>
+      <div class="phone-s">
+        <div style="padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px">
+          <img src="assets/img/mark.svg" width="20" height="20" alt="">
+          <b style="font:650 14px var(--font-display)">Lepidy</b>
+          <span class="spacer"></span>
+          <span class="pill pill-ok">Agents on</span>
+        </div>
+
+        <div style="flex:1;overflow:auto;padding:14px">
+          <div class="panel livecard mb14">
+            <div class="panel-b" style="padding:14px">
+              <div class="flexrow gap6 mb10">
+                <span data-icon="key" style="color:var(--accent)"></span>
+                <b class="mono" style="font-size:13.5px">PROD_DB_URL</b>
+              </div>
+              <div class="small" style="color:var(--text-2);line-height:1.7">
+                <div><span class="prov"><b>a.releasebot</b><span class="via">via daniel</span></span></div>
+                <div class="mt6"><span class="muted">on</span> <span class="mono">maya-mbp</span></div>
+                <div class="mt6">“run the payments backfill Daniel asked for in #eng”</div>
+                <div class="mt6 muted">Injected into psql. Never shown to the agent.</div>
+              </div>
+              <div class="stack gap6 mt14">
+                <button class="btn btn-ok" style="width:100%">Allow for 15 minutes</button>
+                <button class="btn" style="width:100%">Allow once</button>
+                <button class="btn btn-danger" style="width:100%">Deny</button>
+              </div>
+              <p class="xs muted mt10" style="text-align:center">Face ID confirms · 4:38 left</p>
+            </div>
+          </div>
+
+          <div class="meta">Earlier</div>
+          <div class="panel"><div class="rows">
+            <div class="row" style="padding:11px 13px">
+              <span data-agentav="26"></span>
+              <div class="row-main"><div class="row-t" style="font-size:12.5px">Release Bot · #eng</div>
+                <div class="row-s xs">Migration landed at 02:14 UTC</div></div>
+            </div>
+            <div class="row" style="padding:11px 13px">
+              <span data-icon="check" style="color:var(--mint)"></span>
+              <div class="row-main"><div class="row-t" style="font-size:12.5px">You allowed STAGING_DB_URL</div>
+                <div class="row-s xs">15 minutes · expired</div></div>
+            </div>
+          </div></div>
+        </div>
+
+        <div style="padding:12px 14px;border-top:1px solid var(--line)">
+          <div class="flexrow gap10" style="border:1px solid var(--line-strong);border-radius:var(--r-pill);padding:7px 13px">
+            <span class="small muted" style="flex:1">@a.releasebot check staging</span>
+            <span data-icon="send" style="color:var(--accent)"></span>
+          </div>
+          <p class="xs muted mt6" style="text-align:center">A composer, deliberately small. It's a decision
+            surface, not a chat client.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ page: "mobile" });
+document.querySelectorAll("[data-agentav]").forEach(n => n.outerHTML = UI.agentAv(+n.dataset.agentav));
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+</script>
+</body>
+</html>

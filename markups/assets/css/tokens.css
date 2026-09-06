@@ -1,0 +1,110 @@
+/* Lepidy — design tokens, straight from brandkit/.
+   Colours are the brand kit's ten, with their stated roles. Nothing invented. */
+
+:root {
+  /* ---- brand palette ---- */
+  --indigo:      #1E1B4B;   /* trust, depth      — UI base */
+  --violet:      #7C3AED;   /* imagination       — interactive, progress */
+  --lilac:       #C4B5FD;   /* creativity        — surfaces, softness */
+  --coral:       #FF8FA3;   /* energy, warmth    — highlights */
+  --mint:        #34D399;   /* growth, balance   — success */
+  --cream:       #FFF9F4;   /* airiness, calm    — background */
+  --periwinkle:  #E0E7FF;   /* clarity, focus */
+  --blush:       #FFE4E6;   /* humanity, joy */
+  --slate:       #64748B;   /* stability         — text, structure */
+  --mist:        #F1F5F9;   /* simplicity, space */
+
+  /* ---- derived ---- */
+  --indigo-90: #2A2660;
+  --indigo-70: #46418C;
+  --violet-12: rgba(124, 58, 237, .12);
+  --violet-08: rgba(124, 58, 237, .08);
+  --violet-dark: #6D28D9;
+  --coral-14: rgba(255, 143, 163, .14);
+  --mint-14:  rgba(52, 211, 153, .14);
+  --amber:    #F59E0B;
+  --amber-14: rgba(245, 158, 11, .14);
+
+  /* ---- semantic ---- */
+  --canvas:      var(--cream);
+  --surface:     #FFFFFF;
+  --surface-2:   #FDFBFF;
+  --sunken:      #F7F4FB;
+  --line:        #ECE7F5;
+  --line-strong: #DED6EE;
+  --text:        var(--indigo);
+  --text-2:      #575377;
+  --text-3:      var(--slate);
+  --accent:      var(--violet);
+  --on-accent:   #FFFFFF;
+
+  /* ---- type ---- */
+  --font-display: "Sora", ui-sans-serif, system-ui, sans-serif;
+  --font-body:    "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --t-display: 700 30px/1.15 var(--font-display);
+  --t-h1:      700 22px/1.25 var(--font-display);
+  --t-h2:      650 17px/1.3  var(--font-display);
+  --t-h3:      650 14px/1.35 var(--font-display);
+  --t-body:    400 14px/1.6  var(--font-body);
+  --t-sm:      400 13px/1.55 var(--font-body);
+  --t-xs:      500 11.5px/1.4 var(--font-body);
+  --t-mono:    400 12.5px/1.6 var(--font-mono);
+
+  /* ---- shape & depth: shadows are violet-tinted, never neutral grey ---- */
+  --r-sm: 8px;  --r-md: 10px;  --r-lg: 14px;  --r-xl: 20px;  --r-pill: 999px;
+  --sh-1: 0 1px 2px rgba(30, 27, 75, .05), 0 1px 3px rgba(124, 58, 237, .05);
+  --sh-2: 0 2px 6px rgba(30, 27, 75, .05), 0 8px 20px rgba(124, 58, 237, .07);
+  --sh-3: 0 4px 12px rgba(30, 27, 75, .07), 0 18px 44px rgba(124, 58, 237, .11);
+  --sh-focus: 0 0 0 3px rgba(124, 58, 237, .30);
+
+  --rail-w: 258px;
+  --aside-w: 320px;
+  --topbar-h: 56px;
+}
+
+/* Dark: the app icon is dark-first, so this is a real mode, not an inversion. */
+:root[data-theme="dark"] {
+  --canvas:      #14122E;
+  --surface:     #1B1840;
+  --surface-2:   #201C4A;
+  --sunken:      #17143A;
+  --line:        #2C2760;
+  --line-strong: #3B3480;
+  --text:        #F1EEFF;
+  --text-2:      #C3BCE8;
+  --text-3:      #948DBE;
+  --accent:      #9B6BFF;
+  --violet-12: rgba(155, 107, 255, .18);
+  --violet-08: rgba(155, 107, 255, .12);
+  --periwinkle: #2B2A6B;
+  --mist: #221E52;
+  --blush: #4A2C3A;
+  --sh-1: 0 1px 2px rgba(0,0,0,.3);
+  --sh-2: 0 2px 8px rgba(0,0,0,.35);
+  --sh-3: 0 12px 40px rgba(0,0,0,.45);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--text);
+  font: var(--t-body);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+h1,h2,h3,h4 { margin: 0; font-family: var(--font-display); color: var(--text); }
+p { margin: 0 0 .8em; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: none; box-shadow: var(--sh-focus); border-radius: var(--r-sm); }
+code, kbd, pre { font-family: var(--font-mono); }
+::selection { background: var(--lilac); color: var(--indigo); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}

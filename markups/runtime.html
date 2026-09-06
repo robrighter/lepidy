@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Runtime · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div data-rail></div>
+  <div class="col">
+    <div data-topbar></div>
+
+    <div class="tabs">
+      <a class="tab" href="agent.html">Overview</a>
+      <a class="tab" href="agent.html">Brief &amp; rules</a>
+      <a class="tab" href="agent.html">Scope &amp; access</a>
+      <button class="tab is-active">Runtime</button>
+      <a class="tab" href="agent.html">Activity</a>
+    </div>
+
+    <div class="body">
+      <div class="pad-narrow">
+
+        <div class="field">
+          <label class="label">How this agent runs</label>
+          <p class="xs muted mb10">The question isn't where the model runs. It's whether a person is at the
+            keyboard — that's what decides where its authority comes from.</p>
+          <div class="radio">
+            <div class="radio-opt" data-reveal="connected">
+              <div class="radio-t"><span data-icon="term"></span> Connected</div>
+              <div class="radio-s">Works only while an owner has an MCP client open. Authority: the live owner.</div>
+            </div>
+            <div class="radio-opt is-active" data-reveal="local">
+              <div class="radio-t"><span data-icon="laptop"></span> Local session</div>
+              <div class="radio-s">A mention starts a harness on a machine you run. Your repos, your toolchain.</div>
+            </div>
+            <div class="radio-opt" data-reveal="cloud">
+              <div class="radio-t"><span data-icon="clock"></span> Claude Cloud</div>
+              <div class="radio-s">Anthropic runs it, in your account. Can run on a schedule with every laptop shut.</div>
+            </div>
+            <div class="radio-opt" data-reveal="custom">
+              <div class="radio-t"><span data-icon="send"></span> Custom</div>
+              <div class="radio-s">Your webhook. You run the loop.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- LOCAL -->
+        <div data-revealgroup="local">
+          <div class="notice notice-warn mb18">
+            <span data-icon="laptop"></span>
+            <div><b>@a.docs is waiting for permission on dan-desktop.</b>
+              A machine allows an agent to start sessions on itself, in the Lepidy desktop app on that machine —
+              never from here. Until then nothing starts.
+              <div class="mt10"><button class="btn btn-sm">Send Daniel a reminder</button></div></div>
+          </div>
+
+          <div class="panel mb18">
+            <div class="panel-h"><b style="font:var(--t-h3)">Where it runs</b></div>
+            <div class="panel-b">
+              <div class="grid g2">
+                <div class="field">
+                  <label class="label">Machine</label>
+                  <select class="select"><option>maya-mbp — macOS · online</option>
+                    <option>dan-desktop — Linux · online</option>
+                    <option>build-01 — lepidy agentd · online</option></select>
+                  <p class="hint"><span class="dot on" style="display:inline-block"></span>
+                    Online, last seen 2 seconds ago.</p>
+                </div>
+                <div class="field">
+                  <label class="label">Working directory</label>
+                  <input class="input mono" value="~/dev/api">
+                  <p class="hint">The machine keeps its own list of directories a session may run in.
+                    A path that isn't on it is refused there, not here.</p>
+                </div>
+              </div>
+
+              <div class="field">
+                <label class="label">Harness</label>
+                <div class="radio">
+                  <div class="radio-opt is-active"><div class="radio-t">Claude Code</div>
+                    <div class="radio-s"><span class="mono">claude</span> on PATH</div></div>
+                  <div class="radio-opt"><div class="radio-t">Codex</div>
+                    <div class="radio-s"><span class="mono">codex</span> on PATH</div></div>
+                  <div class="radio-opt"><div class="radio-t">Open Coder</div>
+                    <div class="radio-s">Any binary you name</div></div>
+                </div>
+              </div>
+
+              <div class="field">
+                <label class="label">Launch command</label>
+                <div class="code">claude <span class="k">--print</span> \
+  <span class="k">--mcp-config</span> <span class="s">&lt;generated by Lepidy&gt;</span> \
+  <span class="k">--append-system-prompt</span> <span class="s">&lt;the agent's brief&gt;</span> \
+  <span class="k">--permission-mode</span> <span class="s">default</span>   <span class="c"># the safe one</span></div>
+                <div class="flexrow gap10 mt10">
+                  <button class="btn btn-sm">Edit</button>
+                  <button class="btn btn-sm btn-ghost">Reset to preset</button>
+                  <span class="xs muted">Preset v14 · updated 2 Sep</span>
+                </div>
+                <p class="hint">Presets come from Lepidy, not from the app you installed — so when a harness
+                  renames a flag, this is fixed the same day rather than waiting on an app store review.</p>
+              </div>
+
+              <div class="field" style="margin-bottom:0">
+                <label class="label">Credentials this session may use</label>
+                <div class="tagrow mb10">
+                  <span class="pill pill-info mono">GITHUB_TOKEN ✕</span>
+                  <span class="pill pill-info mono">STAGING_DB_URL ✕</span>
+                </div>
+                <button class="btn btn-sm">Add a credential</button>
+                <p class="hint">Injected on the machine by <span class="mono">lepidy run --with</span> —
+                  the value goes into the child process's environment and never into the agent's context.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel mb18">
+            <div class="panel-h"><b style="font:var(--t-h3)">Sessions</b>
+              <span class="spacer"></span><span class="pill pill-agent">Live now · 6m</span></div>
+            <div class="panel-b">
+              <div class="switchrow">
+                <div><div class="strong small">Reuse a running session</div>
+                  <div class="xs muted">A new mention goes to the session that's already open instead of
+                    starting a second one. Recommended.</div></div>
+                <button class="switch on" aria-label="Reuse a running session"></button>
+              </div>
+              <div class="switchrow">
+                <div><div class="strong small">Start on mention</div>
+                  <div class="xs muted">Off means the agent only works when an owner starts it by hand.</div></div>
+                <button class="switch on" aria-label="Start on mention"></button>
+              </div>
+              <div class="switchrow">
+                <div><div class="strong small">Only while I'm signed in at this machine</div>
+                  <div class="xs muted">Narrower, and it gives up the point: you couldn't ask from your phone
+                    while the laptop sits closed.</div></div>
+                <button class="switch" aria-label="Only while signed in"></button>
+              </div>
+
+              <div class="grid g3 mt18">
+                <div class="field" style="margin:0"><label class="label">Idle before it exits</label>
+                  <select class="select"><option>15 minutes</option><option>5 minutes</option><option>1 hour</option></select></div>
+                <div class="field" style="margin:0"><label class="label">Max at once</label>
+                  <select class="select"><option>1</option><option>2</option><option>3</option></select></div>
+                <div class="field" style="margin:0"><label class="label">Max starts per hour</label>
+                  <select class="select"><option>6</option><option>12</option><option>30</option></select></div>
+              </div>
+
+              <div class="field mt18" style="margin-bottom:0">
+                <label class="label">Who can start a session</label>
+                <select class="select"><option>Anyone in the agent's rooms</option>
+                  <option>Owners only</option><option>A group…</option></select>
+                <p class="hint">This is the setting that decides who may cause a process to run on
+                  <span class="mono">maya-mbp</span>. Worth a thought.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel mb18">
+            <div class="panel-h"><b style="font:var(--t-h3)">What happens when someone mentions it</b></div>
+            <div class="panel-b">
+              <table class="tbl" style="margin:-11px -14px">
+                <thead><tr><th>If the session is…</th><th>Then</th><th>Why</th></tr></thead>
+                <tbody>
+                  <tr><td><span class="pill pill-agent">Waiting</span></td>
+                    <td>It gets the message straight away. Nothing starts.</td>
+                    <td class="muted">The session is parked in a long poll, so it's already listening.</td></tr>
+                  <tr><td><span class="pill pill-warn">Working</span></td>
+                    <td>The message waits its turn.</td>
+                    <td class="muted">Interrupting a working agent is worse than making the next thing wait.</td></tr>
+                  <tr><td><span class="pill pill-info">Starting</span></td>
+                    <td>Nothing. The starting session will take it too.</td>
+                    <td class="muted">Three mentions in five seconds make one session, not three.</td></tr>
+                  <tr><td><span class="pill pill-quiet">Not running</span></td>
+                    <td>Lepidy wakes <span class="mono">maya-mbp</span> and it starts one.</td>
+                    <td class="muted">The only path that starts a process.</td></tr>
+                  <tr><td><span class="pill pill-alert">Machine offline</span></td>
+                    <td>The work is kept, and the agent says so in the room.</td>
+                    <td class="muted">“The laptop is closed” isn't a secret, and silence would just leave someone waiting.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="notice notice-alert mb18">
+            <span data-icon="shield"></span>
+            <div><b>A mention starts a real process on a real machine.</b>
+              Lepidy decides <i>when</i> a session may start, <i>where</i>, and <i>which credentials</i> it can get.
+              It does not sandbox what the harness does once it's running — that's the harness's permission mode
+              and the operating system. For a tighter box, point a runner at a container instead.</div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-h"><b style="font:var(--t-h3)">Recent sessions</b></div>
+            <table class="tbl">
+              <thead><tr><th>Started</th><th>Machine</th><th>Because</th><th>Items</th><th>Ran for</th><th></th></tr></thead>
+              <tbody>
+                <tr><td class="mono">9:12</td><td class="mono">maya-mbp</td><td>Mention by Daniel Park</td>
+                  <td>2</td><td>6m, live</td><td><button class="btn btn-sm btn-danger">Stop</button></td></tr>
+                <tr><td class="mono">06:01</td><td class="mono">maya-mbp</td><td>Mention by @a.cron</td>
+                  <td>1</td><td>48s</td><td class="muted xs">exit 0</td></tr>
+                <tr><td class="mono">Mon 17:40</td><td class="mono">maya-mbp</td><td>Queue drain on exit</td>
+                  <td>1</td><td>2m 11s</td><td class="muted xs">exit 0</td></tr>
+                <tr><td class="mono">Mon 17:38</td><td class="mono">maya-mbp</td><td>Mention by Priya Singh</td>
+                  <td>3</td><td>4m 02s</td><td class="muted xs">exit 0</td></tr>
+              </tbody>
+            </table>
+            <div class="panel-f xs muted">“Queue drain on exit” is the safety net: when a session ends,
+              the machine checks whether anything arrived in its last moments and starts again if so.</div>
+          </div>
+        </div>
+
+        <!-- CLAUDE CLOUD -->
+        <div data-revealgroup="cloud" hidden>
+
+          <div class="notice notice-info mb18">
+            <span data-icon="shield"></span>
+            <div><b>This agent runs in your Anthropic account, not ours.</b>
+              Lepidy never runs the loop. We hold the identity, the queue, the permissions and the
+              credentials; Anthropic runs the agent and hosts its sandbox. Your bill, your data,
+              your retention settings.</div>
+          </div>
+
+          <div class="panel mb18">
+            <div class="panel-h"><b style="font:var(--t-h3)">Connection</b>
+              <span class="spacer"></span><span class="pill pill-ok">Verified 2 Sep</span></div>
+            <div class="panel-b">
+              <div class="grid g2">
+                <div class="field"><label class="label">Managed agent</label>
+                  <select class="select"><option>Triage &mdash; agent_01H8x&hellip; (v3)</option>
+                    <option>Compliance scan &mdash; agent_01J2p&hellip;</option></select>
+                  <p class="hint">Created in your Anthropic org. Lepidy points at it; it never copies it.</p></div>
+                <div class="field"><label class="label">Environment</label>
+                  <select class="select"><option>support-tools &mdash; env_01K4m&hellip;</option></select></div>
+              </div>
+
+              <div class="field" style="margin-bottom:0">
+                <label class="label">Webhook endpoint</label>
+                <div class="kbdline">https://acme.lepidy.app/hooks/anthropic</div>
+                <div class="flexrow gap10 mt10 wrap">
+                  <button class="btn btn-sm">Copy URL</button>
+                  <button class="btn btn-sm">Copy the event list</button>
+                  <span class="pill pill-ok">Test event received</span>
+                </div>
+                <p class="hint">Paste this into the Anthropic Console under Manage &rarr; Webhooks, subscribe to
+                  the events we list, then paste the signing secret below. Anthropic has no API for registering
+                  an endpoint, so this part is by hand &mdash; and we won't mark it done until a signed event
+                  actually arrives here.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel mb18">
+            <div class="panel-h"><b style="font:var(--t-h3)">When it runs</b></div>
+            <div class="panel-b">
+              <div class="switchrow">
+                <div><div class="strong small">When someone mentions it</div>
+                  <div class="xs muted">Starts a session with the mention as its opening message.</div></div>
+                <button class="switch on" aria-label="Run on mention"></button>
+              </div>
+              <div class="switchrow">
+                <div><div class="strong small">On a schedule</div>
+                  <div class="xs muted">Runs whether or not anyone asks. This is the thing a laptop can't do.</div></div>
+                <button class="switch on" aria-label="Run on a schedule"></button>
+              </div>
+
+              <div class="grid g2 mt18">
+                <div class="field" style="margin:0"><label class="label">Repeat</label>
+                  <select class="select"><option>Every day at 02:00</option><option>Every weekday at 09:00</option>
+                    <option>Every Friday at 20:00</option><option>Custom (cron)&hellip;</option></select></div>
+                <div class="field" style="margin:0"><label class="label">Time zone</label>
+                  <select class="select"><option>America/New_York</option><option>Europe/Berlin</option>
+                    <option>UTC</option></select></div>
+              </div>
+
+              <div class="field mt18" style="margin-bottom:0">
+                <label class="label">Next three runs</label>
+                <div class="kbdline">Wed 6 Sep, 02:00 EDT
+Thu 7 Sep, 02:00 EDT
+Fri 8 Sep, 02:00 EDT</div>
+                <p class="hint">Read these back before you trust the schedule. Start times are spread out by up to
+                  nine minutes to level load, so treat them as &ldquo;about then&rdquo;, never as a deadline.</p>
+              </div>
+
+              <div class="notice notice-warn mt14">
+                <span data-icon="clock"></span>
+                <div><b>02:00 is inside the daylight-saving window.</b>
+                  On the spring-forward day 02:00 doesn't exist and the run is skipped; on the fall-back day it
+                  happens twice. Move it outside 01:00&ndash;03:00, or switch to UTC.
+                  <div class="mt10"><button class="btn btn-sm">Use 03:30 instead</button>
+                    <button class="btn btn-sm btn-ghost">Switch to UTC</button></div></div>
+              </div>
+
+              <div class="flexrow gap10 mt18 wrap">
+                <button class="btn btn-sm">Run it now</button>
+                <button class="btn btn-sm">Pause the schedule</button>
+                <span class="xs muted">&ldquo;Run it now&rdquo; works even while paused &mdash; it's how you test
+                  before trusting it.</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel mb18">
+            <div class="panel-h"><b style="font:var(--t-h3)">Credentials</b></div>
+            <div class="panel-b">
+              <div class="flexrow gap10 mb10 wrap">
+                <span class="pill pill-info mono">SENTRY_TOKEN &times;</span>
+                <button class="btn btn-sm">Add a credential</button>
+              </div>
+              <div class="notice notice-quiet">
+                <span data-icon="shield"></span>
+                <div><b>Reached through Lepidy's proxy, not injected.</b>
+                  There's no <span class="mono">lepidy</span> command inside Anthropic's sandbox, so the agent
+                  asks us to make the call and we attach the credential on the way out &mdash; to
+                  <span class="mono">sentry.io</span> and nowhere else. The value never leaves us, which is the
+                  same promise injection makes by a different route.
+                  <div class="mt10 xs">Want it in the child process instead? That's what
+                    <a href="#">Local session</a> is for.</div></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel mb18">
+            <div class="panel-h"><b style="font:var(--t-h3)">Spending limit</b>
+              <span class="spacer"></span><span class="pill pill-ok">Enforced by Anthropic</span></div>
+            <div class="panel-b">
+              <div class="grid g2">
+                <div class="field" style="margin:0"><label class="label">Cap per run</label>
+                  <input class="input" value="$5.00"></div>
+                <div class="field" style="margin:0"><label class="label">Spent this month</label>
+                  <div class="input" style="background:var(--sunken)">$41.20 across 28 runs</div></div>
+              </div>
+              <p class="hint">A hard cap, not a warning &mdash; the run stops at it. A change takes effect on the
+                next run; anything already going keeps the limit it started with. When a run stops on budget the
+                agent says so in the room and offers you a one-click raise.</p>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-h"><b style="font:var(--t-h3)">Run history</b>
+              <span class="spacer"></span><a class="xs" href="#">Failures only</a></div>
+            <table class="tbl">
+              <thead><tr><th>Started</th><th>Because</th><th>Result</th><th>Cost</th><th></th></tr></thead>
+              <tbody>
+                <tr><td class="mono">02:04</td><td>Schedule</td>
+                  <td><span class="pill pill-ok">Posted in #support</span></td><td>$1.42</td>
+                  <td class="xs muted">6m 20s</td></tr>
+                <tr><td class="mono">Mon 14:31</td><td>Priya mentioned it</td>
+                  <td><span class="pill pill-ok">Posted in #support</span></td><td>$0.31</td>
+                  <td class="xs muted">54s</td></tr>
+                <tr><td class="mono">Mon 02:04</td><td>Schedule</td>
+                  <td><span class="pill pill-warn">Stopped at its limit</span></td><td>$5.00</td>
+                  <td class="xs muted">21m</td></tr>
+                <tr><td class="mono">Sun 02:04</td><td>Schedule</td>
+                  <td><span class="pill pill-alert">Didn't start &mdash; environment archived</span></td><td>&mdash;</td>
+                  <td class="xs muted">said so in #support</td></tr>
+              </tbody>
+            </table>
+            <div class="panel-f xs muted">Every attempt is here, including the ones that never started. A nightly
+              job that quietly stopped working is the failure this table exists to catch.</div>
+          </div>
+
+          <div class="notice notice-info mt18">
+            <span data-icon="clock"></span>
+            <div><b>Delegation expires 5 October.</b> Runs as Priya in #support. May use SENTRY_TOKEN.
+              <a href="#">Re-affirm</a></div>
+          </div>
+        </div>
+
+        <div data-revealgroup="connected" hidden>
+          <div class="panel"><div class="panel-b">
+            <p class="small" style="color:var(--text-2)">Nothing to configure. This agent works when an owner
+              has Claude Code — or any MCP client — connected to Lepidy. Its authority is that person's own,
+              checked on every call.</p>
+            <div class="kbdline mt14">claude mcp add lepidy https://acme.lepidy.app/mcp</div>
+          </div></div>
+        </div>
+
+        <div data-revealgroup="custom" hidden>
+          <div class="panel"><div class="panel-b">
+            <div class="field"><label class="label">Webhook URL</label>
+              <input class="input mono" value="https://hooks.acme.dev/lepidy/releasebot"></div>
+            <div class="field" style="margin:0"><label class="label">Signing secret</label>
+              <input class="input mono" value="whsec_••••••••••••••••"></div>
+          </div></div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "agents", page: "runtime",
+  topbar: { icon: "agent", title: "Release Bot", sub: "Runtime",
+    actions: '<button class="btn btn-sm btn-primary">Save</button>' } });
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+
+// deep-link a runtime so you can share one: runtime.html?runtime=cloud
+const want = new URLSearchParams(location.search).get("runtime");
+if (want) {
+  const opt = document.querySelector(`.radio-opt[data-reveal="${want}"]`);
+  if (opt) opt.click();
+}
+</script>
+</body>
+</html>

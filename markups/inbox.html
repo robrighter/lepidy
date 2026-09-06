@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Inbox · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div data-rail></div>
+  <div class="col">
+    <div data-topbar></div>
+    <div class="tabs">
+      <button class="tab is-active">All</button>
+      <button class="tab">Approvals <span class="badge" style="margin-left:6px">1</span></button>
+      <button class="tab">Mentions</button>
+      <button class="tab">Threads</button>
+      <button class="tab">Agents</button>
+    </div>
+    <div class="body">
+      <div class="pad-narrow">
+
+        <!-- the approval, as a message -->
+        <div class="panel livecard mb18">
+          <div class="panel-b">
+            <div class="flexrow gap10 mb14">
+              <span data-icon="key" style="color:var(--accent)"></span>
+              <b class="mono" style="font-size:15px">PROD_DB_URL</b>
+              <span class="pill pill-alert">Human-gated</span>
+              <span class="spacer"></span>
+              <span class="pill pill-warn">Times out in 4:38</span>
+            </div>
+
+            <table class="tbl" style="margin:0 -14px 4px">
+              <tbody>
+                <tr><td class="muted" style="width:110px">Asked by</td>
+                  <td><span class="prov"><b>a.releasebot</b><span class="via">via daniel</span></span>
+                    <span class="xs muted" style="margin-left:8px">unattended session</span></td></tr>
+                <tr><td class="muted">From</td><td class="mono">maya-mbp · ~/dev/api</td></tr>
+                <tr><td class="muted">Because</td>
+                  <td>“run the payments backfill Daniel asked for in #eng”</td></tr>
+                <tr><td class="muted">It gets</td>
+                  <td>Injected into <span class="mono">psql</span>.
+                    <span class="muted">The value is never shown to the agent.</span></td></tr>
+                <tr><td class="muted">History</td><td class="muted">Never used by this agent. Last used by you, 6 days ago.</td></tr>
+              </tbody>
+            </table>
+
+            <div class="notice notice-warn mt14">
+              <span data-icon="shield"></span>
+              <div>Nobody is at that keyboard. The session started because Daniel mentioned the agent —
+                a mention is a request, not an approval.</div>
+            </div>
+
+            <div class="flexrow gap10 mt14 wrap">
+              <button class="btn btn-danger">Deny</button>
+              <button class="btn btn-ok">Allow once</button>
+              <button class="btn btn-ok">Allow for 15 minutes</button>
+              <span class="spacer"></span>
+              <span class="xs muted flexrow gap6"><span data-icon="lock"></span> Touch ID confirms</span>
+            </div>
+            <p class="xs muted mt10">No answer in 4:38 means denied, and the agent is told a person may be away
+              rather than that you refused.</p>
+          </div>
+        </div>
+
+        <div class="panel mb18">
+          <div class="rows">
+            <div class="row">
+              <span data-av="Daniel Park"></span>
+              <div class="row-main"><div class="row-t">Daniel Park <span class="pill pill-quiet">#eng</span></div>
+                <div class="row-s">@maya can you sign off the 0041 rollout plan?</div></div>
+              <div class="row-r"><span class="xs muted">9:15</span></div>
+            </div>
+            <div class="row">
+              <span data-agentav="30"></span>
+              <div class="row-main"><div class="row-t">Release Bot
+                <span class="pill pill-agent">AGENT</span><span class="pill pill-quiet">#release</span></div>
+                <div class="row-s">Nightly deploy summary — 3 services, all green</div></div>
+              <div class="row-r"><span class="xs muted">06:02</span></div>
+            </div>
+            <div class="row">
+              <span data-av="Priya Singh"></span>
+              <div class="row-main"><div class="row-t">Priya Singh <span class="pill pill-quiet">Thread · #billing</span></div>
+                <div class="row-s">Replied to “failed charge retries” — 4 new</div></div>
+              <div class="row-r"><span class="badge">4</span></div>
+            </div>
+            <div class="row">
+              <span data-agentav="30"></span>
+              <div class="row-main"><div class="row-t">Triage
+                <span class="pill pill-agent">AGENT</span><span class="pill pill-warn">Flagged</span></div>
+                <div class="row-s">A message it was sent tried to redirect it. Reported instead of complying.</div></div>
+              <div class="row-r"><span class="xs muted">Mon</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="empty">
+          <img src="assets/img/empty-flight.svg" alt="">
+          <h3>That's everything</h3>
+          <p>Nothing else is waiting on you. Your agents will put anything they can't decide right here.</p>
+          <a class="btn" href="agents.html">See what your agents are doing</a>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "inbox", page: "inbox",
+  topbar: { icon: "inbox", title: "Inbox", sub: "1 approval · 3 unread",
+    actions: '<button class="btn btn-sm">Mark all read</button>' } });
+document.querySelectorAll("[data-agentav]").forEach(n => n.outerHTML = UI.agentAv(+n.dataset.agentav));
+document.querySelectorAll("[data-av]").forEach(n => n.outerHTML = UI.av(n.dataset.av, 30, true));
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+node_modules/
+.next/
+.open-next/
+.wrangler/
+src-tauri/target/
+src-tauri/gen/
+
+.env
+.env.*
+!.env.example
+
+*.log
+*.tsbuildinfo
+*:Zone.Identifier
+.DS_Store
+Thumbs.db

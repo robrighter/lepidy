@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Daniel Park · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div data-rail></div>
+  <div class="col">
+    <div data-topbar></div>
+    <div class="body">
+      <div class="msgs">
+        <div class="daybreak">Yesterday</div>
+
+        <div class="msg">
+          <span data-av="Daniel Park" data-size="38"></span>
+          <div>
+            <div class="msg-hd"><span class="msg-who">Daniel Park</span><span class="msg-t">16:42</span></div>
+            <div class="msg-b">Did you get anywhere with the retry thing? I keep seeing it in the logs
+              but I can't reproduce it locally.</div>
+          </div>
+        </div>
+
+        <div class="msg">
+          <span data-av="Maya Chen" data-size="38"></span>
+          <div>
+            <div class="msg-hd"><span class="msg-who">Maya Chen</span><span class="msg-t">16:51</span></div>
+            <div class="msg-b">
+              <p>Reproduced it — it only happens when the first attempt times out rather than erroring.
+                Here's the path:</p>
+              <div class="code">async <span class="k">function</span> charge(req) {
+  <span class="c">// idempotency key is set here…</span>
+  <span class="k">const</span> key = req.headers[<span class="s">'x-idem'</span>] ?? crypto.randomUUID();
+  <span class="c">// …but the retry wrapper builds a fresh request, so it's lost</span>
+  <span class="k">return</span> withRetry(() =&gt; post(<span class="s">'/charges'</span>, body));
+}</div>
+              <p class="mt10">Two-line fix, but it wants a test that actually times out.</p>
+            </div>
+            <div class="flexrow gap6 mt10">
+              <span class="pill pill-quiet">👀 2</span>
+              <span class="pill pill-quiet">🎯 1</span>
+              <button class="iconbtn" data-icon="smile"></button>
+            </div>
+          </div>
+        </div>
+
+        <div class="msg">
+          <span data-av="Daniel Park" data-size="38"></span>
+          <div>
+            <div class="msg-hd"><span class="msg-who">Daniel Park</span><span class="msg-t">17:03</span></div>
+            <div class="msg-b">That's the one. Can you file it on the board so it doesn't get lost?</div>
+          </div>
+        </div>
+
+        <div class="daybreak">Today</div>
+
+        <div class="msg">
+          <span data-av="Maya Chen" data-size="38"></span>
+          <div>
+            <div class="msg-hd"><span class="msg-who">Maya Chen</span><span class="msg-t">09:04</span></div>
+            <div class="msg-b">Filed — <a href="queue.html">#support-queue → Retries silently drop the
+              idempotency key</a>. It's on 18 🔥 already.</div>
+            <div class="work" style="max-width:420px">
+              <div class="flexrow gap10">
+                <span data-icon="hash" class="muted"></span>
+                <div style="flex:1"><div class="row-t" style="font-size:13px">Retries silently drop the idempotency key</div>
+                  <div class="xs muted">support-queue · 🔥 18 · Planned</div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="msg">
+          <span data-av="Daniel Park" data-size="38"></span>
+          <div>
+            <div class="msg-hd"><span class="msg-who">Daniel Park</span><span class="msg-t">09:06</span></div>
+            <div class="msg-b">Perfect, thank you 🙏</div>
+          </div>
+        </div>
+
+        <div class="flexrow gap10 mt14" style="padding-left:49px">
+          <span data-av="Daniel Park" data-size="18"></span>
+          <span class="xs muted">Daniel is typing…</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="composer">
+      <div class="composer-tabs">
+        <button class="ctab is-active">Message</button>
+        <button class="ctab">Ask an agent</button>
+      </div>
+      <div class="composer-in">Message Daniel</div>
+      <div class="composer-f">
+        <button class="iconbtn" data-icon="plus"></button>
+        <button class="iconbtn" data-icon="clip"></button>
+        <button class="iconbtn" data-icon="at"></button>
+        <button class="iconbtn" data-icon="smile"></button>
+        <button class="iconbtn" data-icon="clock" title="Schedule for later"></button>
+        <span class="spacer"></span>
+        <span class="xs muted">It's 18:06 for Daniel — he's set to focus until 09:00</span>
+        <button class="btn btn-primary btn-sm" data-icon="send"></button>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "", page: "dm",
+  topbar: { title: "Daniel Park", sub: "Berlin · 18:06 · focus until 09:00",
+    actions: '<button class="btn btn-sm" data-icon="phone"></button><button class="iconbtn" data-icon="dots"></button>' } });
+document.querySelectorAll("[data-av]").forEach(n => n.outerHTML = UI.av(n.dataset.av, +(n.dataset.size || 30), true));
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+const b = document.querySelector(".body"); if (b) b.scrollTop = b.scrollHeight;
+</script>
+</body>
+</html>

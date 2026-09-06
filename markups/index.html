@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lepidy — screen mockups</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="hub">
+
+  <div class="hub-hero">
+    <img class="wash-img" src="assets/img/wash.svg" alt="">
+    <div class="flexrow gap10 mb18">
+      <img src="assets/img/mark.svg" width="34" height="34" alt="">
+      <b style="font:700 20px var(--font-display)">Lepidy</b>
+      <span class="spacer"></span>
+      <button class="iconbtn" id="themeBtn"></button>
+    </div>
+    <div class="hub-eyebrow">Screen mockups · v1</div>
+    <h1>Work, transformed.</h1>
+    <p>Twelve screens covering the workspace, the agents, the vault and the account.
+      Click through them, or use the bar at the bottom of any screen to walk forward and back.
+      Everything is real HTML and CSS — nothing is a picture, so you can poke at it.</p>
+    <div class="flexrow gap10 mt18 wrap">
+      <a class="btn btn-primary" href="channel.html">Start the walkthrough</a>
+      <a class="btn" href="runtime.html">Jump to the local-session screen</a>
+    </div>
+  </div>
+
+  <div class="notice notice-info mb18">
+    <span data-icon="agent"></span>
+    <div><b>Two things to look for.</b>
+      The <span class="prov"><b>a.releasebot</b><span class="via">via maya</span></span> chip is the same
+      component everywhere an agent acts — it's the product's argument rendered as one small element.
+      The dashed violet line is the brand's flight-path motif, used to mean exactly one thing:
+      a harness session is running on somebody's machine right now.</div>
+  </div>
+
+  <div id="groups"></div>
+
+  <p class="xs muted mt24" style="text-align:center">
+    Palette, type and motifs from <span class="mono">brandkit/</span>. Avatars are generated, not photographs.
+  </p>
+</div>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+const t = localStorage.getItem("lepidy-theme");
+if (t) document.documentElement.dataset.theme = t;
+document.getElementById("themeBtn").innerHTML = UI.icon(t === "dark" ? "sun" : "moon");
+
+const groups = [...new Set(LEPIDY.PAGES.map(p => p.group))];
+document.getElementById("groups").innerHTML = groups.map(g => `
+  <div class="hub-group">
+    <h2>${g}</h2>
+    <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(290px,1fr))">
+      ${LEPIDY.PAGES.filter(p => p.group === g).map(p => `
+        <a class="hub-card" href="${p.file}">
+          <b><span class="hub-num">${String(LEPIDY.PAGES.indexOf(p) + 1).padStart(2, "0")}</span> ${p.name}</b>
+          <span>${p.note}</span>
+        </a>`).join("")}
+    </div>
+  </div>`).join("");
+
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+document.addEventListener("click", e => {
+  if (e.target.closest("#themeBtn")) {
+    const dark = document.documentElement.dataset.theme === "dark";
+    document.documentElement.dataset.theme = dark ? "light" : "dark";
+    localStorage.setItem("lepidy-theme", dark ? "light" : "dark");
+    document.getElementById("themeBtn").innerHTML = UI.icon(dark ? "moon" : "sun");
+  }
+});
+</script>
+</body>
+</html>

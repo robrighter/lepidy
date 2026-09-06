@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vault · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div data-rail></div>
+  <div class="col">
+    <div data-topbar></div>
+    <div class="body">
+      <div class="pad">
+
+        <div class="grid g4 mb18">
+          <div class="stat"><div class="stat-n">6</div><div class="stat-l">Credentials</div></div>
+          <div class="stat"><div class="stat-n">3</div><div class="stat-l">Live grants</div></div>
+          <div class="stat"><div class="stat-n">1</div><div class="stat-l">Waiting on you</div></div>
+          <div class="stat"><div class="stat-n">18</div><div class="stat-l">Uses today</div></div>
+        </div>
+
+        <div class="panel mb18">
+          <div class="panel-h">
+            <b style="font:var(--t-h3)">Live grants</b>
+            <span class="spacer"></span>
+            <span class="xs muted">All of these die the moment agent access goes off</span>
+          </div>
+          <table class="tbl">
+            <thead><tr><th>Credential</th><th>Who has it</th><th>How</th><th>Expires</th><th></th></tr></thead>
+            <tbody>
+              <tr><td class="mono">STAGING_DB_URL</td>
+                <td><span class="prov"><b>a.releasebot</b><span class="via">via maya</span></span></td>
+                <td>Injected · maya-mbp · ~/dev/api</td>
+                <td><span class="pill pill-warn">9:42 left</span></td>
+                <td><button class="btn btn-sm">Revoke</button></td></tr>
+              <tr><td class="mono">SENTRY_TOKEN</td>
+                <td><span class="prov"><b>a.triage</b><span class="via">via priya</span></span></td>
+                <td>Proxied · sentry.io only</td>
+                <td><span class="pill pill-quiet">This session</span></td>
+                <td><button class="btn btn-sm">Revoke</button></td></tr>
+              <tr><td class="mono">GITHUB_TOKEN</td><td>Daniel Park</td>
+                <td>Injected · dan-desktop · ~/dev/docs</td>
+                <td><span class="pill pill-quiet">44 min</span></td>
+                <td><button class="btn btn-sm">Revoke</button></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="flexrow gap10 mb14 wrap">
+          <h2 style="font:var(--t-h2)">Credentials</h2>
+          <span class="spacer"></span>
+          <div class="tagrow">
+            <span class="pill pill-quiet">All 6</span>
+            <span class="pill pill-quiet">dev</span>
+            <span class="pill pill-quiet">prod</span>
+            <span class="pill pill-quiet">payments</span>
+            <span class="pill pill-quiet">agents</span>
+          </div>
+        </div>
+
+        <div class="panel"><div class="rows" id="credRows"></div></div>
+
+        <div class="notice notice-quiet mt18">
+          <span data-icon="term"></span>
+          <div><b>Nothing here is ever pasted into a chat.</b>
+            An agent gets a credential by running it, not by reading it:
+            <div class="kbdline mt10">lepidy run --with STAGING_DB_URL -- psql -c 'select 1'</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "vault", page: "vault",
+  topbar: { icon: "key", title: "Vault", sub: "Acme workspace",
+    actions: '<button class="btn btn-sm btn-danger">Turn agent access off</button>' +
+             '<button class="btn btn-sm btn-primary">Add credential</button>' } });
+
+document.getElementById("credRows").innerHTML = LEPIDY.CREDS.map(c => `
+  <a class="row" href="credential.html" style="color:inherit">
+    ${UI.icon(c.tier === "human" ? "lock" : "key")}
+    <div class="row-main">
+      <div class="row-t"><span class="mono">${c.name}</span>
+        ${c.tier === "human" ? '<span class="pill pill-alert">Human-gated</span>' : ""}
+        ${c.expires ? `<span class="pill pill-warn">Expires ${c.expires}</span>` : ""}
+      </div>
+      <div class="row-s">${c.desc} · used ${c.uses}× · last ${c.last}</div>
+    </div>
+    <div class="row-r">
+      <span class="pill ${c.mode === "ask" ? "pill-warn" : "pill-ok"}">${c.mode === "ask" ? "Asks every time" : "Automatic"}</span>
+      <span class="pill pill-quiet">Inject only</span>
+      <span class="avstack">${c.owners.map(o => UI.av(o, 22, true)).join("")}</span>
+    </div>
+  </a>`).join("");
+
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+</script>
+</body>
+</html>

@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Home · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div data-rail></div>
+  <div class="col">
+    <div data-topbar></div>
+    <div class="body">
+      <div class="pad">
+
+        <div class="panel wash mb18">
+          <div class="panel-b" style="padding:24px 26px">
+            <h1 style="font:700 26px/1.15 var(--font-display)">Good morning, Maya.</h1>
+            <p class="mt6" style="color:var(--text-2);max-width:520px">
+              Two agents worked overnight. One is waiting on you.</p>
+            <div class="grid g4 mt18">
+              <div class="stat"><div class="stat-n">1</div><div class="stat-l">Approval waiting</div></div>
+              <div class="stat"><div class="stat-n">3</div><div class="stat-l">Mentions</div></div>
+              <div class="stat"><div class="stat-n">2</div><div class="stat-l">Agent sessions today</div></div>
+              <div class="stat"><div class="stat-n">18</div><div class="stat-l">Credential uses</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid g2">
+          <div>
+            <h2 class="mb10" style="font:var(--t-h2)">Needs you</h2>
+            <div class="panel">
+              <div class="rows">
+                <div class="row">
+                  <span data-icon="key" style="color:var(--accent)"></span>
+                  <div class="row-main">
+                    <div class="row-t"><span class="mono">PROD_DB_URL</span>
+                      <span class="pill pill-warn">Approval</span></div>
+                    <div class="row-s">@a.releasebot wants to run the payments backfill · 4:38 left</div>
+                  </div>
+                  <div class="row-r">
+                    <button class="btn btn-sm">Deny</button>
+                    <button class="btn btn-sm btn-ok">Review</button>
+                  </div>
+                </div>
+                <div class="row">
+                  <span data-icon="at" style="color:var(--coral)"></span>
+                  <div class="row-main">
+                    <div class="row-t">Daniel Park mentioned you</div>
+                    <div class="row-s">#eng — “@maya can you sign off the 0041 rollout plan?”</div>
+                  </div>
+                  <div class="row-r"><span class="xs muted">9:15</span></div>
+                </div>
+                <div class="row">
+                  <span data-icon="clock" style="color:var(--amber)"></span>
+                  <div class="row-main">
+                    <div class="row-t"><span class="mono">NPM_PUBLISH_TOKEN</span> expires in 9 days</div>
+                    <div class="row-s">Rotate it before the next CLI release</div>
+                  </div>
+                  <div class="row-r"><button class="btn btn-sm">Rotate</button></div>
+                </div>
+              </div>
+            </div>
+
+            <h2 class="mb10 mt24" style="font:var(--t-h2)">Catch up</h2>
+            <div class="panel">
+              <div class="rows">
+                <div class="row">
+                  <span data-icon="hash" class="muted"></span>
+                  <div class="row-main"><div class="row-t">#billing <span class="badge">2</span></div>
+                    <div class="row-s">Priya and 3 others · failed-charge retries</div></div>
+                </div>
+                <div class="row">
+                  <span data-icon="hash" class="muted"></span>
+                  <div class="row-main"><div class="row-t">#release</div>
+                    <div class="row-s">@a.releasebot posted a deploy summary · 06:02</div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <h2 class="mb10" style="font:var(--t-h2)">Agent activity</h2>
+            <div class="panel livecard mb14">
+              <div class="panel-b">
+                <div class="flexrow gap10">
+                  <span data-agentav="34"></span>
+                  <div style="flex:1;min-width:0">
+                    <div class="row-t">@a.releasebot <span class="pill pill-agent">Live</span></div>
+                    <div class="xs muted">Claude Code on maya-mbp · ~/dev/api · 6m</div>
+                  </div>
+                  <button class="btn btn-sm">Stop</button>
+                </div>
+                <div class="flight mt14"></div>
+                <div class="small mt14" style="color:var(--text-2)">
+                  Answering Daniel in #eng. Used <span class="mono">STAGING_DB_URL</span> once.</div>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-h"><b style="font:var(--t-h3)">Overnight</b>
+                <span class="spacer"></span><a class="xs" href="agents.html">All agents</a></div>
+              <div class="rows">
+                <div class="row">
+                  <span data-agentav="30"></span>
+                  <div class="row-main"><div class="row-t">@a.triage</div>
+                    <div class="row-s">Cleared 11 support mentions · 4 waiting</div></div>
+                  <div class="row-r"><span class="badge gray">4</span></div>
+                </div>
+                <div class="row">
+                  <span data-agentav="30"></span>
+                  <div class="row-main"><div class="row-t">@a.docs</div>
+                    <div class="row-s">Opened 2 PRs against the handbook</div></div>
+                  <div class="row-r"><span class="dot off"></span></div>
+                </div>
+                <div class="row">
+                  <span data-agentav="30"></span>
+                  <div class="row-main"><div class="row-t">@a.research</div>
+                    <div class="row-s">Nothing since Tuesday</div></div>
+                  <div class="row-r"><span class="dot off"></span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "home", page: "home",
+  topbar: { title: "Home", sub: "Tuesday, 5 September",
+    actions: '<button class="btn btn-sm btn-danger" title="Kill switch">Agent access: on</button>' } });
+document.querySelectorAll("[data-agentav]").forEach(n => n.outerHTML = UI.agentAv(+n.dataset.agentav));
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+</script>
+</body>
+</html>

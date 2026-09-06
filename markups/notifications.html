@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Notifications · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div data-rail></div>
+  <div class="col">
+    <div data-topbar></div>
+    <div class="body">
+      <div class="pad-narrow">
+
+        <div class="notice notice-info mb18">
+          <span data-icon="bell"></span>
+          <div><b>A workspace with agents in it makes more noise than one without.</b>
+            So the defaults here are quieter than you're used to, and the one thing that always
+            gets through is a credential request — because an approval nobody sees just times out.</div>
+        </div>
+
+        <div class="panel mb18">
+          <div class="panel-h"><b style="font:var(--t-h3)">By default, tell me about</b></div>
+          <div class="panel-b">
+            <div class="switchrow">
+              <div><div class="strong small">Messages from people</div>
+                <div class="xs muted">In channels you've joined</div></div>
+              <div class="seg"><button>All</button><button class="is-active">Mentions</button><button>Nothing</button></div>
+            </div>
+            <div class="switchrow">
+              <div><div class="strong small">Messages from agents</div>
+                <div class="xs muted">Quieter on purpose. You'll still hear about an agent replying in your
+                  thread, mentioning you, or answering something you asked.</div></div>
+              <div class="seg"><button>All</button><button>Mentions</button><button class="is-active">Only mine</button></div>
+            </div>
+            <div class="switchrow">
+              <div><div class="strong small">Direct messages</div>
+                <div class="xs muted">Always, unless you're in focus</div></div>
+              <div class="seg"><button class="is-active">All</button><button>Nothing</button></div>
+            </div>
+            <div class="switchrow">
+              <div><div class="strong small">Credential approvals</div>
+                <div class="xs muted">Every device, even during focus. This is the only thing that
+                  overrides focus — which is exactly why nothing else does.</div></div>
+              <span class="pill pill-ok">Always</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel mb18">
+          <div class="panel-h"><b style="font:var(--t-h3)">Words to watch for</b></div>
+          <div class="panel-b">
+            <div class="tagrow mb10">
+              <span class="pill pill-info">payments ✕</span>
+              <span class="pill pill-info">on-call ✕</span>
+              <span class="pill pill-info">acme-api ✕</span>
+            </div>
+            <input class="input" placeholder="Add a word or phrase">
+            <p class="hint">You'll be notified when these appear anywhere you can see, even in channels
+              you've set to mentions only.</p>
+          </div>
+        </div>
+
+        <div class="panel mb18">
+          <div class="panel-h"><b style="font:var(--t-h3)">Focus</b>
+            <span class="spacer"></span><span class="pill pill-quiet">On until 09:00</span></div>
+          <div class="panel-b">
+            <div class="switchrow">
+              <div><div class="strong small">Quiet hours</div>
+                <div class="xs muted">Nothing gets through except approvals and anyone who marks a message urgent.</div></div>
+              <button class="switch on"></button>
+            </div>
+            <div class="grid g3 mt18">
+              <div class="field" style="margin:0"><label class="label">From</label>
+                <select class="select"><option>18:30</option></select></div>
+              <div class="field" style="margin:0"><label class="label">Until</label>
+                <select class="select"><option>09:00</option></select></div>
+              <div class="field" style="margin:0"><label class="label">Days</label>
+                <select class="select"><option>Every day</option><option>Weekdays</option></select></div>
+            </div>
+            <p class="hint">People see “focus until 09:00” next to your name before they type, so they can
+              decide whether it can wait. That's the part that actually reduces interruptions.</p>
+          </div>
+        </div>
+
+        <div class="panel mb18">
+          <div class="panel-h"><b style="font:var(--t-h3)">Per channel</b></div>
+          <table class="tbl">
+            <thead><tr><th>Channel</th><th>People</th><th>Agents</th><th></th></tr></thead>
+            <tbody>
+              <tr><td class="strong">#eng</td><td>All messages</td><td>Only mine</td>
+                <td><button class="btn btn-sm btn-ghost">Change</button></td></tr>
+              <tr><td class="strong">#support-queue</td><td>Mentions</td><td>All messages</td>
+                <td><button class="btn btn-sm btn-ghost">Change</button></td></tr>
+              <tr><td class="strong">#release</td><td>Mentions</td><td>Nothing</td>
+                <td><button class="btn btn-sm btn-ghost">Change</button></td></tr>
+              <tr><td class="strong muted">#random</td><td colspan="2"><span class="pill pill-quiet">Muted</span></td>
+                <td><button class="btn btn-sm btn-ghost">Unmute</button></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="panel">
+          <div class="panel-h"><b style="font:var(--t-h3)">Notifying everyone</b></div>
+          <div class="panel-b">
+            <div class="notice notice-warn mb14">
+              <span data-icon="at"></span>
+              <div><b>@channel asks first.</b> It shows how many people it's about to interrupt and
+                waits for you to confirm. “It looked like it notified everyone” is a mistake worth
+                one extra click.</div>
+            </div>
+            <div class="field" style="margin:0">
+              <label class="label">Who can use @channel and @here in #eng</label>
+              <select class="select"><option>Channel admins only</option><option>Everyone</option>
+                <option>A group…</option></select>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "", page: "notifications",
+  topbar: { icon: "bell", title: "Notifications", sub: "Maya Chen",
+    actions: '<button class="btn btn-sm btn-primary">Save</button>' } });
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+document.querySelectorAll(".seg").forEach(g => g.addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  g.querySelectorAll("button").forEach(n => n.classList.toggle("is-active", n === b));
+}));
+</script>
+</body>
+</html>

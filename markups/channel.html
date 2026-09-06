@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#eng · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app has-aside">
+  <div data-rail></div>
+
+  <div class="col">
+    <div data-topbar></div>
+
+    <div class="body">
+      <div class="msgs">
+
+        <div class="daybreak">Today</div>
+
+        <div class="msg">
+          <img class="av" src="" data-av="Daniel Park" width="38" height="38" alt="">
+          <div>
+            <div class="msg-hd"><span class="msg-who">Daniel Park</span><span class="msg-t">9:12</span></div>
+            <div class="msg-b">Morning — did the payments migration actually land on staging last night, or did it
+              stall again? <a href="#">@a.releasebot</a></div>
+          </div>
+        </div>
+
+        <!-- the agent's reply: AGENT badge, provenance chip, live work card -->
+        <div class="msg">
+          <span data-agentav="38"></span>
+          <div>
+            <div class="msg-hd">
+              <span class="msg-who">Release Bot</span>
+              <span class="pill pill-agent">AGENT</span>
+              <span class="prov"><b>a.releasebot</b><span class="via">via maya</span></span>
+              <span class="msg-t">9:12</span>
+              <span class="msg-t">· session on <span class="mono">maya-mbp</span></span>
+            </div>
+
+            <div class="work">
+              <div class="work-t"><span data-icon="term"></span> Working in <span class="mono">~/dev/api</span>
+                <span class="pill pill-info">Claude Code</span></div>
+              <div class="step"><span data-icon="check" class="tick" style="color:var(--mint)"></span>
+                Read the mention and the thread it sits in</div>
+              <div class="step"><span data-icon="check" class="tick" style="color:var(--mint)"></span>
+                <span class="mono">lepidy run --with STAGING_DB_URL -- psql -c '\dt payments.*'</span></div>
+              <div class="step pend"><span data-icon="clock" class="tick"></span>
+                Checking the last three deploy records…</div>
+              <div class="flight mt10"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="msg">
+          <span data-agentav="38"></span>
+          <div>
+            <div class="msg-hd">
+              <span class="msg-who">Release Bot</span>
+              <span class="pill pill-agent">AGENT</span>
+              <span class="prov"><b>a.releasebot</b><span class="via">via maya</span></span>
+              <span class="msg-t">9:13</span>
+            </div>
+            <div class="msg-b">
+              <p>It landed. <b>0041_payments_split.sql</b> applied at 02:14 UTC on staging, 11 seconds, no errors.
+                The stall you saw on Tuesday was the lock timeout on <span class="mono">payments.charges</span>,
+                which the retry cleared.</p>
+              <p>Two things worth knowing: the follow-up backfill hasn't run yet, and production is still on 0040.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="msg">
+          <img class="av" src="" data-av="Daniel Park" width="38" height="38" alt="">
+          <div>
+            <div class="msg-hd"><span class="msg-who">Daniel Park</span><span class="msg-t">9:15</span></div>
+            <div class="msg-b">Perfect. @a.releasebot can you run the backfill against production?</div>
+          </div>
+        </div>
+
+        <!-- an approval, inline, as a message. This is §8.6 rendered. -->
+        <div class="msg">
+          <span data-agentav="38"></span>
+          <div>
+            <div class="msg-hd">
+              <span class="msg-who">Release Bot</span>
+              <span class="pill pill-agent">AGENT</span>
+              <span class="prov"><b>a.releasebot</b><span class="via">via maya</span></span>
+              <span class="msg-t">9:15</span>
+            </div>
+            <div class="msg-b mb10">That needs <span class="mono">PROD_DB_URL</span>, which asks every time.
+              I've requested it from Maya — I'll pick this up the moment she answers, or tell you if she declines.</div>
+
+            <div class="panel livecard" style="max-width:520px">
+              <div class="panel-b">
+                <div class="flexrow gap10 mb10">
+                  <span data-icon="key" style="color:var(--accent)"></span>
+                  <b class="mono" style="font-size:13.5px">PROD_DB_URL</b>
+                  <span class="pill pill-warn">Waiting on Maya</span>
+                  <span class="spacer"></span>
+                  <span class="xs muted">4:38 left</span>
+                </div>
+                <div class="small" style="color:var(--text-2)">
+                  <div class="flexrow gap6"><span class="muted" style="width:70px">Asked by</span>
+                    <span class="prov"><b>a.releasebot</b><span class="via">via daniel</span></span></div>
+                  <div class="flexrow gap6 mt6"><span class="muted" style="width:70px">From</span>
+                    <span class="mono">maya-mbp · ~/dev/api</span></div>
+                  <div class="flexrow gap6 mt6"><span class="muted" style="width:70px">Reason</span>
+                    <span>“run the payments backfill Daniel asked for in #eng”</span></div>
+                  <div class="flexrow gap6 mt6"><span class="muted" style="width:70px">Gets</span>
+                    <span>injected into <span class="mono">psql</span> — the value is never shown to the agent</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <div class="composer">
+      <div class="composer-tabs">
+        <button class="ctab is-active">Message</button>
+        <button class="ctab">Ask an agent</button>
+        <button class="ctab">Create task</button>
+      </div>
+      <div class="composer-in">Message #eng</div>
+      <div class="composer-f">
+        <button class="iconbtn" data-icon="plus"></button>
+        <button class="iconbtn" data-icon="clip"></button>
+        <button class="iconbtn" data-icon="at"></button>
+        <button class="iconbtn" data-icon="smile"></button>
+        <span class="spacer"></span>
+        <span class="xs muted">Press ⌘↵ to send</span>
+        <button class="btn btn-primary btn-sm" data-icon="send"></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- right rail -->
+  <div class="aside">
+    <div class="aside-h">#eng</div>
+    <div class="aside-b">
+      <p class="small" style="color:var(--text-2)">Everything that ships. Deploys, migrations, incidents.</p>
+
+      <div class="meta">Agents working here</div>
+      <div class="stack gap10">
+        <div class="panel livecard">
+          <div class="panel-b" style="padding:12px 13px">
+            <div class="flexrow gap10">
+              <span data-agentav="30"></span>
+              <div style="flex:1;min-width:0">
+                <div class="row-t">@a.releasebot</div>
+                <div class="xs muted">Session live on maya-mbp · 6m</div>
+              </div>
+              <button class="btn btn-sm btn-ghost" data-icon="pause" title="Pause"></button>
+            </div>
+            <div class="flight mt10"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-b" style="padding:12px 13px">
+            <div class="flexrow gap10">
+              <span data-agentav="30"></span>
+              <div style="flex:1;min-width:0">
+                <div class="row-t">@a.docs</div>
+                <div class="xs muted">Idle · starts on mention · dan-desktop</div>
+              </div>
+              <span class="dot off"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="meta">Credentials scoped to this channel</div>
+      <div class="stack gap6">
+        <div class="flexrow gap10 small"><span data-icon="key" class="muted"></span>
+          <span class="mono">GITHUB_TOKEN</span><span class="spacer"></span><span class="pill pill-quiet">auto</span></div>
+        <div class="flexrow gap10 small"><span data-icon="key" class="muted"></span>
+          <span class="mono">STAGING_DB_URL</span><span class="spacer"></span><span class="pill pill-warn">ask</span></div>
+      </div>
+      <p class="xs muted mt10">Agents working in #eng may use these. Anything else needs its own grant.</p>
+
+      <div class="meta">Members</div>
+      <div class="flexrow gap6"><span class="avstack" data-avstack="Maya Chen,Daniel Park,Priya Singh,Sam Ortiz"></span>
+        <span class="xs muted">and 6 more</span></div>
+    </div>
+  </div>
+</div>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({
+  active: "eng", page: "channel",
+  topbar: { icon: "hash", title: "eng",
+    pill: '<span class="pill pill-quiet">12 members</span>',
+    actions: '<button class="btn btn-sm">Share</button><button class="iconbtn" data-icon="dots"></button>' }
+});
+document.querySelectorAll("[data-av]").forEach(n => n.src = UI.avatar(n.dataset.av, 38));
+document.querySelectorAll("[data-agentav]").forEach(n => n.outerHTML = UI.agentAv(+n.dataset.agentav));
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+document.querySelectorAll("[data-avstack]").forEach(n =>
+  n.innerHTML = n.dataset.avstack.split(",").map(x => UI.av(x, 26, true)).join(""));
+// chat opens at the newest message, like the real thing
+const b = document.querySelector(".body"); if (b) b.scrollTop = b.scrollHeight;
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Lepidy">
+  <g fill="currentColor">
+    <path d="M31 33 C29 17 21 4 11 6 C1 8 1 24 12 31 C18 35 26 36 31 33 Z"/>
+    <path d="M31 33 C28 42 22 56 14 55 C6 54 6 41 15 36 C20 33 27 31 31 33 Z" opacity=".82"/>
+    <path d="M33 33 C35 17 43 4 53 6 C63 8 63 24 52 31 C46 35 38 36 33 33 Z"/>
+    <path d="M33 33 C36 42 42 56 50 55 C58 54 58 41 49 36 C44 33 37 31 33 33 Z" opacity=".82"/>
+  </g>
+</svg>

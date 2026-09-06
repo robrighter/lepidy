@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Devices and sessions · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div data-rail></div>
+  <div class="col">
+    <div data-topbar></div>
+    <div class="body">
+      <div class="pad-narrow">
+
+        <div class="notice notice-info mb18">
+          <span data-icon="phone"></span>
+          <div><b>Signing in somewhere new never signs you out anywhere else.</b>
+            That's what lets you ask an agent something from your phone while the session it needs
+            runs on the desktop at home.</div>
+        </div>
+
+        <div class="panel mb18">
+          <div class="panel-h"><b style="font:var(--t-h3)">Where you're signed in</b>
+            <span class="spacer"></span>
+            <button class="btn btn-sm">Sign out everywhere else</button></div>
+          <div class="rows">
+            <div class="row"><span data-icon="laptop" class="muted"></span>
+              <div class="row-main"><div class="row-t">maya-mbp · Lepidy for macOS
+                <span class="pill pill-ok">This device</span></div>
+                <div class="row-s">Passkey · Berlin · active now</div></div>
+              <div class="row-r"><span class="pill pill-quiet">Can approve</span></div></div>
+            <div class="row"><span data-icon="phone" class="muted"></span>
+              <div class="row-main"><div class="row-t">iPhone 16 · Lepidy Approvals</div>
+                <div class="row-s">Passkey · Berlin · 4 minutes ago</div></div>
+              <div class="row-r"><span class="pill pill-quiet">Can approve</span>
+                <button class="btn btn-sm">Sign out</button></div></div>
+            <div class="row"><span data-icon="grid" class="muted"></span>
+              <div class="row-main"><div class="row-t">Chrome on Windows · web</div>
+                <div class="row-s">Email link · Munich · yesterday</div></div>
+              <div class="row-r"><span class="pill pill-warn">Read and post only</span>
+                <button class="btn btn-sm">Sign out</button></div></div>
+          </div>
+          <div class="panel-f xs muted">A session you started from an email link can read and post,
+            and can't open the vault. Releasing a credential always needs a passkey, whatever you signed in with.</div>
+        </div>
+
+        <div class="panel mb18">
+          <div class="panel-h"><b style="font:var(--t-h3)">Machines that can run agents</b>
+            <span class="spacer"></span>
+            <button class="btn btn-sm btn-danger">Stop every runner</button></div>
+          <div class="rows">
+            <div class="row"><span data-icon="laptop" style="color:var(--accent)"></span>
+              <div class="row-main"><div class="row-t">maya-mbp <span class="pill pill-agent">1 session live</span></div>
+                <div class="row-s">macOS · desktop app 1.4.0 · allows @a.releasebot in ~/dev/api</div></div>
+              <div class="row-r"><button class="btn btn-sm">Manage</button>
+                <button class="btn btn-sm btn-danger">Remove</button></div></div>
+            <div class="row"><span data-icon="term" class="muted"></span>
+              <div class="row-main"><div class="row-t">build-01</div>
+                <div class="row-s">Linux · lepidy agentd 1.4.0 · allows @a.docs in /srv/docs</div></div>
+              <div class="row-r"><button class="btn btn-sm">Manage</button>
+                <button class="btn btn-sm btn-danger">Remove</button></div></div>
+          </div>
+          <div class="panel-f xs muted">
+            Signing your phone out doesn't stop these, and removing a machine doesn't sign you out.
+            They answer different worries, so they're separate buttons.</div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-h"><b style="font:var(--t-h3)">How you sign in</b></div>
+          <div class="rows">
+            <div class="row"><span data-icon="lock" class="muted"></span>
+              <div class="row-main"><div class="row-t">Passkey · MacBook Touch ID</div>
+                <div class="row-s">Added 14 Aug · used 4 minutes ago</div></div>
+              <div class="row-r"><button class="btn btn-sm">Remove</button></div></div>
+            <div class="row"><span data-icon="lock" class="muted"></span>
+              <div class="row-main"><div class="row-t">Passkey · iPhone</div>
+                <div class="row-s">Added 14 Aug · used yesterday</div></div>
+              <div class="row-r"><button class="btn btn-sm">Remove</button></div></div>
+            <div class="row"><span data-icon="check" style="color:var(--mint)"></span>
+              <div class="row-main"><div class="row-t">Google · maya@acme.dev</div>
+                <div class="row-s">Linked 14 Aug. A way in — your Lepidy account doesn't depend on it.</div></div>
+              <div class="row-r"><button class="btn btn-sm">Unlink</button></div></div>
+            <div class="row"><span data-icon="key" class="muted"></span>
+              <div class="row-main"><div class="row-t">Password</div>
+                <div class="row-s">Changed 14 Aug</div></div>
+              <div class="row-r"><button class="btn btn-sm">Change</button></div></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "", page: "sessions",
+  topbar: { title: "Devices and sessions", sub: "Maya Chen" } });
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+</script>
+</body>
+</html>

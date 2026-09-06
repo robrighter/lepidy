@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Search · Lepidy</title>
+<link rel="icon" href="assets/img/mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;650;700&family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/tokens.css"><link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div data-rail></div>
+  <div class="col">
+    <div data-topbar></div>
+    <div class="body">
+      <div class="pad-narrow">
+
+        <div class="sbox mb10">
+          <span data-icon="search" class="muted"></span>
+          <input value="idempotency from:maya in:#eng has:code" aria-label="Search">
+          <span class="xs muted">41 results</span>
+        </div>
+        <div class="flexrow gap6 mb18 wrap">
+          <span class="xs muted">Add:</span>
+          <span class="op">from:</span><span class="op">in:</span><span class="op">before:</span>
+          <span class="op">after:</span><span class="op">has:file</span><span class="op">has:link</span>
+          <span class="op">has:code</span><span class="op">is:thread</span>
+          <span class="spacer"></span>
+          <button class="btn btn-sm">Save this search</button>
+        </div>
+
+        <div class="panel mb18">
+          <div class="rows">
+            <div class="hit">
+              <div class="flexrow gap10 mb6">
+                <span data-av="Maya Chen"></span>
+                <b class="small">Maya Chen</b>
+                <span class="pill pill-quiet">#eng</span>
+                <span class="spacer"></span><span class="xs muted">yesterday 16:51</span>
+              </div>
+              <div class="small" style="color:var(--text-2)">Reproduced it — it only happens when the first
+                attempt times out. The <mark>idempotency</mark> key is set in the handler but the retry wrapper
+                builds a fresh request, so it's lost.</div>
+              <div class="flexrow gap6 mt6"><span class="pill pill-quiet">code block</span>
+                <span class="xs muted">2 reactions · in a thread</span></div>
+            </div>
+
+            <div class="hit">
+              <div class="flexrow gap10 mb6">
+                <span data-agentav="22"></span>
+                <b class="small">Release Bot</b>
+                <span class="pill pill-agent">AGENT</span>
+                <span class="pill pill-quiet">#release</span>
+                <span class="spacer"></span><span class="xs muted">Mon 06:02</span>
+              </div>
+              <div class="small" style="color:var(--text-2)">Deploy 0041 shipped the
+                <mark>idempotency</mark>-key fix to staging. Production is still on 0040.</div>
+              <div class="prov mt6"><b>a.releasebot</b><span class="via">via maya</span></div>
+            </div>
+
+            <div class="hit">
+              <div class="flexrow gap10 mb6">
+                <span data-icon="hash" class="muted"></span>
+                <b class="small">Retries silently drop the idempotency key</b>
+                <span class="pill pill-quiet">support-queue</span>
+                <span class="spacer"></span><span class="xs muted">4 days ago</span>
+              </div>
+              <div class="small" style="color:var(--text-2)">Form entry by Daniel Park · Area: Payments ·
+                <mark>idempotency</mark> · 🔥 18 · <span class="pill pill-info">Planned</span></div>
+            </div>
+
+            <div class="hit">
+              <div class="flexrow gap10 mb6">
+                <span data-icon="clip" class="muted"></span>
+                <b class="small">charge-retry-trace.log</b>
+                <span class="pill pill-quiet">#eng</span>
+                <span class="spacer"></span><span class="xs muted">4 days ago</span>
+              </div>
+              <div class="small" style="color:var(--text-2)">Uploaded by Daniel Park · 2.1 MB ·
+                matched on file contents</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="notice notice-quiet">
+          <span data-icon="key"></span>
+          <div><b>Search covers messages, files, form entries and everything your agents posted.</b>
+            It does not cover credential values. A credential's name and description are findable;
+            its value has never been in an index and can't be put in one.</div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/js/data.js"></script>
+<script src="assets/js/shell.js"></script>
+<script>
+UI.mount({ active: "", page: "search", topbar: { icon: "search", title: "Search", sub: "Acme workspace" } });
+document.querySelectorAll("[data-agentav]").forEach(n => n.outerHTML = UI.agentAv(+n.dataset.agentav));
+document.querySelectorAll("[data-av]").forEach(n => n.outerHTML = UI.av(n.dataset.av, 22, true));
+document.querySelectorAll("[data-icon]").forEach(n => n.innerHTML = UI.icon(n.dataset.icon));
+</script>
+</body>
+</html>
