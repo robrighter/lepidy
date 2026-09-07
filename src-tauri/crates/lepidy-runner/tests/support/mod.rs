@@ -1,0 +1,601 @@
+//! A disposable local Lepidy for `lepidy-agentd` to talk to.
+//!
+//! Real loopback sockets, a real WebSocket handshake, and the signed-device
+//! envelope verified the way the control plane verifies it — canonical string,
+//! P-256 signature, body hash, path. A double that accepted any request would
+//! prove the daemon runs, not that it signs; and a double that faked the socket
+//! would prove the frames parse, not that they arrive.
+//!
+//! The daemon under test is the compiled binary, spawned as a real process,
+//! because everything R01 claims is about process boundaries: what reaches a
+//! child's environment, what happens to a tree when it is stopped, and what a
+//! machine does when the connection it was holding goes away.
+
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use lepidy_cli::crypto::{encode, DeviceSigningKey, VaultKeyPair};
+use lepidy_cli::profile::{fresh_secrets, seal, Profile, PROFILE_VERSION};
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature, VerifyingKey};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+pub const WORKSPACE_ID: &str = "ws-runner";
+pub const WORKSPACE_SLUG: &str = "runner-workspace";
+pub const MEMBER_ID: &str = "member-runner";
+pub const DEVICE_ID: &str = "device-runner";
+pub const DEVICE_CREDENTIAL: &str = "device-credential-runner-0001";
+pub const PASSPHRASE: &str = "correct horse battery staple";
+pub const AGENT_ID: &str = "agent-runner-0001";
+
+#[derive(Clone, Debug)]
+pub struct Recorded {
+    pub path: String,
+    pub body: Vec<u8>,
+    pub signature_verified: bool,
+    pub config_revision: u64,
+    pub runner_epoch: u64,
+}
+
+#[derive(Default)]
+pub struct DoubleState {
+    pub requests: Vec<Recorded>,
+    pub signing_key: Option<VerifyingKey>,
+    /// What a depth check answers with. A scenario sets exactly the queue it
+    /// wants to test rather than the double modelling one.
+    pub depth: Vec<Value>,
+    /// Frames to push down the next socket, in order. A scenario can add to
+    /// this after the socket is live, which is how a stop that arrives *while*
+    /// a run is going is tested rather than a stop that races the start.
+    pub outbound: Vec<String>,
+    pub sockets_accepted: usize,
+    pub socket_rejected_reason: Option<String>,
+}
+
+impl DoubleState {
+    pub fn requests_to(&self, path: &str) -> Vec<Recorded> {
+        self.requests
+            .iter()
+            .filter(|request| request.path == path)
+            .cloned()
+            .collect()
+    }
+}
+
+pub struct Double {
+    address: SocketAddr,
+    pub state: Arc<Mutex<DoubleState>>,
+    running: Arc<AtomicBool>,
+}
+
+impl Double {
+    pub fn start(signing_key: VerifyingKey) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("a bound address");
+        let state = Arc::new(Mutex::new(DoubleState {
+            signing_key: Some(signing_key),
+            ..DoubleState::default()
+        }));
+        let running = Arc::clone(&Arc::new(AtomicBool::new(true)));
+        let thread_state = Arc::clone(&state);
+        let thread_running = Arc::clone(&running);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if !thread_running.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(stream) = stream else { break };
+                let state = Arc::clone(&thread_state);
+                // One thread per connection: the daemon holds a socket open for
+                // as long as it runs, and a serialised double would deadlock the
+                // moment it also made an HTTP call.
+                std::thread::spawn(move || serve(stream, &state));
+            }
+        });
+        Self {
+            address,
+            state,
+            running,
+        }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.address.port())
+    }
+
+    pub fn with_state<T>(&self, edit: impl FnOnce(&mut DoubleState) -> T) -> T {
+        edit(&mut self.state.lock().expect("the double's state"))
+    }
+
+    /// Wait for something to become true of the double, or give up.
+    pub fn wait_for<T>(&self, what: &str, mut probe: impl FnMut(&DoubleState) -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Some(value) = probe(&self.state.lock().expect("the double's state")) {
+                return value;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("timed out waiting for {what}");
+    }
+}
+
+impl Drop for Double {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.address);
+    }
+}
+
+fn serve(mut stream: TcpStream, state: &Arc<Mutex<DoubleState>>) {
+    // The path is read without consuming the stream, so a websocket upgrade can
+    // be handed to the handshake untouched while everything else is served as
+    // ordinary HTTP.
+    let Some(path) = peek_path(&stream) else {
+        return;
+    };
+    if path.starts_with("/api/device/runner/socket") {
+        serve_socket(stream, state, &path);
+        return;
+    }
+
+    let Some((path, headers, body)) = read_request(&mut stream) else {
+        return;
+    };
+    let verified = verify_envelope(state, "POST", &path, &headers, &body);
+    let claims = decode_claims(&headers);
+    let response = {
+        let mut locked = state.lock().expect("the double's state");
+        locked.requests.push(Recorded {
+            path: path.clone(),
+            body: body.clone(),
+            signature_verified: verified,
+            config_revision: claims
+                .get("configRevision")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            runner_epoch: serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|parsed| parsed.get("runnerEpoch").and_then(Value::as_u64))
+                .unwrap_or(0),
+        });
+        respond(&mut locked, &path, verified)
+    };
+    let (status, payload) = response;
+    let body = payload.to_string();
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    let _ = stream.flush();
+}
+
+/// Accept the daemon's outbound socket and push whatever the scenario staged.
+fn serve_socket(stream: TcpStream, state: &Arc<Mutex<DoubleState>>, path: &str) {
+    let headers: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let captured = Arc::clone(&headers);
+    let accepted = tungstenite::accept_hdr(
+        stream,
+        |request: &tungstenite::handshake::server::Request,
+         response: tungstenite::handshake::server::Response| {
+            let mut locked = captured.lock().expect("the captured headers");
+            for (name, value) in request.headers() {
+                locked.insert(
+                    name.as_str().to_ascii_lowercase(),
+                    value.to_str().unwrap_or_default().to_string(),
+                );
+            }
+            Ok(response)
+        },
+    );
+    let Ok(mut socket) = accepted else { return };
+
+    // The upgrade is signed like every other device request, and the double
+    // checks it the same way. An unsigned socket would make every other
+    // guarantee here reachable by anybody who can open a TCP connection.
+    let captured = headers.lock().expect("the captured headers").clone();
+    let signed_path = path.split('?').next().unwrap_or(path).to_string();
+    if !verify_envelope(state, "GET", &signed_path, &captured, &[]) {
+        state
+            .lock()
+            .expect("the double's state")
+            .socket_rejected_reason = Some("unsigned upgrade".to_string());
+        let _ = socket.close(None);
+        return;
+    }
+
+    state.lock().expect("the double's state").sockets_accepted += 1;
+    // A short read timeout so this thread can do both jobs: notice frames the
+    // daemon sends, and notice frames the scenario stages while it is running.
+    let _ = socket
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(25)));
+    loop {
+        let staged = {
+            let mut locked = state.lock().expect("the double's state");
+            std::mem::take(&mut locked.outbound)
+        };
+        for frame in staged {
+            if socket
+                .send(tungstenite::Message::Text(frame.into()))
+                .is_err()
+            {
+                return;
+            }
+        }
+        match socket.read() {
+            Ok(_) => continue,
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn peek_path(stream: &TcpStream) -> Option<String> {
+    let mut buffer = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let read = stream.peek(&mut buffer).ok()?;
+        if read == 0 {
+            return None;
+        }
+        if let Some(end) = buffer[..read].windows(2).position(|pair| pair == b"\r\n") {
+            let line = String::from_utf8_lossy(&buffer[..end]).to_string();
+            return line.split_whitespace().nth(1).map(str::to_string);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<(String, HashMap<String, String>, Vec<u8>)> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).ok()?;
+    let path = request_line.split_whitespace().nth(1)?.to_string();
+
+    let mut headers = HashMap::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            break;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    let length: usize = headers
+        .get("content-length")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body).ok()?;
+    Some((path, headers, body))
+}
+
+fn decode_claims(headers: &HashMap<String, String>) -> Value {
+    headers
+        .get("x-lepidy-device-claims")
+        .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or(json!({}))
+}
+
+/// The control plane's check, in miniature.
+fn verify_envelope(
+    state: &Arc<Mutex<DoubleState>>,
+    method: &str,
+    path: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> bool {
+    let Some(key) = state.lock().expect("the double's state").signing_key else {
+        return false;
+    };
+    let (Some(encoded_claims), Some(encoded_signature), Some(credential)) = (
+        headers.get("x-lepidy-device-claims"),
+        headers.get("x-lepidy-device-signature"),
+        headers.get("x-lepidy-device-credential"),
+    ) else {
+        return false;
+    };
+    if credential != DEVICE_CREDENTIAL {
+        return false;
+    }
+    let (Ok(claims_bytes), Ok(signature_bytes)) = (
+        URL_SAFE_NO_PAD.decode(encoded_claims),
+        URL_SAFE_NO_PAD.decode(encoded_signature),
+    ) else {
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<Value>(&claims_bytes) else {
+        return false;
+    };
+    let text = |name: &str| {
+        claims
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let number = |name: &str| {
+        claims
+            .get(name)
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .to_string()
+    };
+    // The signature covers the method and the path, so an upgrade signed for
+    // the socket cannot be replayed against the register endpoint.
+    if text("path") != path || !text("method").eq_ignore_ascii_case(method) {
+        return false;
+    }
+    if text("bodyHash") != URL_SAFE_NO_PAD.encode(Sha256::digest(body)) {
+        return false;
+    }
+    let canonical = [
+        "lepidy-device-request-v1".to_string(),
+        text("method").to_uppercase(),
+        text("path"),
+        text("bodyHash"),
+        text("workspaceId"),
+        text("memberId"),
+        number("authorizationEpoch"),
+        text("deviceId"),
+        number("deviceKeyEpoch"),
+        number("timestamp"),
+        text("nonce"),
+        text("requestId"),
+        text("projectId"),
+        number("configRevision"),
+        text("agentId"),
+        text("delegationId"),
+        text("originId"),
+    ]
+    .join("\n");
+    let Ok(signature) = Signature::from_slice(&signature_bytes) else {
+        return false;
+    };
+    key.verify(canonical.as_bytes(), &signature).is_ok()
+}
+
+fn respond(state: &mut DoubleState, path: &str, verified: bool) -> (u16, Value) {
+    if !verified {
+        return (
+            401,
+            json!({ "error": "device_unauthorized", "message": "the signature was refused" }),
+        );
+    }
+    match path {
+        "/api/device/runner/register" => (
+            200,
+            json!({
+                "workspaceId": WORKSPACE_ID,
+                "deviceId": DEVICE_ID,
+                "runnerEpoch": 1,
+                "agentIds": [AGENT_ID],
+                "displacedDeviceIds": [],
+            }),
+        ),
+        "/api/device/runner/depth" => (
+            200,
+            json!({ "workspaceId": WORKSPACE_ID, "runnerEpoch": 1, "agents": state.depth }),
+        ),
+        "/api/device/runner/release" => {
+            (200, json!({ "workspaceId": WORKSPACE_ID, "released": 1 }))
+        }
+        _ => (
+            404,
+            json!({ "error": "not_found", "message": "no such endpoint" }),
+        ),
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* The machine under test                                                      */
+/* -------------------------------------------------------------------------- */
+
+static HOMES: AtomicUsize = AtomicUsize::new(0);
+
+/// One scenario's private profile directory, removed when the test ends.
+pub struct TempHome {
+    pub path: PathBuf,
+}
+
+impl TempHome {
+    pub fn create(label: &str) -> Self {
+        let ordinal = HOMES.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "lepidy-runner-{}-{label}-{ordinal}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("a scenario home");
+        Self { path }
+    }
+}
+
+impl Drop for TempHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Enrol this scenario's machine without going through `lepidy login`.
+///
+/// The profile is written exactly as the CLI writes it — the same sealed
+/// keystore, the same Argon2id parameters — so the daemon under test is opening
+/// a real keystore with a real passphrase, not a fixture shaped like one.
+pub fn enrol(home: &TempHome, server_url: &str) -> VerifyingKey {
+    let signing = DeviceSigningKey::generate();
+    let vault = VaultKeyPair::generate();
+    let secrets = fresh_secrets(DEVICE_CREDENTIAL.to_string(), &signing, &vault);
+    let sealed = seal(&secrets, PASSPHRASE, DEVICE_ID, WORKSPACE_ID).expect("a sealed keystore");
+    let recovery = seal(&secrets, "recovery-code-for-tests", DEVICE_ID, WORKSPACE_ID)
+        .expect("a sealed recovery keystore");
+    let profile = Profile {
+        version: PROFILE_VERSION,
+        server_url: server_url.to_string(),
+        workspace_id: WORKSPACE_ID.to_string(),
+        workspace_slug: WORKSPACE_SLUG.to_string(),
+        member_id: MEMBER_ID.to_string(),
+        authorization_epoch: 1,
+        device_id: DEVICE_ID.to_string(),
+        device_key_epoch: 1,
+        project_id: "project-runner".to_string(),
+        vault_key_epoch: 1,
+        vault_public_key: encode(&vault.public_key_bytes()),
+        passphrase: sealed,
+        recovery,
+    };
+    std::fs::write(
+        home.path.join("profile.json"),
+        serde_json::to_vec_pretty(&profile).expect("a profile document"),
+    )
+    .expect("the scenario home is writable");
+    verifying_key(&signing)
+}
+
+fn verifying_key(signing: &DeviceSigningKey) -> VerifyingKey {
+    let jwk = signing.public_jwk();
+    let x = URL_SAFE_NO_PAD
+        .decode(jwk["x"].as_str().expect("the jwk has an x"))
+        .expect("x decodes");
+    let y = URL_SAFE_NO_PAD
+        .decode(jwk["y"].as_str().expect("the jwk has a y"))
+        .expect("y decodes");
+    let mut sec1 = vec![0x04];
+    sec1.extend_from_slice(&x);
+    sec1.extend_from_slice(&y);
+    VerifyingKey::from_sec1_bytes(&sec1).expect("a verifying key")
+}
+
+/// Run `lepidy-agentd` to completion, writing exactly what the scenario says
+/// on standard input — including a wrong passphrase, which is a case worth
+/// being able to test.
+pub fn agentd(home: &TempHome, arguments: &[&str], stdin: &[&str]) -> std::process::Output {
+    let mut child = command(home, arguments);
+    {
+        let mut handle = child.stdin.take().expect("stdin was piped");
+        for line in stdin {
+            writeln!(handle, "{line}").expect("write to the daemon");
+        }
+    }
+    child.wait_with_output().expect("the daemon to finish")
+}
+
+/// A running daemon, with its output collected as it is produced.
+///
+/// Collected on a thread rather than read at the end for a concrete reason:
+/// the preset's own processes inherit the daemon's stdout, so a `read_to_end`
+/// after killing the daemon blocks until every grandchild has also exited —
+/// which for a preset that sleeps is the whole test.
+pub struct Daemon {
+    child: Child,
+    output: Arc<Mutex<String>>,
+}
+
+impl Daemon {
+    /// What the daemon has said so far.
+    pub fn output(&self) -> String {
+        self.output.lock().expect("the daemon's output").clone()
+    }
+
+    /// Wait for the daemon to say something, or give up.
+    pub fn wait_for_output(&self, needle: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let seen = self.output();
+            if seen.contains(needle) {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!(
+            "timed out waiting for {needle:?}; the daemon said: {}",
+            self.output()
+        );
+    }
+
+    pub fn stop(mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.output()
+    }
+}
+
+/// Start `lepidy-agentd` and leave it running, unlocked with the right
+/// passphrase — on standard input, never in argv.
+pub fn spawn_agentd(home: &TempHome, arguments: &[&str]) -> Daemon {
+    let mut child = command(home, arguments);
+    if let Some(handle) = child.stdin.as_mut() {
+        let _ = writeln!(handle, "{PASSPHRASE}");
+    }
+    let output = Arc::new(Mutex::new(String::new()));
+    if let Some(stdout) = child.stdout.take() {
+        let collected = Arc::clone(&output);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { return };
+                let mut locked = collected.lock().expect("the daemon's output");
+                locked.push_str(&line);
+                locked.push('\n');
+            }
+        });
+    }
+    Daemon { child, output }
+}
+
+fn command(home: &TempHome, arguments: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_lepidy-agentd"))
+        .args(arguments)
+        .env("LEPIDY_HOME", &home.path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the lepidy-agentd binary")
+}
+
+pub fn text(output: &[u8]) -> String {
+    String::from_utf8_lossy(output).to_string()
+}
+
+/// A wake frame, as the workspace sends it.
+pub fn wake(preset_id: &str, config_revision: u64) -> String {
+    json!({
+        "type": "wake",
+        "trigger": {
+            "workspaceId": WORKSPACE_ID,
+            "agentId": AGENT_ID,
+            "deviceId": DEVICE_ID,
+            "presetId": preset_id,
+            "configRevision": config_revision,
+            "requestId": "request-0001",
+        },
+    })
+    .to_string()
+}

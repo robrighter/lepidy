@@ -1,0 +1,43 @@
+[package]
+name = "lepidy-runner"
+version = "0.1.0"
+description = "Lepidy headless local runner"
+authors = ["Lepidy"]
+edition = "2021"
+# Higher than the rest of the workspace: the WebSocket client this daemon holds
+# its connection with requires 1.85. Nothing else here needs it, so the bump is
+# confined to this crate.
+rust-version = "1.85"
+
+[lib]
+name = "lepidy_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lepidy-agentd"
+path = "src/main.rs"
+
+[dependencies]
+lepidy-cli = { path = "../lepidy-cli" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = { version = "0.30", default-features = false, features = [
+  "handshake",
+  "rustls-tls-webpki-roots",
+] }
+
+# Terminating a process *tree* is the one thing with no portable standard
+# library answer. On Unix the child leads its own process group and the group is
+# signalled; on Windows `taskkill /T` does the same job as a documented tool.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["signal"] }
+
+# The integration suite's local double verifies the signed envelope the way the
+# control plane does, and speaks the same WebSocket handshake the workspace does.
+[dev-dependencies]
+base64 = "0.22"
+p256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"

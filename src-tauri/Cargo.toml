@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lepidy-cli"]
+members = ["crates/lepidy-cli", "crates/lepidy-runner"]
 
 [package]
 name = "lepidy-desktop"

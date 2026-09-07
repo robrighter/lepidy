@@ -46,7 +46,7 @@ pub struct SignedClaims {
 }
 
 impl SignedClaims {
-    fn canonical(&self) -> String {
+    pub fn canonical(&self) -> String {
         [
             "lepidy-device-request-v1",
             &self.method.to_uppercase(),
@@ -128,42 +128,16 @@ impl Client {
     ) -> CliResult<Response> {
         let bytes =
             serde_json::to_vec(body).map_err(|error| CliError::failure(error.to_string()))?;
-        let claims = SignedClaims {
-            method: "POST".to_string(),
-            path: path.to_string(),
-            body_hash: sha256_base64url(&bytes),
-            workspace_id: profile.workspace_id.clone(),
-            member_id: profile.member_id.clone(),
-            authorization_epoch: profile.authorization_epoch,
-            device_id: profile.device_id.clone(),
-            device_key_epoch: profile.device_key_epoch,
-            timestamp: now_ms(),
-            nonce: encode(&random_bytes(18)),
-            request_id: encode(&random_bytes(18)),
-            project_id: provenance.project_id,
-            // The revision of the local launch configuration this request was
-            // made under. One until R01 owns real presets, but signed from the
-            // start so a preset change cannot be replayed past.
-            config_revision: 1,
-            agent_id: provenance.agent_id,
-            delegation_id: provenance.delegation_id,
-            origin_id: provenance.origin_id,
-        };
-        let encoded_claims = encode(
-            serde_json::to_vec(&claims)
-                .map_err(|error| CliError::failure(error.to_string()))?
-                .as_slice(),
-        );
-        let signature = encode(&signing.sign(claims.canonical().as_bytes()));
-        self.send(
+        let headers = signed_headers(
+            profile,
+            signing,
+            device_credential,
+            "POST",
             path,
             &bytes,
-            vec![
-                (CREDENTIAL_HEADER, device_credential.to_string()),
-                (CLAIMS_HEADER, encoded_claims),
-                (SIGNATURE_HEADER, signature),
-            ],
-        )
+            provenance,
+        )?;
+        self.send(path, &bytes, headers)
     }
 
     fn send(&self, path: &str, body: &[u8], headers: Vec<(&str, String)>) -> CliResult<Response> {
@@ -193,6 +167,11 @@ pub struct Provenance {
     pub agent_id: Option<String>,
     pub delegation_id: Option<String>,
     pub origin_id: Option<String>,
+    /// The revision of the local launch configuration this request is made
+    /// under. Signed, so a workspace can tell a session started under an edited
+    /// preset apart from one started under the preset it registered — without
+    /// ever learning what either preset says.
+    pub config_revision: u64,
 }
 
 impl Provenance {
@@ -202,8 +181,60 @@ impl Provenance {
             agent_id: None,
             delegation_id: None,
             origin_id: None,
+            config_revision: 1,
         }
     }
+
+    pub fn at_revision(mut self, config_revision: u64) -> Self {
+        self.config_revision = config_revision;
+        self
+    }
+}
+
+/// The three headers an F05 signed request carries.
+///
+/// Lifted out of `post_signed` for the runner's socket upgrade, which is a GET
+/// with no body and so cannot go through the JSON helper — but must be signed
+/// exactly the same way, over the same canonical claims, or the control plane
+/// will refuse it.
+pub fn signed_headers(
+    profile: &Profile,
+    signing: &DeviceSigningKey,
+    device_credential: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    provenance: Provenance,
+) -> CliResult<Vec<(&'static str, String)>> {
+    let claims = SignedClaims {
+        method: method.to_uppercase(),
+        path: path.to_string(),
+        body_hash: sha256_base64url(body),
+        workspace_id: profile.workspace_id.clone(),
+        member_id: profile.member_id.clone(),
+        authorization_epoch: profile.authorization_epoch,
+        device_id: profile.device_id.clone(),
+        device_key_epoch: profile.device_key_epoch,
+        timestamp: now_ms(),
+        nonce: encode(&random_bytes(18)),
+        request_id: encode(&random_bytes(18)),
+        project_id: provenance.project_id,
+        config_revision: provenance.config_revision,
+        agent_id: provenance.agent_id,
+        delegation_id: provenance.delegation_id,
+        origin_id: provenance.origin_id,
+    };
+    let encoded_claims = encode(
+        serde_json::to_vec(&claims)
+            .map_err(|error| CliError::failure(error.to_string()))?
+            .as_slice(),
+    );
+    let signature = encode(&signing.sign(claims.canonical().as_bytes()));
+    Ok(vec![
+        (CREDENTIAL_HEADER, device_credential.to_string()),
+        (CLAIMS_HEADER, encoded_claims),
+        (SIGNATURE_HEADER, signature),
+    ])
 }
 
 /// HTTPS, or a loopback address.
