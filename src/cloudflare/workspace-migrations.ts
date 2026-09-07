@@ -812,6 +812,25 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       ) STRICT`,
     ],
   },
+  {
+    version: 19,
+    name: "Vault custodian wrapping keys",
+    statements: [
+      // The public half of a member's vault wrapping key, published by the
+      // native client that generated it. The private half never leaves that
+      // client, so this table is what lets one custodian's client seal a DEK
+      // for another without either key passing through Lepidy.
+      `CREATE TABLE vault_member_keys (
+        member_id TEXT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
+        key_epoch INTEGER NOT NULL CHECK (key_epoch > 0),
+        wrap_suite TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      ) STRICT`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

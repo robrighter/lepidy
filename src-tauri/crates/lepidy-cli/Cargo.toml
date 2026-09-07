@@ -1,0 +1,47 @@
+[package]
+name = "lepidy-cli"
+version = "0.1.0"
+description = "Lepidy local credential injection CLI"
+authors = ["Lepidy"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "lepidy_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lepidy"
+path = "src/main.rs"
+
+# The child the CLI integration suite injects into. It is a real separate
+# process because that is the boundary under test: environment inheritance,
+# pipe scrubbing, exit status and cleanup only mean anything across a spawn.
+[[bin]]
+name = "lepidy-injection-probe"
+path = "src/bin/injection_probe.rs"
+
+[dependencies]
+aes-gcm = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+zeroize = "1"
+
+# The integration suite's local double verifies the signed envelope the way the
+# control plane does, so it needs the same primitives the CLI signs with.
+[dev-dependencies]
+base64 = "0.22"
+p256 = { version = "0.13", features = ["ecdsa"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"

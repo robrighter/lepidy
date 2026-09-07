@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/lepidy-cli"]
+
 [package]
 name = "lepidy-desktop"
 version = "0.1.0"
@@ -20,6 +23,27 @@ serde_json = "1"
 sha2 = "0.10"
 tauri = { version = "2", features = [] }
 thiserror = "1"
+
+# Password hashing and the vault's own primitives are deliberately expensive.
+# Left unoptimised in a debug build they turn every test unlock into seconds of
+# wall clock, so these dependencies are optimised even in dev.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.aes]
+opt-level = 3
+
+[profile.dev.package.aes-gcm]
+opt-level = 3
+
+[profile.dev.package.p256]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
 
 [profile.release]
 codegen-units = 1

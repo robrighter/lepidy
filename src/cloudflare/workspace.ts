@@ -218,8 +218,10 @@ import {
   type VaultScope,
 } from "../domain/vault-authorization";
 import {
+  VAULT_WRAP_SUITE,
   validateVaultEnvelope,
   validateVaultKeyWrap,
+  validateVaultPublicKey,
   type VaultCiphertextEnvelope,
   type VaultKeyWrap,
 } from "../domain/vault-envelope";
@@ -345,6 +347,13 @@ export type VaultCredentialSummary = VaultCredentialMetadata & {
   updatedAt: number;
   lastAccessedAt?: number;
   accessCount: number;
+};
+
+export type VaultMemberKey = {
+  memberId: string;
+  keyEpoch: number;
+  wrapSuite: string;
+  publicKey: string;
 };
 
 export type VaultAccessRequest = {
@@ -4194,6 +4203,109 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     return { envelope: this.vaultEnvelope(row), wraps: this.readVaultWraps(row.id, row.version) };
   }
 
+  /**
+   * Publish this member's vault wrapping public key.
+   *
+   * Only the member's own key, and only when no key is registered yet: once
+   * credentials are wrapped to a key, replacing it silently would strand every
+   * one of them. Enrolling a second device onto an existing key, and rotating a
+   * key with the re-wrapping that implies, are V07's.
+   */
+  async publishVaultMemberKey(input: {
+    actor: Actor;
+    publicKey: string;
+    deviceId: string;
+    freshUserVerification: boolean;
+    now: number;
+  }): Promise<{ memberId: string; keyEpoch: number; published: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    if (!input.freshUserVerification) throw new Error("fresh user verification is required");
+    const publicKey = validateVaultPublicKey(input.publicKey, "vault public key");
+    const existing = this.readVaultMemberKey(actor.id);
+    if (existing !== null) {
+      return { memberId: actor.id, keyEpoch: existing.keyEpoch, published: existing.publicKey === publicKey };
+    }
+    const outcome = await this.commitMutation({ scope: "vault.member_key", now: input.now }, () => {
+      if (this.readVaultMemberKey(actor.id) !== null) throw new Error("a vault key is already registered for this member");
+      this.ctx.storage.sql.exec(
+        `INSERT INTO vault_member_keys(member_id, key_epoch, wrap_suite, public_key, device_id, created_at, updated_at)
+         VALUES (?, 1, ?, ?, ?, ?, ?)`,
+        actor.id, VAULT_WRAP_SUITE, publicKey, input.deviceId, input.now, input.now,
+      );
+      return {
+        result: { memberId: actor.id, keyEpoch: 1, published: true },
+        effects: this.vaultEffects("vault.member_key_published", "member_key", actor, { key_epoch: 1, device_id: input.deviceId }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /**
+   * The published wrapping keys a client needs to seal a DEK for custodians.
+   * Public halves only; a member with no enrolled client is simply absent, and
+   * the caller must then refuse rather than invent a custodian.
+   */
+  getVaultMemberKeys(input: { actor: Actor; memberIds: readonly string[] }): { keys: readonly VaultMemberKey[] } {
+    const requester = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const wanted = new Set(input.memberIds.length === 0 ? [requester.id] : input.memberIds);
+    return {
+      keys: [...wanted]
+        .map((memberId) => this.readVaultMemberKey(memberId))
+        .filter((key): key is VaultMemberKey => key !== null),
+    };
+  }
+
+  /**
+   * The same-device local release path: one authorization decision, and the
+   * ciphertext only when it says allow.
+   *
+   * The wrap returned is the requester's own. A use-authorized requester who is
+   * not a custodian is told there is nothing here they can open, rather than
+   * being handed somebody else's sealed key.
+   */
+  async releaseVaultCredential(
+    input: VaultAccessRequest,
+  ): Promise<{ decision: VaultDecision; hint?: string; envelope?: VaultCiphertextEnvelope; wrap?: VaultKeyWrap }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    // Before the decision, not after: a requester with no wrap is going to be
+    // refused whatever the policy says, and letting the authorization run first
+    // would spend a single-use grant and a slot in the hourly ceiling on a
+    // release that could never have been delivered.
+    //
+    // The check is skipped for a requester who cannot see this credential at
+    // all, so that the reason they are told is "no such credential", not "you
+    // are not one of its custodians".
+    const known = this.readVaultCredential(input.credentialId);
+    const visible =
+      known !== null
+      && this.vaultCanDiscover(known.id, actor.id, input.agentId, input.origin.channelId);
+    if (known !== null && visible) {
+      const held = this.readVaultWraps(known.id, known.version).some(
+        (candidate) => candidate.custodianMemberId === actor.id,
+      );
+      if (!held) {
+        return {
+          decision: { kind: "deny", reason: "no_custodian_wrap" },
+          hint: vaultDenialHint("no_custodian_wrap", known.name),
+        };
+      }
+    }
+
+    const authorized = await this.authorizeVaultUse(input);
+    if (authorized.decision.kind !== "allow") return authorized;
+    const row = this.requireVaultCredential(input.credentialId);
+    const wrap = this.readVaultWraps(row.id, row.version).find(
+      (candidate) => candidate.custodianMemberId === actor.id,
+    );
+    if (wrap === undefined) {
+      return { decision: { kind: "deny", reason: "no_custodian_wrap" }, hint: vaultDenialHint("no_custodian_wrap", row.name) };
+    }
+    return { decision: authorized.decision, envelope: this.vaultEnvelope(row), wrap };
+  }
+
   async setVaultAgentAccess(input: { actor: Actor; enabled: boolean; freshUserVerification: boolean; now: number }): Promise<{ enabled: boolean; accessEpoch: number }> {
     const actor = this.authorizeActor(input.actor);
     if (actor.role !== "owner" && actor.role !== "admin") throw new Error("only an admin may change vault agent access");
@@ -4359,6 +4471,13 @@ export class Workspace extends DurableObject<CloudflareEnv> {
 
   private vaultEnvelope(row: VaultCredentialRow): VaultCiphertextEnvelope {
     return { cipherSuite: row.cipher_suite, aadVersion: row.aad_version, version: row.version, keyEpoch: row.key_epoch, iv: row.iv, ciphertext: row.ciphertext };
+  }
+
+  private readVaultMemberKey(memberId: string): VaultMemberKey | null {
+    const row = this.ctx.storage.sql.exec<{ member_id: string; key_epoch: number; wrap_suite: string; public_key: string }>(
+      "SELECT member_id, key_epoch, wrap_suite, public_key FROM vault_member_keys WHERE member_id = ?", memberId,
+    ).toArray()[0];
+    return row === undefined ? null : { memberId: row.member_id, keyEpoch: row.key_epoch, wrapSuite: row.wrap_suite, publicKey: row.public_key };
   }
 
   private readVaultWraps(credentialId: string, version: number): VaultKeyWrap[] {

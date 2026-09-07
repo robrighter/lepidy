@@ -30,18 +30,20 @@ npm("Browser integration tests", ["run", "test:browser"]);
 npm("Wrangler deployment bundle", ["run", "cf:dry-run"]);
 npm("Production dependency audit", ["audit", "--omit=dev"]);
 
-const cargoArgs = ["--manifest-path", "src-tauri/Cargo.toml"];
+// The whole Rust workspace: the Tauri shell and the credential CLI, whose
+// integration suite drives the compiled binary against a local double.
+const cargoArgs = ["--manifest-path", "src-tauri/Cargo.toml", "--workspace"];
 
 if (process.platform === "linux" && os.release().toLowerCase().includes("microsoft")) {
   const windowsRoot = execFileSync("wslpath", ["-w", root], { encoding: "utf8" }).trim();
   const manifest = `${windowsRoot}\\src-tauri\\Cargo.toml`.replaceAll("'", "''");
   const command = [
     "$env:CARGO_INCREMENTAL='0'",
-    `cargo fmt --manifest-path '${manifest}' -- --check`,
+    `cargo fmt --manifest-path '${manifest}' --all -- --check`,
     "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
-    `cargo check --manifest-path '${manifest}'`,
+    `cargo check --manifest-path '${manifest}' --workspace`,
     "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
-    `cargo test --manifest-path '${manifest}'`,
+    `cargo test --manifest-path '${manifest}' --workspace`,
   ].join("; ");
   run(
     "Native Windows Tauri compile",
@@ -49,12 +51,12 @@ if (process.platform === "linux" && os.release().toLowerCase().includes("microso
     ["-NoProfile", "-NonInteractive", "-Command", command],
   );
 } else {
-  run("Tauri formatting", "cargo", ["fmt", ...cargoArgs, "--", "--check"]);
+  run("Tauri formatting", "cargo", ["fmt", "--manifest-path", "src-tauri/Cargo.toml", "--all", "--", "--check"]);
   run("Native Tauri compile", "cargo", ["check", ...cargoArgs], {
     ...process.env,
     CARGO_INCREMENTAL: "0",
   });
-  run("Native local-store integration tests", "cargo", ["test", ...cargoArgs], {
+  run("Native local-store and CLI integration tests", "cargo", ["test", ...cargoArgs], {
     ...process.env,
     CARGO_INCREMENTAL: "0",
   });

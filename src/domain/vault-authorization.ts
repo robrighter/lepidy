@@ -112,6 +112,8 @@ export function vaultDenialHint(reason: string, name: string, retryAfter?: numbe
       return `${name} hit its hourly use ceiling.${retryAfter ? ` Retry after ${new Date(retryAfter).toISOString()}.` : ""} Stop rather than retrying in a loop.`;
     case "delivery_refused":
       return `${name} does not permit that delivery. Use the delivery described by its metadata; never read it from a file or ask for it in chat.`;
+    case "no_custodian_wrap":
+      return `${name} has no key wrapped for this member, so this device cannot open it. Ask a custodian to share it; do not look for the value elsewhere.`;
     case "policy_never":
       return `${name} is unavailable to agents. Tell the user; there is no way around this.`;
     case "use_acl_refused":

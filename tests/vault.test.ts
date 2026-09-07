@@ -3,8 +3,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 import type { Actor, Workspace } from "../src/cloudflare/workspace";
-import { decryptVaultValue, encryptVaultValue } from "../src/domain/vault-client-crypto";
-import { encodeVaultBytes, type VaultKeyWrap } from "../src/domain/vault-envelope";
+import { decryptVaultValue, encryptVaultValue, unwrapVaultDek, wrapVaultDek } from "../src/domain/vault-client-crypto";
+import { VAULT_WRAP_SUITE, encodeVaultBytes, type VaultKeyWrap } from "../src/domain/vault-envelope";
 
 const NOW = 1_800_000_000_000;
 const encoder = new TextEncoder();
@@ -27,6 +27,17 @@ async function seed(name: string, storageMode: "cloud" | "local_host" = "cloud")
   const channel = await stub.createChannel({ actor: owner, idempotencyKey: `vault:channel:${name}:0001`, kind: "public", slug: "vault", memberIds: ["member", "outsider"], now: NOW });
   const message = await stub.sendMessage({ actor: owner, idempotencyKey: `vault:message:${name}:0001`, channelId: channel.channelId, bodyMarkdown: "Use the configured credential.", now: NOW + 1 });
   return { stub, owner, member: { memberId: "member", authorizationEpoch: 1 } satisfies Actor, outsider: { memberId: "outsider", authorizationEpoch: 1 } satisfies Actor, channelId: channel.channelId, messageId: message.messageId };
+}
+
+/**
+ * A real custodian wrapping key pair. The private half stays in the test, which
+ * is the point: the workspace only ever sees the public half and the sealed
+ * wrap, exactly as it only ever sees a real client's.
+ */
+async function custodianKey() {
+  const pair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits", "deriveKey"]);
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  return { privateKey: pair.privateKey, raw, encoded: encodeVaultBytes(raw) };
 }
 
 function wrap(memberId = "owner"): VaultKeyWrap {
@@ -147,6 +158,109 @@ describe("encrypted credential vault", () => {
     await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
       const reasons = state.storage.sql.exec<{ revoked_reason: string | null }>("SELECT revoked_reason FROM vault_grants ORDER BY created_at").toArray().map((row) => row.revoked_reason);
       expect(reasons).toEqual(["device_revoked", "member_authority_changed"]);
+    });
+  });
+
+  it("VAULT-INT-007 registers one custodian wrapping key per member and refuses to replace it", async () => {
+    const seeded = await seed("vault-member-keys");
+    const owner = await custodianKey();
+    const replacement = await custodianKey();
+
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      await expect(
+        instance.publishVaultMemberKey({ actor: seeded.owner, publicKey: owner.encoded, deviceId: "device-a", freshUserVerification: false, now: NOW + 2 }),
+      ).rejects.toThrow(/fresh user verification/);
+      await expect(
+        instance.publishVaultMemberKey({ actor: seeded.owner, publicKey: encodeVaultBytes(new Uint8Array(65).fill(9)), deviceId: "device-a", freshUserVerification: true, now: NOW + 2 }),
+      ).rejects.toThrow(/uncompressed P-256 point/);
+    });
+
+    await expect(
+      seeded.stub.publishVaultMemberKey({ actor: seeded.owner, publicKey: owner.encoded, deviceId: "device-a", freshUserVerification: true, now: NOW + 3 }),
+    ).resolves.toEqual({ memberId: "owner", keyEpoch: 1, published: true });
+    // The same client re-enrolling is idempotent; a different key is not, because
+    // replacing it would strand every credential already wrapped to the first.
+    await expect(
+      seeded.stub.publishVaultMemberKey({ actor: seeded.owner, publicKey: owner.encoded, deviceId: "device-b", freshUserVerification: true, now: NOW + 4 }),
+    ).resolves.toEqual({ memberId: "owner", keyEpoch: 1, published: true });
+    await expect(
+      seeded.stub.publishVaultMemberKey({ actor: seeded.owner, publicKey: replacement.encoded, deviceId: "device-b", freshUserVerification: true, now: NOW + 5 }),
+    ).resolves.toEqual({ memberId: "owner", keyEpoch: 1, published: false });
+
+    // Only public halves are ever stored, and only for members who enrolled.
+    const keys = await seeded.stub.getVaultMemberKeys({ actor: seeded.member, memberIds: ["owner", "member"] });
+    expect(keys.keys).toEqual([{ memberId: "owner", keyEpoch: 1, wrapSuite: VAULT_WRAP_SUITE, publicKey: owner.encoded }]);
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      const stored = state.storage.sql.exec<{ public_key: string }>("SELECT public_key FROM vault_member_keys").toArray();
+      expect(stored).toEqual([{ public_key: owner.encoded }]);
+    });
+  });
+
+  it("VAULT-INT-008 releases ciphertext only to an allowed custodian, and only they can open it", async () => {
+    const seeded = await seed("vault-release");
+    const custodian = await custodianKey();
+    await seeded.stub.publishVaultMemberKey({ actor: seeded.owner, publicKey: custodian.encoded, deviceId: "device-a", freshUserVerification: true, now: NOW + 2 });
+
+    const credentialId = "credential-RELEASE";
+    const workspaceId = seeded.stub.id.toString();
+    const encrypted = await encryptVaultValue({ workspaceId, credentialId, version: 1, keyEpoch: 1, plaintext: encoder.encode("release-plaintext-canary") });
+    const sealed = await wrapVaultDek({
+      workspaceId, credentialId, version: 1, custodianMemberId: "owner", recipientKeyEpoch: 1,
+      recipientPublicKey: custodian.raw, dek: encrypted.dek,
+    });
+    await seeded.stub.createVaultCredential({
+      actor: seeded.owner, idempotencyKey: "vault:create:RELEASE:000001", credentialId,
+      metadata: { name: "TOKEN_RELEASE", description: "Released to a local client", envVar: "TOKEN", tags: [], commands: [], proxyHosts: [] },
+      policy: { mode: "auto", allowedDeliveries: ["inject"], projectIds: ["project-a"], highRisk: false },
+      envelope: encrypted.envelope, wraps: [sealed],
+      acl: [
+        { subjectType: "member", subjectId: "owner", verb: "manage" },
+        { subjectType: "member", subjectId: "owner", verb: "use" },
+        { subjectType: "member", subjectId: "member", verb: "use" },
+      ],
+      freshUserVerification: true, localVaultUnlocked: true, now: NOW + 3,
+    });
+
+    const request = (actor: Actor, now: number, overrides: Partial<Parameters<typeof seeded.stub.releaseVaultCredential>[0]> = {}) =>
+      seeded.stub.releaseVaultCredential({
+        actor, credentialId,
+        device: { id: "device-a", active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+        origin: { channelId: seeded.channelId, messageId: seeded.messageId },
+        projectId: "project-a", delivery: "inject", now, ...overrides,
+      });
+
+    const released = await request(seeded.owner, NOW + 4);
+    expect(released.decision).toEqual({ kind: "allow", via: "automatic" });
+    const dek = await unwrapVaultDek({
+      workspaceId, credentialId, version: released.envelope!.version,
+      wrap: released.wrap!, recipientPrivateKey: custodian.privateKey,
+    });
+    expect(decoder.decode(await decryptVaultValue({ workspaceId, credentialId, envelope: released.envelope!, dek }))).toBe("release-plaintext-canary");
+
+    // A use-authorized member who is not a custodian gets no ciphertext at all,
+    // rather than somebody else's sealed key to fail on.
+    const other = await request(seeded.member, NOW + 5);
+    expect(other.decision).toEqual({ kind: "deny", reason: "no_custodian_wrap" });
+    expect(other).not.toHaveProperty("envelope");
+    expect(other).not.toHaveProperty("wrap");
+
+    // Every mandatory refusal still returns a decision and nothing else.
+    for (const overrides of [
+      { projectId: "project-b" },
+      { device: { id: "device-a", active: true, ownedByMember: true, signatureVerified: false, nonceFresh: true } },
+      { origin: { channelId: seeded.channelId, messageId: "not-a-message" } },
+      { delivery: "file" as const },
+    ]) {
+      const refused = await request(seeded.owner, NOW + 6, overrides);
+      expect(refused.decision.kind).toBe("deny");
+      expect(refused).not.toHaveProperty("envelope");
+      expect(refused.hint).toBeTypeOf("string");
+    }
+
+    // One release, one usage event: a refusal never counts as a use.
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      const usage = state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_usage_events").one();
+      expect(usage.count).toBe(1);
     });
   });
 });

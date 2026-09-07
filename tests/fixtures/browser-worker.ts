@@ -61,6 +61,20 @@ export class Workspace extends ProductionWorkspace {
     return { token: session.token, sessionId: session.sessionId, delegationId: delegation.id, agentId: agent.agentId, agentHandle: agent.handle, allowedChannelId: allowed.channelId, outsideChannelId: outside.channelId, rootMessageId: root.messageId };
   }
 
+  /**
+   * A real channel and message for a device release to cite as its origin.
+   *
+   * The vault's policy requires verified provenance, so a CLI scenario needs an
+   * origin that actually exists; this creates one through the production
+   * authority rather than inventing ids the policy would refuse.
+   */
+  async seedDeviceOrigin(actor: { memberId: string; authorizationEpoch: number }) {
+    const now = Date.now();
+    const channel = await this.createChannel({ actor, idempotencyKey: `browser-device:${now}`, kind: "public", slug: `device-${String(now).slice(-6)}`, name: "device", now });
+    const message = await this.sendMessage({ actor, channelId: channel.channelId, idempotencyKey: `browser-device:message:${now}`, bodyMarkdown: "Deploy with the release token.", now });
+    return { channelId: channel.channelId, messageId: message.messageId };
+  }
+
   async seedBrowserVault(actor: { memberId: string; authorizationEpoch: number }) {
     const now = Date.now();
     const credentialId = "browser-vault-credential";
@@ -91,7 +105,7 @@ export default {
       }
       return Response.json(counts);
     }
-    if (["/__fixture/seed", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/session-token", "/__fixture/vault"].includes(url.pathname) && request.method === "POST") {
+    if (["/__fixture/seed", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/session-token", "/__fixture/vault", "/__fixture/device-origin"].includes(url.pathname) && request.method === "POST") {
       const authorization = new AuthorizationService(env.CONTROL_DB, env.WORKSPACE);
       const resolved = await resolveViewerWorkspace({ db: env.CONTROL_DB, workspaces: env.WORKSPACE, authenticateSession: (token) => authorization.authenticateBrowserSession(token) }, request.headers.get("authorization"));
       if (resolved.status !== "ok") return new Response("Unauthorized", { status: 401 });
@@ -102,6 +116,16 @@ export default {
       }
       if (url.pathname.endsWith("vault")) {
         return Response.json(await stub.seedBrowserVault({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch }));
+      }
+      if (url.pathname.endsWith("device-origin")) {
+        const actor = { memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch };
+        return Response.json({
+          workspaceId: resolved.row.id,
+          workspaceSlug: resolved.row.slug,
+          memberId: resolved.row.member_id,
+          authorizationEpoch: resolved.row.authorization_epoch,
+          ...(await stub.seedDeviceOrigin(actor)),
+        });
       }
       if (url.pathname.endsWith("bulk")) {
         const body = (await request.json()) as { slug: string; count: number };
