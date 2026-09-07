@@ -586,6 +586,52 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX oauth_connections_refresh_idx ON oauth_connections(previous_refresh_token_hash)`,
     ],
   },
+  {
+    version: 16,
+    name: "Agent queue execution and MCP attribution",
+    statements: [
+      // Human display state (`read_at`) stays independent from execution state.
+      // A person may clear an inbox without completing work, and a runner may
+      // complete work without deciding what its owner has read.
+      `ALTER TABLE agent_queue ADD COLUMN execution_state TEXT NOT NULL DEFAULT 'pending'
+         CHECK (execution_state IN ('pending', 'claimed', 'completed', 'needs_attention', 'dead_letter', 'cancelled'))`,
+      `ALTER TABLE agent_queue ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0)`,
+      `ALTER TABLE agent_queue ADD COLUMN not_before INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE agent_queue ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0 CHECK (lease_generation >= 0)`,
+      `ALTER TABLE agent_queue ADD COLUMN lease_connection_id TEXT REFERENCES oauth_connections(id) ON DELETE SET NULL`,
+      `ALTER TABLE agent_queue ADD COLUMN lease_session_id TEXT`,
+      `ALTER TABLE agent_queue ADD COLUMN lease_token_hash TEXT`,
+      `ALTER TABLE agent_queue ADD COLUMN lease_expires_at INTEGER`,
+      `ALTER TABLE agent_queue ADD COLUMN execution_started_at INTEGER`,
+      `ALTER TABLE agent_queue ADD COLUMN claim_id TEXT`,
+      `ALTER TABLE agent_queue ADD COLUMN completion_id TEXT`,
+      `ALTER TABLE agent_queue ADD COLUMN completion_digest TEXT`,
+      `ALTER TABLE agent_queue ADD COLUMN completion_result_json TEXT CHECK (completion_result_json IS NULL OR json_valid(completion_result_json))`,
+      `ALTER TABLE agent_queue ADD COLUMN completed_at INTEGER`,
+      `CREATE INDEX agent_queue_claim_idx
+         ON agent_queue(agent_id, execution_state, not_before, enqueued_at, id)`,
+      // Durable, server-authored provenance for every message written through
+      // MCP. It is separate from the body so a caller cannot forge or erase it.
+      `CREATE TABLE mcp_message_attribution (
+        message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        connection_id TEXT NOT NULL REFERENCES oauth_connections(id) ON DELETE RESTRICT,
+        operating_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
+        agent_id TEXT REFERENCES agents(id) ON DELETE RESTRICT,
+        client_id TEXT NOT NULL,
+        client_name_snapshot TEXT,
+        created_at INTEGER NOT NULL
+      ) STRICT`,
+      // Strongly consistent per-(connection, agent) write brake. The empty
+      // agent id is the connection's human chat-write bucket.
+      `CREATE TABLE mcp_write_limits (
+        connection_id TEXT NOT NULL REFERENCES oauth_connections(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL,
+        window_started_at INTEGER NOT NULL,
+        write_count INTEGER NOT NULL CHECK (write_count >= 0),
+        PRIMARY KEY (connection_id, agent_id)
+      ) STRICT`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

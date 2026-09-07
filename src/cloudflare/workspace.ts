@@ -47,9 +47,11 @@ import {
   AUTHORIZATION_CODE_TTL_MS,
   checkCodeExchange,
   checkPresentedToken,
+  constantTimeEquals,
   decideRefresh,
   formatToken,
   hashSecret,
+  nextMcpWriteWindow,
   parseToken,
   parseTokenOfKind,
   randomSecret,
@@ -116,11 +118,12 @@ import {
   channelMemberIds,
   insertChannel,
   insertMessage,
+  insertMcpMessageAttribution,
   isChannelMember,
   listChannelHistory,
   listThreadHistory,
   agentOwnerIds,
-  agentQueueDepth,
+  visibleAgentQueueDepth,
   agentScopeChannelIds,
   claimDueScheduledMessages,
   customEmojiExists,
@@ -129,7 +132,7 @@ import {
   insertCustomEmoji,
   insertSnippet,
   enqueueAgentWork,
-  listAgentQueue,
+  pageAgentQueue,
   listAgentRows,
   listCustomEmoji,
   insertScheduledMessage,
@@ -144,6 +147,7 @@ import {
   readScheduledMessage,
   replaceAgentScope,
   readSnippets,
+  readMcpMessageAttributions,
   settleScheduledMessage,
   updateScheduledMessage,
   writeDraft,
@@ -182,10 +186,12 @@ import {
   resolveMentionTargets,
   writeChannelCursor,
   writeThreadCursor,
+  setAgentQueueReadState,
   type AgentRow,
   type ChannelRow,
   type CustomEmojiRow,
   type QueueItemRow,
+  type AgentQueueCursor,
   type DraftRow,
   type MessagePage,
   type MessageRow,
@@ -383,6 +389,40 @@ export type OauthPrincipal = {
 export type OauthPrincipalResult =
   | { ok: true; principal: OauthPrincipal }
   | { ok: false; error: "invalid_token" | "insufficient_scope"; description: string };
+
+export type McpAttribution = {
+  connectionId: string;
+  memberId: string;
+  memberHandle: string;
+  clientId: string;
+  clientName: string | null;
+};
+
+export type AgentLease = {
+  itemId: string;
+  agentId: string;
+  messageId: string;
+  channelId: string;
+  sessionId: string;
+  leaseGeneration: number;
+  leaseExpiresAt: number;
+  attemptCount: number;
+  claimId: string;
+};
+
+export type AgentLeaseResult =
+  | { ok: true; lease: AgentLease; item: QueueItemRow; replayed: boolean }
+  | { ok: true; lease: null; item: null; replayed: false };
+
+export type AgentLeaseProof = {
+  actor: Actor;
+  connectionId: string;
+  agent: string;
+  itemId: string;
+  sessionId: string;
+  leaseGeneration: number;
+  leaseToken: string;
+};
 
 export type OauthConnectionSummary = {
   id: string;
@@ -2122,6 +2162,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       this.ctx.storage,
       messages.map((message) => message.id),
     );
+    const mcpAttributions = readMcpMessageAttributions(
+      this.ctx.storage,
+      messages.map((message) => message.id),
+    );
     const pinsByChannel = new Map<string, Set<string>>();
 
     const decorated = annotated.messages.map((message) => {
@@ -2148,6 +2192,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         isSaved: saved.has(message.id),
         isPinned: pinsByChannel.get(message.channelId)!.has(message.id),
         snippet: snippets.get(message.id) ?? null,
+        mcpAttribution: mcpAttributions.get(message.id) ?? null,
       };
     });
 
@@ -3073,7 +3118,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         scopeChannelCount: scopeChannelIds.length,
         ownerIds,
         isOwner: ownerIds.includes(actor.id),
-        queueDepth: ownerIds.includes(actor.id) ? agentQueueDepth(this.ctx.storage, agent.id) : null,
+        queueDepth: ownerIds.includes(actor.id)
+          ? visibleAgentQueueDepth(this.ctx.storage, agent.id, actor.id)
+          : null,
       };
     });
     return { agents };
@@ -3114,14 +3161,363 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const actor = this.authorizeActor(input.actor);
     const agent = this.requireOwnedAgent(input.agentId, actor.id);
     return {
-      items: listAgentQueue(
-        this.ctx.storage,
-        agent.id,
-        clampHistoryLimit(input.limit),
-        input.unreadOnly !== false,
-      ),
-      depth: agentQueueDepth(this.ctx.storage, agent.id),
+      items: pageAgentQueue(this.ctx.storage, {
+        agentId: agent.id,
+        memberId: actor.id,
+        limit: clampHistoryLimit(input.limit),
+        unreadOnly: input.unreadOnly !== false,
+        order: "oldest",
+        cursor: null,
+      }).items,
+      depth: visibleAgentQueueDepth(this.ctx.storage, agent.id, actor.id),
     };
+  }
+
+  /** MCP inbox paging is keyset-based and delivery state is explicit. */
+  readAgentQueuePage(input: {
+    actor: Actor;
+    agent: string;
+    limit?: number;
+    unreadOnly?: boolean;
+    order?: "oldest" | "newest";
+    cursor?: AgentQueueCursor | null;
+    peek?: boolean;
+    now: number;
+  }): { agent: AgentRow; items: readonly QueueItemRow[]; nextCursor: AgentQueueCursor | null; depth: number } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const agent = this.requireOwnedAgentArgument(input.agent, actor.id);
+    const page = pageAgentQueue(this.ctx.storage, {
+      agentId: agent.id,
+      memberId: actor.id,
+      limit: clampHistoryLimit(input.limit),
+      unreadOnly: input.unreadOnly !== false,
+      order: input.order ?? "newest",
+      cursor: input.cursor ?? null,
+    });
+    if (input.peek !== true && page.items.length > 0) {
+      this.ctx.storage.transactionSync(() => {
+        for (const item of page.items) {
+          setAgentQueueReadState(this.ctx.storage, { agentId: agent.id, itemId: item.id, readAt: input.now });
+        }
+      });
+    }
+    return { agent, ...page, depth: visibleAgentQueueDepth(this.ctx.storage, agent.id, actor.id) };
+  }
+
+  setAgentQueueDisplayState(input: {
+    actor: Actor;
+    agent: string;
+    itemId: string;
+    read: boolean;
+    now: number;
+  }): { changed: boolean } {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgentArgument(input.agent, actor.id);
+    const changed = this.ctx.storage.transactionSync(() =>
+      setAgentQueueReadState(this.ctx.storage, {
+        agentId: agent.id,
+        itemId: input.itemId,
+        readAt: input.read ? input.now : null,
+      }),
+    );
+    if (!changed) throw new Error("queue item not found");
+    return { changed };
+  }
+
+  /**
+   * Claim one item without changing its human display state. The caller brings
+   * a random lease secret; only its digest is persisted, which also makes a
+   * lost response safely replayable under the same claim id and secret.
+   */
+  async claimAgentWork(input: {
+    actor: Actor;
+    connectionId: string;
+    agent: string;
+    claimId: string;
+    leaseToken: string;
+    sessionId: string;
+    peek?: boolean;
+    now: number;
+  }): Promise<AgentLeaseResult> {
+    if (input.claimId.length < 8 || input.claimId.length > 200) throw new Error("invalid claim id");
+    if (input.sessionId.length < 1 || input.sessionId.length > 200) throw new Error("invalid session id");
+    if (input.leaseToken.length < 32 || input.leaseToken.length > 512) throw new Error("invalid lease token");
+    const leaseTokenHash = await hashSecret(input.leaseToken);
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const agent = this.requireOwnedAgentArgument(input.agent, actor.id);
+    if (agent.status !== "active") throw new Error("agent is not active");
+    this.requireLiveMcpConnection(input.connectionId, actor.id);
+
+    return this.ctx.storage.transactionSync(() => {
+      this.expireAgentClaims(agent.id, input.now);
+
+      const replay = this.ctx.storage.sql
+        .exec<{
+          id: string;
+          message_id: string;
+          channel_id: string;
+          enqueued_at: number;
+          read_at: number | null;
+          flags_json: string;
+          body_markdown: string;
+          author_display_snapshot: string;
+          lease_generation: number;
+          lease_expires_at: number;
+          attempt_count: number;
+          lease_token_hash: string;
+        }>(
+          `SELECT q.id, q.message_id, q.channel_id, q.enqueued_at, q.read_at, q.flags_json,
+                  m.body_markdown, m.author_display_snapshot, q.lease_generation,
+                  q.lease_expires_at, q.attempt_count, q.lease_token_hash
+           FROM agent_queue q JOIN messages m ON m.id = q.message_id
+           WHERE q.agent_id = ? AND q.claim_id = ? AND q.execution_state = 'claimed'
+             AND q.lease_connection_id = ? AND q.lease_session_id = ?`,
+          agent.id,
+          input.claimId,
+          input.connectionId,
+          input.sessionId,
+        )
+        .toArray()[0];
+      if (replay !== undefined) {
+        if (replay.lease_token_hash !== leaseTokenHash) throw new Error("claim id was reused with another lease token");
+        if (input.peek !== true) {
+          setAgentQueueReadState(this.ctx.storage, { agentId: agent.id, itemId: replay.id, readAt: input.now });
+        }
+        return {
+          ok: true as const,
+          lease: this.leaseFromRow(agent.id, input.claimId, input.sessionId, replay),
+          item: this.queueItemFromRow(replay),
+          replayed: true,
+        };
+      }
+
+      const row = this.ctx.storage.sql
+        .exec<{
+          id: string;
+          message_id: string;
+          channel_id: string;
+          enqueued_at: number;
+          read_at: number | null;
+          flags_json: string;
+          body_markdown: string;
+          author_display_snapshot: string;
+          lease_generation: number;
+          attempt_count: number;
+        }>(
+          `SELECT q.id, q.message_id, q.channel_id, q.enqueued_at, q.read_at, q.flags_json,
+                  m.body_markdown, m.author_display_snapshot, q.lease_generation, q.attempt_count
+           FROM agent_queue q
+           JOIN messages m ON m.id = q.message_id
+           JOIN channels c ON c.id = q.channel_id
+           WHERE q.agent_id = ? AND q.execution_state = 'pending' AND q.not_before <= ?
+             AND m.deleted_at IS NULL
+             AND (c.kind = 'public' OR EXISTS (
+               SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_id = ?
+             ))
+           ORDER BY q.enqueued_at, q.id LIMIT 1`,
+          agent.id,
+          input.now,
+          actor.id,
+        )
+        .toArray()[0];
+      if (row === undefined) return { ok: true as const, lease: null, item: null, replayed: false as const };
+
+      const leaseGeneration = row.lease_generation + 1;
+      const attemptCount = row.attempt_count + 1;
+      const leaseExpiresAt = input.now + 60_000;
+      const claimed = this.ctx.storage.sql.exec(
+        `UPDATE agent_queue SET execution_state = 'claimed', attempt_count = ?,
+           lease_generation = ?, lease_connection_id = ?, lease_session_id = ?,
+           lease_token_hash = ?, lease_expires_at = ?, execution_started_at = NULL,
+           claim_id = ?, completion_id = NULL, completion_digest = NULL,
+           completion_result_json = NULL, completed_at = NULL
+         WHERE id = ? AND agent_id = ? AND execution_state = 'pending'`,
+        attemptCount,
+        leaseGeneration,
+        input.connectionId,
+        input.sessionId,
+        leaseTokenHash,
+        leaseExpiresAt,
+        input.claimId,
+        row.id,
+        agent.id,
+      );
+      if (claimed.rowsWritten === 0) throw new Error("queue claim raced");
+      appendAuditEntry(
+        this.ctx.storage,
+        this.workspaceKey(),
+        {
+          eventType: "agent.work_claimed",
+          outcome: "allowed",
+          requesterKind: "member",
+          requesterId: actor.id,
+          subjectKind: "agent_queue_item",
+          subjectId: row.id,
+          metadata: {
+            agent_id: agent.id,
+            connection_id: input.connectionId,
+            session_id: input.sessionId,
+            lease_generation: leaseGeneration,
+            attempt_count: attemptCount,
+          },
+        },
+        input.now,
+      );
+      if (input.peek !== true) {
+        setAgentQueueReadState(this.ctx.storage, { agentId: agent.id, itemId: row.id, readAt: input.now });
+      }
+      const leaseRow = { ...row, lease_generation: leaseGeneration, lease_expires_at: leaseExpiresAt, attempt_count: attemptCount };
+      return {
+        ok: true as const,
+        lease: this.leaseFromRow(agent.id, input.claimId, input.sessionId, leaseRow),
+        item: this.queueItemFromRow(row),
+        replayed: false,
+      };
+    });
+  }
+
+  async renewAgentLease(input: AgentLeaseProof & { now: number }): Promise<{ leaseExpiresAt: number }> {
+    const proof = await this.authorizeAgentLease(input);
+    const leaseExpiresAt = input.now + 60_000;
+    const changed = this.ctx.storage.sql.exec(
+      `UPDATE agent_queue SET lease_expires_at = ?
+       WHERE id = ? AND agent_id = ? AND execution_state = 'claimed'
+         AND lease_connection_id = ? AND lease_session_id = ? AND lease_generation = ?
+         AND lease_token_hash = ? AND lease_expires_at > ?`,
+      leaseExpiresAt,
+      input.itemId,
+      proof.agent.id,
+      input.connectionId,
+      input.sessionId,
+      input.leaseGeneration,
+      proof.leaseTokenHash,
+      input.now,
+    );
+    if (changed.rowsWritten === 0) throw new Error("stale agent lease");
+    return { leaseExpiresAt };
+  }
+
+  async markAgentExecutionStarted(input: AgentLeaseProof & { now: number }): Promise<{ startedAt: number }> {
+    const proof = await this.authorizeAgentLease(input);
+    const changed = this.ctx.storage.sql.exec(
+      `UPDATE agent_queue SET execution_started_at = COALESCE(execution_started_at, ?)
+       WHERE id = ? AND agent_id = ? AND execution_state = 'claimed'
+         AND lease_connection_id = ? AND lease_session_id = ? AND lease_generation = ?
+         AND lease_token_hash = ? AND lease_expires_at > ?`,
+      input.now,
+      input.itemId,
+      proof.agent.id,
+      input.connectionId,
+      input.sessionId,
+      input.leaseGeneration,
+      proof.leaseTokenHash,
+      input.now,
+    );
+    if (changed.rowsWritten === 0) throw new Error("stale agent lease");
+    const startedAt = this.ctx.storage.sql
+      .exec<{ execution_started_at: number }>("SELECT execution_started_at FROM agent_queue WHERE id = ?", input.itemId)
+      .one().execution_started_at;
+    return { startedAt };
+  }
+
+  async completeAgentWork(input: AgentLeaseProof & {
+    completionId: string;
+    outputDigest: string;
+    result?: Record<string, unknown> | null;
+    now: number;
+  }): Promise<{ completedAt: number; replayed: boolean }> {
+    if (input.completionId.length === 0 || input.completionId.length > 200) {
+      throw new Error("completion id is invalid");
+    }
+    if (input.outputDigest.length === 0 || input.outputDigest.length > 256) {
+      throw new Error("output digest is invalid");
+    }
+    const resultJson = JSON.stringify(input.result ?? {});
+    if (resultJson.length > 16_000) throw new Error("completion result is too large");
+    const proof = await this.authorizeAgentLease(input, true);
+    return this.ctx.storage.transactionSync(() => {
+      const existing = this.ctx.storage.sql
+        .exec<{ completion_id: string | null; completion_digest: string | null; completed_at: number | null }>(
+          "SELECT completion_id, completion_digest, completed_at FROM agent_queue WHERE id = ? AND agent_id = ?",
+          input.itemId,
+          proof.agent.id,
+        )
+        .one();
+      if (existing.completed_at !== null) {
+        if (existing.completion_id === input.completionId && existing.completion_digest === input.outputDigest) {
+          return { completedAt: existing.completed_at, replayed: true };
+        }
+        throw new Error("completion id or digest conflicts with the recorded result");
+      }
+      const changed = this.ctx.storage.sql.exec(
+        `UPDATE agent_queue SET execution_state = 'completed', completion_id = ?, completion_digest = ?,
+           completion_result_json = ?, completed_at = ?, lease_expires_at = NULL
+         WHERE id = ? AND agent_id = ? AND execution_state = 'claimed'
+           AND lease_connection_id = ? AND lease_session_id = ? AND lease_generation = ?
+           AND lease_token_hash = ? AND lease_expires_at > ?`,
+        input.completionId,
+        input.outputDigest,
+        resultJson,
+        input.now,
+        input.itemId,
+        proof.agent.id,
+        input.connectionId,
+        input.sessionId,
+        input.leaseGeneration,
+        proof.leaseTokenHash,
+        input.now,
+      );
+      if (changed.rowsWritten === 0) throw new Error("stale agent lease");
+      appendAuditEntry(
+        this.ctx.storage,
+        this.workspaceKey(),
+        {
+          eventType: "agent.work_completed",
+          outcome: "allowed",
+          requesterKind: "member",
+          requesterId: input.actor.memberId,
+          subjectKind: "agent_queue_item",
+          subjectId: input.itemId,
+          metadata: {
+            agent_id: proof.agent.id,
+            connection_id: input.connectionId,
+            session_id: input.sessionId,
+            lease_generation: input.leaseGeneration,
+            completion_id: input.completionId,
+            output_digest: input.outputDigest,
+          },
+        },
+        input.now,
+      );
+      return { completedAt: input.now, replayed: false };
+    });
+  }
+
+  async postMcpMessage(input: {
+    actor: Actor;
+    connectionId: string;
+    idempotencyKey: string;
+    channelId: string;
+    bodyMarkdown: string;
+    threadParentId?: string | null;
+    now: number;
+  }): Promise<SentMessage> {
+    return this.sendAttributedMcpMessage({ ...input, agentArgument: null });
+  }
+
+  async postMcpAgentMessage(input: {
+    actor: Actor;
+    connectionId: string;
+    agent: string;
+    idempotencyKey: string;
+    channelId: string;
+    bodyMarkdown: string;
+    threadParentId?: string | null;
+    now: number;
+  }): Promise<SentMessage> {
+    return this.sendAttributedMcpMessage({ ...input, agentArgument: input.agent });
   }
 
   /**
@@ -3159,6 +3555,332 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       throw new Error("agent not found");
     }
     return agent;
+  }
+
+  private requireOwnedAgentArgument(agentArgument: string, memberId: string): AgentRow {
+    const normalized = agentArgument.startsWith("@") ? agentArgument.slice(1) : agentArgument;
+    const agent = normalized.startsWith("a.")
+      ? readAgentByHandle(this.ctx.storage, normalized)
+      : readAgent(this.ctx.storage, normalized);
+    if (agent === null || !agentOwnerIds(this.ctx.storage, agent.id).includes(memberId)) {
+      throw new Error("agent not found");
+    }
+    return agent;
+  }
+
+  private requireLiveMcpConnection(connectionId: string, memberId: string): void {
+    const connection = readOauthConnection(this.ctx.storage, connectionId);
+    if (connection === null || connection.revokedAt !== null || connection.memberId !== memberId) {
+      throw new Error("MCP connection is no longer active");
+    }
+  }
+
+  private expireAgentClaims(agentId: string, now: number): void {
+    const expired = this.ctx.storage.sql
+      .exec<{ id: string; attempt_count: number; execution_started_at: number | null }>(
+        `SELECT id, attempt_count, execution_started_at FROM agent_queue
+         WHERE agent_id = ? AND execution_state = 'claimed' AND lease_expires_at <= ?`,
+        agentId,
+        now,
+      )
+      .toArray();
+    const backoff = [5_000, 30_000, 120_000, 600_000] as const;
+    for (const item of expired) {
+      if (item.execution_started_at !== null) {
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_queue SET execution_state = 'needs_attention', lease_token_hash = NULL,
+             lease_expires_at = NULL WHERE id = ? AND execution_state = 'claimed'`,
+          item.id,
+        );
+      } else if (item.attempt_count >= 5) {
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_queue SET execution_state = 'dead_letter', lease_token_hash = NULL,
+             lease_expires_at = NULL WHERE id = ? AND execution_state = 'claimed'`,
+          item.id,
+        );
+      } else {
+        const retryAt = now + (backoff[Math.min(item.attempt_count - 1, backoff.length - 1)] ?? 600_000);
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_queue SET execution_state = 'pending', not_before = ?,
+             lease_connection_id = NULL, lease_session_id = NULL, lease_token_hash = NULL,
+             lease_expires_at = NULL, execution_started_at = NULL, claim_id = NULL
+           WHERE id = ? AND execution_state = 'claimed'`,
+          retryAt,
+          item.id,
+        );
+      }
+    }
+  }
+
+  private queueItemFromRow(row: {
+    id: string;
+    message_id: string;
+    channel_id: string;
+    enqueued_at: number;
+    read_at: number | null;
+    flags_json: string;
+    body_markdown: string;
+    author_display_snapshot: string;
+  }): QueueItemRow {
+    return {
+      id: row.id,
+      messageId: row.message_id,
+      channelId: row.channel_id,
+      enqueuedAt: row.enqueued_at,
+      readAt: row.read_at,
+      flags: JSON.parse(row.flags_json) as string[],
+      bodyMarkdown: row.body_markdown,
+      authorDisplaySnapshot: row.author_display_snapshot,
+    };
+  }
+
+  private leaseFromRow(
+    agentId: string,
+    claimId: string,
+    sessionId: string,
+    row: {
+      id: string;
+      message_id: string;
+      channel_id: string;
+      lease_generation: number;
+      lease_expires_at: number;
+      attempt_count: number;
+    },
+  ): AgentLease {
+    return {
+      itemId: row.id,
+      agentId,
+      messageId: row.message_id,
+      channelId: row.channel_id,
+      sessionId,
+      leaseGeneration: row.lease_generation,
+      leaseExpiresAt: row.lease_expires_at,
+      attemptCount: row.attempt_count,
+      claimId,
+    };
+  }
+
+  private async authorizeAgentLease(
+    input: AgentLeaseProof & { now: number },
+    allowCompleted = false,
+  ): Promise<{ agent: AgentRow; leaseTokenHash: string }> {
+    const leaseTokenHash = await hashSecret(input.leaseToken);
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgentArgument(input.agent, actor.id);
+    if (agent.status !== "active") throw new Error("agent is not active");
+    this.requireLiveMcpConnection(input.connectionId, actor.id);
+    const row = this.ctx.storage.sql
+      .exec<{
+        execution_state: string;
+        lease_connection_id: string | null;
+        lease_session_id: string | null;
+        lease_generation: number;
+        lease_token_hash: string | null;
+        lease_expires_at: number | null;
+      }>(
+        `SELECT execution_state, lease_connection_id, lease_session_id, lease_generation,
+                lease_token_hash, lease_expires_at
+         FROM agent_queue WHERE id = ? AND agent_id = ?`,
+        input.itemId,
+        agent.id,
+      )
+      .toArray()[0];
+    if (row === undefined || (row.execution_state !== "claimed" && !(allowCompleted && row.execution_state === "completed"))) {
+      throw new Error("stale agent lease");
+    }
+    if (
+      row.lease_connection_id !== input.connectionId ||
+      row.lease_session_id !== input.sessionId ||
+      row.lease_generation !== input.leaseGeneration ||
+      row.lease_token_hash === null ||
+      !constantTimeEquals(row.lease_token_hash, leaseTokenHash) ||
+      (row.execution_state === "claimed" && (row.lease_expires_at === null || row.lease_expires_at <= input.now))
+    ) {
+      throw new Error("stale agent lease");
+    }
+    return { agent, leaseTokenHash };
+  }
+
+  private async sendAttributedMcpMessage(input: {
+    actor: Actor;
+    connectionId: string;
+    agentArgument: string | null;
+    idempotencyKey: string;
+    channelId: string;
+    bodyMarkdown: string;
+    threadParentId?: string | null;
+    now: number;
+  }): Promise<SentMessage> {
+    this.requireCloudContentAuthority();
+    const body = parseMessageBody(input.bodyMarkdown);
+    if (body === null) throw new Error("message body is empty or too long");
+    // Digest before the authority checks: SubtleCrypto yields. Every live
+    // membership, owner, connection and scope decision below is therefore made
+    // after the last await and cannot go stale before the transaction commits.
+    const bodyDigest = await hashSecret(body);
+    const actor = this.authorizeActor(input.actor);
+    const connection = readOauthConnection(this.ctx.storage, input.connectionId);
+    if (connection === null || connection.revokedAt !== null || connection.memberId !== actor.id) {
+      throw new Error("MCP connection is no longer active");
+    }
+    const agent = input.agentArgument === null ? null : this.requireOwnedAgentArgument(input.agentArgument, actor.id);
+    if (agent !== null && agent.status !== "active") throw new Error("agent is not active");
+    const channel = this.requireChannelParticipant(input.channelId, actor.id);
+    if (channel.archivedAt !== null) throw new Error("this room is archived");
+    if (
+      agent !== null &&
+      !agentMayPostIn({
+        agentStatus: agent.status,
+        scope: this.agentScope(agent),
+        channelId: channel.id,
+      })
+    ) {
+      throw new Error("agent cannot post in this room");
+    }
+    const parent = input.threadParentId ? readMessage(this.ctx.storage, input.threadParentId) : null;
+    if (input.threadParentId && parent === null) throw new Error("thread parent not found");
+    const placement = resolveThreadPlacement(parent, channel.id);
+    if (placement.kind === "invalid") throw new Error(placement.reason);
+    const threadRootId = placement.kind === "reply" ? placement.threadRootId : null;
+
+    const outcome = await this.commitMutation(
+      {
+        scope: agent === null ? "mcp.message.send" : "mcp.agent.send",
+        idempotencyKey: input.idempotencyKey,
+        requestHash: `${actor.id}|${agent?.id ?? "member"}|${channel.id}|${threadRootId ?? ""}|${bodyDigest}`,
+        now: input.now,
+      },
+      () => {
+        this.consumeMcpWrite(input.connectionId, agent?.id ?? "", input.now);
+        const messageId = crypto.randomUUID();
+        const channelSequence = nextChannelSequence(this.ctx.storage, channel.id);
+        const mentions = resolveMentionTargets(this.ctx.storage, parseMentions(body));
+        const authorKind = agent === null ? "member" : "agent";
+        const authorId = agent?.id ?? actor.id;
+        insertMessage(this.ctx.storage, {
+          id: messageId,
+          channelId: channel.id,
+          threadRootId,
+          authorKind,
+          authorId,
+          authorDisplaySnapshot: agent?.displayName ?? actor.displayName,
+          bodyMarkdown: body,
+          channelSequence,
+          now: input.now,
+        });
+        replaceMentions(this.ctx.storage, messageId, mentions, input.now);
+        // Deliberately call the shared enqueue rule even for an agent post: it
+        // is the single brake that prevents any agent-authored message from
+        // starting another agent loop.
+        const enqueued = this.enqueueAgentMentions({
+          messageId,
+          channelId: channel.id,
+          authorKind,
+          authorId,
+          bodyMarkdown: body,
+          mentions,
+          isHistorical: false,
+          now: input.now,
+        });
+        insertMcpMessageAttribution(this.ctx.storage, {
+          messageId,
+          connectionId: connection.id,
+          operatingMemberId: actor.id,
+          agentId: agent?.id ?? null,
+          clientId: connection.clientId,
+          clientName: connection.clientName,
+          createdAt: input.now,
+        });
+        return {
+          result: {
+            messageId,
+            channelId: channel.id,
+            threadRootId,
+            channelSequence,
+            createdAt: input.now,
+            replayed: false,
+          },
+          effects: {
+            audit: {
+              eventType: "mcp.message_created",
+              outcome: "allowed" as const,
+              requesterKind: "member" as const,
+              requesterId: actor.id,
+              subjectKind: "message",
+              subjectId: messageId,
+              metadata: {
+                channel_id: channel.id,
+                in_thread: threadRootId !== null,
+                connection_id: connection.id,
+                client_id: connection.clientId,
+                operating_agent_id: agent?.id ?? null,
+                agent_work_enqueued: enqueued,
+              },
+            },
+            replay: [
+              {
+                kind: "message.created",
+                audience: [channel.id],
+                payload: {
+                  messageId,
+                  channelId: channel.id,
+                  threadRootId,
+                  channelSequence,
+                  authorId,
+                  createdAt: input.now,
+                },
+              },
+            ],
+            outbox: [
+              {
+                id: `message.${messageId}`,
+                kind: "message_created",
+                dedupeKey: `message:${messageId}`,
+                payload: { messageId, channelId: channel.id, threadRootId },
+              },
+            ],
+          } satisfies MutationEffects,
+        };
+      },
+    );
+
+    if (!outcome.replayed) {
+      this.broadcastChannelEvent(channel, this.latestReplaySequence(), "message.created", {
+        messageId: outcome.result.messageId,
+        channelId: channel.id,
+        threadRootId: outcome.result.threadRootId,
+        channelSequence: outcome.result.channelSequence,
+        authorId: agent?.id ?? actor.id,
+        createdAt: input.now,
+      });
+    }
+    return { ...outcome.result, replayed: outcome.replayed };
+  }
+
+  private consumeMcpWrite(connectionId: string, agentId: string, now: number): void {
+    const current = this.ctx.storage.sql
+      .exec<{ window_started_at: number; write_count: number }>(
+        "SELECT window_started_at, write_count FROM mcp_write_limits WHERE connection_id = ? AND agent_id = ?",
+        connectionId,
+        agentId,
+      )
+      .toArray()[0];
+    const next = nextMcpWriteWindow({
+      now,
+      windowStartedAt: current?.window_started_at ?? null,
+      writeCount: current?.write_count ?? 0,
+    });
+    if (!next.allowed) throw new Error(`rate limited; retry after ${next.retryAfterMs} ms`);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO mcp_write_limits(connection_id, agent_id, window_started_at, write_count)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(connection_id, agent_id) DO UPDATE SET
+         window_started_at = excluded.window_started_at, write_count = excluded.write_count`,
+      connectionId,
+      agentId,
+      next.windowStartedAt,
+      next.writeCount,
+    );
   }
 
   /** An owner cannot scope an agent to a room they cannot reach themselves. */
@@ -3264,6 +3986,36 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     this.requireVisibleChannel(root.channelId, actor.id);
     const page = listThreadHistory(this.ctx.storage, root.id, input.cursor ?? null, input.limit);
     return { ...this.decorateMessages(page.messages, actor.id), nextCursor: page.nextCursor };
+  }
+
+  /** MCP never auto-joins or treats a public-room id as membership. */
+  readMcpChannelHistory(input: {
+    actor: Actor;
+    channelId: string;
+    cursor?: string | null;
+    limit?: number;
+  }): MessagePage {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireChannelParticipant(input.channelId, actor.id);
+    const page = listChannelHistory(this.ctx.storage, channel.id, input.cursor ?? null, input.limit);
+    return { ...this.decorateMessages(page.messages, actor.id), nextCursor: page.nextCursor };
+  }
+
+  readMcpThreadHistory(input: {
+    actor: Actor;
+    threadRootId: string;
+    cursor?: string | null;
+    limit?: number;
+  }): MessagePage {
+    const actor = this.authorizeActor(input.actor);
+    const root = readMessage(this.ctx.storage, input.threadRootId);
+    if (root === null || root.threadRootId !== null) throw new Error("thread not found");
+    this.requireChannelParticipant(root.channelId, actor.id);
+    const page = listThreadHistory(this.ctx.storage, root.id, input.cursor ?? null, input.limit);
+    return {
+      ...this.decorateMessages([root, ...page.messages], actor.id),
+      nextCursor: page.nextCursor,
+    };
   }
 
   browseChannels(input: { actor: Actor; includeArchived?: boolean }): {

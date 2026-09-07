@@ -19,11 +19,15 @@ import {
   isRegistrableRedirectUri,
   isWellFormedCodeVerifier,
   originFromHeaders,
+  encodeAgentQueueCursor,
+  nextMcpWriteWindow,
+  parseAgentQueueCursor,
   parseClientRegistration,
   parseCodeChallenge,
   parseScope,
   parseToken,
   parseTokenOfKind,
+  parseMcpToolCall,
   protectedResourceMetadata,
   protectedResourceMetadataUrl,
   redirectUriAllowed,
@@ -592,6 +596,80 @@ describe("MCP-RULE-015 the metadata documents say exactly what is implemented", 
       authorization_servers: [ORIGIN],
       scopes_supported: ["chat:read", "chat:write", "agent", "vault"],
       bearer_methods_supported: ["header"],
+    });
+  });
+});
+
+describe("MCP-RULE-017 tool calls are total and scope-bound", () => {
+  it("accepts a known call and returns the scope the resource server must demand", () => {
+    expect(
+      parseMcpToolCall({
+        name: "agent_post",
+        arguments: {
+          agent: "a.releasebot",
+          channel_id: "channel-1",
+          content: "done",
+          idempotency_key: "mcp:agent:post:0001",
+        },
+      }),
+    ).toMatchObject({ ok: true, requiredScope: "agent", call: { name: "agent_post" } });
+    expect(parseMcpToolCall({ name: "post_message", arguments: {} })).toMatchObject({
+      ok: false,
+      code: -32602,
+      message: "missing argument channel_id",
+    });
+  });
+
+  it("refuses unknown tools, fields, enum members and oversized values", () => {
+    expect(parseMcpToolCall({ name: "cast_vote", arguments: {} })).toMatchObject({ ok: false });
+    expect(parseMcpToolCall({ name: "whoami", arguments: { user_id: "other" } })).toMatchObject({
+      ok: false,
+      message: "unknown argument user_id",
+    });
+    expect(
+      parseMcpToolCall({ name: "agent_inbox", arguments: { agent: "a.bot", order: "sideways" } }),
+    ).toMatchObject({ ok: false, message: "invalid argument order" });
+    expect(
+      parseMcpToolCall({
+        name: "post_message",
+        arguments: { channel_id: "c", content: "x".repeat(8001), idempotency_key: "key" },
+      }),
+    ).toMatchObject({ ok: false, message: "invalid argument content" });
+  });
+});
+
+describe("MCP-RULE-018 queue cursors are opaque and lossless", () => {
+  it("round-trips the keyset and refuses malformed or differently versioned cursors", () => {
+    const cursor = encodeAgentQueueCursor({ enqueuedAt: 1_800_000_000_123, messageId: "message-z" });
+    expect(parseAgentQueueCursor(cursor)).toEqual({ enqueuedAt: 1_800_000_000_123, messageId: "message-z" });
+    expect(parseAgentQueueCursor("not-json")).toBeNull();
+    const wrongVersion = base64url(new TextEncoder().encode(JSON.stringify({ v: 2, t: 1, m: "m" })));
+    expect(parseAgentQueueCursor(wrongVersion)).toBeNull();
+  });
+});
+
+describe("MCP-RULE-019 write limiting has one controlled window", () => {
+  it("starts, increments, refuses at the cap and resets at the boundary", () => {
+    expect(nextMcpWriteWindow({ now: 100, windowStartedAt: null, writeCount: 0 })).toEqual({
+      allowed: true,
+      windowStartedAt: 100,
+      writeCount: 1,
+      retryAfterMs: 0,
+    });
+    expect(nextMcpWriteWindow({ now: 110, windowStartedAt: 100, writeCount: 1 })).toMatchObject({
+      allowed: true,
+      writeCount: 2,
+    });
+    expect(nextMcpWriteWindow({ now: 59_999, windowStartedAt: 0, writeCount: 20 })).toEqual({
+      allowed: false,
+      windowStartedAt: 0,
+      writeCount: 20,
+      retryAfterMs: 1,
+    });
+    expect(nextMcpWriteWindow({ now: 60_000, windowStartedAt: 0, writeCount: 20 })).toMatchObject({
+      allowed: true,
+      windowStartedAt: 60_000,
+      writeCount: 1,
     });
   });
 });

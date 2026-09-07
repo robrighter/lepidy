@@ -12,7 +12,7 @@ describe("Workspace Durable Object migrations", () => {
 
     await expect(stub.health()).resolves.toEqual({
       ok: true,
-      schemaVersion: 15,
+      schemaVersion: 16,
       status: "ready",
       error: null,
     });
@@ -30,7 +30,7 @@ describe("Workspace Durable Object migrations", () => {
         .toArray()
         .map(({ name }) => name);
 
-      expect(schemaRows).toEqual([{ singleton: 1, version: 15, status: "ready" }]);
+      expect(schemaRows).toEqual([{ singleton: 1, version: 16, status: "ready" }]);
       expect(tables).toEqual(
         expect.arrayContaining([
           "members",
@@ -62,12 +62,14 @@ describe("Workspace Durable Object migrations", () => {
           "agent_queue",
           "oauth_codes",
           "oauth_connections",
+          "mcp_message_attribution",
+          "mcp_write_limits",
         ]),
       );
     });
   });
 
-  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])("MIGRATION-INT-001 upgrades a historical version-%s workspace", async (version) => {
+  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])("MIGRATION-INT-001 upgrades a historical version-%s workspace", async (version) => {
     const stub = env.MIGRATION_FIXTURE.getByName(`historical-v${version}`);
 
     await expect(stub.migrateThrough(version)).resolves.toEqual({
@@ -76,12 +78,12 @@ describe("Workspace Durable Object migrations", () => {
       error: null,
     });
     await expect(stub.migrateCurrent()).resolves.toEqual({
-      version: 15,
+      version: 16,
       status: "ready",
       error: null,
     });
     await expect(stub.migrateCurrent()).resolves.toEqual({
-      version: 15,
+      version: 16,
       status: "ready",
       error: null,
     });
@@ -111,7 +113,7 @@ describe("Workspace Durable Object migrations", () => {
     });
 
     await expect(healthy.migrateCurrent()).resolves.toEqual({
-      version: 15,
+      version: 16,
       status: "ready",
       error: null,
     });

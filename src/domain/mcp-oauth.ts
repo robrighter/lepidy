@@ -777,3 +777,319 @@ export function protectedResourceMetadata(
     bearer_methods_supported: ["header"],
   };
 }
+
+/* -------------------------------------------------------------------------- */
+/* MCP tool protocol                                                           */
+/* -------------------------------------------------------------------------- */
+
+export type McpToolName =
+  | "whoami"
+  | "list_channels"
+  | "read_channel"
+  | "read_thread"
+  | "post_message"
+  | "list_agents"
+  | "agent_inbox"
+  | "agent_next"
+  | "agent_start"
+  | "agent_renew"
+  | "agent_complete"
+  | "agent_mark_read"
+  | "agent_mark_unread"
+  | "agent_post"
+  | "agent_get_prompt"
+  | "agent_set_prompt";
+
+export type McpToolDefinition = {
+  name: McpToolName;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  requiredScope: SupportedScope;
+};
+
+const objectSchema = (
+  properties: Record<string, unknown>,
+  required: readonly string[] = [],
+): Record<string, unknown> => ({
+  type: "object",
+  properties,
+  ...(required.length > 0 ? { required: [...required] } : {}),
+  additionalProperties: false,
+});
+
+const string = (description: string, maxLength = 256) => ({ type: "string", description, maxLength });
+const integer = (minimum: number, maximum: number) => ({ type: "integer", minimum, maximum });
+
+/** The advertised surface is one constant, so listing and dispatch cannot drift. */
+export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
+  {
+    name: "whoami",
+    description: "Return the workspace member and MCP connection this request acts as.",
+    inputSchema: objectSchema({}),
+    requiredScope: "chat:read",
+  },
+  {
+    name: "list_channels",
+    description: "List rooms and conversations the connected member has joined.",
+    inputSchema: objectSchema({ include_dms: { type: "boolean" } }),
+    requiredScope: "chat:read",
+  },
+  {
+    name: "read_channel",
+    description: "Read a joined room newest-first with opaque keyset pagination.",
+    inputSchema: objectSchema(
+      { channel_id: string("Room id"), cursor: string("Opaque cursor", 1024), limit: integer(1, 100) },
+      ["channel_id"],
+    ),
+    requiredScope: "chat:read",
+  },
+  {
+    name: "read_thread",
+    description: "Read replies in a visible thread oldest-first with opaque keyset pagination.",
+    inputSchema: objectSchema(
+      { message_id: string("Thread root message id"), cursor: string("Opaque cursor", 1024), limit: integer(1, 100) },
+      ["message_id"],
+    ),
+    requiredScope: "chat:read",
+  },
+  {
+    name: "post_message",
+    description: "Post as the connected member with durable MCP attribution; never joins a room automatically.",
+    inputSchema: objectSchema(
+      {
+        channel_id: string("Joined room id"),
+        content: string("Markdown message", 8000),
+        parent_id: string("Optional thread root id"),
+        idempotency_key: string("Stable retry key", 200),
+      },
+      ["channel_id", "content", "idempotency_key"],
+    ),
+    requiredScope: "chat:write",
+  },
+  {
+    name: "list_agents",
+    description: "List only agents the connected member owns, with scope and unread depth.",
+    inputSchema: objectSchema({}),
+    requiredScope: "agent",
+  },
+  {
+    name: "agent_inbox",
+    description: "Read an owned agent's mention inbox. Delivery marks items read unless peek is true.",
+    inputSchema: objectSchema(
+      {
+        agent: string("Agent id or a.handle"),
+        filter: { type: "string", enum: ["unread", "all"] },
+        order: { type: "string", enum: ["newest", "oldest"] },
+        limit: integer(1, 100),
+        cursor: string("Opaque cursor", 1024),
+        peek: { type: "boolean" },
+      },
+      ["agent"],
+    ),
+    requiredScope: "agent",
+  },
+  {
+    name: "agent_next",
+    description:
+      "Claim the oldest eligible item for an owned agent under a 60-second fenced lease. This call never parks.",
+    inputSchema: objectSchema(
+      {
+        agent: string("Agent id or a.handle"),
+        claim_id: string("Stable retry id", 200),
+        lease_token: string("Runner-generated random lease secret", 512),
+        session_id: string("Current runner session id", 200),
+        peek: { type: "boolean" },
+      },
+      ["agent", "claim_id", "lease_token", "session_id"],
+    ),
+    requiredScope: "agent",
+  },
+  {
+    name: "agent_start",
+    description: "Record execution start under the exact current lease before launching external work.",
+    inputSchema: leaseProofSchema(),
+    requiredScope: "agent",
+  },
+  {
+    name: "agent_renew",
+    description: "Renew the exact current fenced lease for another 60 seconds.",
+    inputSchema: leaseProofSchema(),
+    requiredScope: "agent",
+  },
+  {
+    name: "agent_complete",
+    description: "Idempotently complete the exact current lease with a stable completion id and output digest.",
+    inputSchema: objectSchema(
+      {
+        ...(leaseProofSchema().properties as Record<string, unknown>),
+        completion_id: string("Stable completion retry id", 200),
+        output_digest: string("Digest of the recorded outcome", 256),
+        result: { type: "object" },
+      },
+      ["agent", "item_id", "session_id", "lease_generation", "lease_token", "completion_id", "output_digest"],
+    ),
+    requiredScope: "agent",
+  },
+  {
+    name: "agent_mark_read",
+    description: "Mark one item in an owned agent's display inbox read.",
+    inputSchema: objectSchema({ agent: string("Agent id or a.handle"), item_id: string("Queue item id") }, ["agent", "item_id"]),
+    requiredScope: "agent",
+  },
+  {
+    name: "agent_mark_unread",
+    description: "Mark one item in an owned agent's display inbox unread without changing execution state.",
+    inputSchema: objectSchema({ agent: string("Agent id or a.handle"), item_id: string("Queue item id") }, ["agent", "item_id"]),
+    requiredScope: "agent",
+  },
+  {
+    name: "agent_post",
+    description: "Post as an owned agent in-scope, with its operating owner and connection recorded server-side.",
+    inputSchema: objectSchema(
+      {
+        agent: string("Agent id or a.handle"),
+        channel_id: string("Joined, in-scope room id"),
+        content: string("Markdown message", 8000),
+        parent_id: string("Optional thread root id"),
+        idempotency_key: string("Stable retry key", 200),
+      },
+      ["agent", "channel_id", "content", "idempotency_key"],
+    ),
+    requiredScope: "agent",
+  },
+  {
+    name: "agent_get_prompt",
+    description: "Return the security preamble and standing brief for an owned agent.",
+    inputSchema: objectSchema({ agent: string("Agent id or a.handle") }, ["agent"]),
+    requiredScope: "agent",
+  },
+  {
+    name: "agent_set_prompt",
+    description: "Replace the standing brief for an owned agent. The security preamble is immutable.",
+    inputSchema: objectSchema(
+      { agent: string("Agent id or a.handle"), prompt: { type: ["string", "null"], maxLength: 12000 } },
+      ["agent", "prompt"],
+    ),
+    requiredScope: "agent",
+  },
+] as const;
+
+export function mcpToolDefinition(name: unknown): McpToolDefinition | null {
+  return MCP_TOOL_DEFINITIONS.find((tool) => tool.name === name) ?? null;
+}
+
+export type ParsedMcpToolCall = { name: McpToolName; arguments: Record<string, unknown> };
+
+export type McpToolCallResult =
+  | { ok: true; call: ParsedMcpToolCall; requiredScope: SupportedScope }
+  | { ok: false; code: -32602; message: string };
+
+/**
+ * Protocol-shaped validation lives here, not in the route. Business methods
+ * still validate authority and content; this only establishes a total MCP call
+ * shape and rejects unknown fields before dispatch.
+ */
+export function parseMcpToolCall(params: unknown): McpToolCallResult {
+  if (!isRecord(params) || typeof params.name !== "string") {
+    return { ok: false, code: -32602, message: "tools/call requires a tool name" };
+  }
+  const tool = mcpToolDefinition(params.name);
+  if (tool === null) return { ok: false, code: -32602, message: `unknown tool ${params.name}` };
+  const args = params.arguments === undefined ? {} : params.arguments;
+  if (!isRecord(args)) return { ok: false, code: -32602, message: "tool arguments must be an object" };
+
+  const schema = tool.inputSchema as { properties: Record<string, unknown>; required?: string[] };
+  for (const key of Object.keys(args)) {
+    if (!(key in schema.properties)) return { ok: false, code: -32602, message: `unknown argument ${key}` };
+  }
+  for (const key of schema.required ?? []) {
+    if (!(key in args)) return { ok: false, code: -32602, message: `missing argument ${key}` };
+  }
+  for (const [key, value] of Object.entries(args)) {
+    if (!matchesProperty(value, schema.properties[key])) {
+      return { ok: false, code: -32602, message: `invalid argument ${key}` };
+    }
+  }
+  return { ok: true, call: { name: tool.name, arguments: args }, requiredScope: tool.requiredScope };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function leaseProofSchema(): Record<string, unknown> {
+  return objectSchema(
+    {
+      agent: string("Agent id or a.handle"),
+      item_id: string("Queue item id"),
+      session_id: string("Current runner session id", 200),
+      lease_generation: integer(1, Number.MAX_SAFE_INTEGER),
+      lease_token: string("Lease secret returned by the runner", 512),
+    },
+    ["agent", "item_id", "session_id", "lease_generation", "lease_token"],
+  );
+}
+
+function matchesProperty(value: unknown, raw: unknown): boolean {
+  if (!isRecord(raw)) return false;
+  const types = Array.isArray(raw.type) ? raw.type : [raw.type];
+  if (value === null) return types.includes("null");
+  if (types.includes("string") && typeof value === "string") {
+    if (typeof raw.maxLength === "number" && value.length > raw.maxLength) return false;
+    return !Array.isArray(raw.enum) || raw.enum.includes(value);
+  }
+  if (types.includes("boolean") && typeof value === "boolean") return true;
+  if (types.includes("object") && isRecord(value)) return true;
+  if (types.includes("integer") && Number.isSafeInteger(value)) {
+    return (
+      (typeof raw.minimum !== "number" || (value as number) >= raw.minimum) &&
+      (typeof raw.maximum !== "number" || (value as number) <= raw.maximum)
+    );
+  }
+  return false;
+}
+
+export function encodeAgentQueueCursor(cursor: { enqueuedAt: number; messageId: string }): string {
+  return base64url(new TextEncoder().encode(JSON.stringify({ v: 1, t: cursor.enqueuedAt, m: cursor.messageId })));
+}
+
+export function parseAgentQueueCursor(value: unknown): { enqueuedAt: number; messageId: string } | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > 1024) return null;
+  try {
+    const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - (value.length % 4)) % 4);
+    const parsed = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(padded), (c) => c.charCodeAt(0)))) as unknown;
+    if (!isRecord(parsed) || parsed.v !== 1 || !Number.isSafeInteger(parsed.t) || typeof parsed.m !== "string") {
+      return null;
+    }
+    return { enqueuedAt: parsed.t as number, messageId: parsed.m };
+  } catch {
+    return null;
+  }
+}
+
+export const MCP_WRITE_LIMIT = 20;
+export const MCP_WRITE_WINDOW_MS = 60_000;
+
+export function nextMcpWriteWindow(input: {
+  now: number;
+  windowStartedAt: number | null;
+  writeCount: number;
+}): { allowed: boolean; windowStartedAt: number; writeCount: number; retryAfterMs: number } {
+  if (input.windowStartedAt === null || input.now - input.windowStartedAt >= MCP_WRITE_WINDOW_MS) {
+    return { allowed: true, windowStartedAt: input.now, writeCount: 1, retryAfterMs: 0 };
+  }
+  if (input.writeCount >= MCP_WRITE_LIMIT) {
+    return {
+      allowed: false,
+      windowStartedAt: input.windowStartedAt,
+      writeCount: input.writeCount,
+      retryAfterMs: Math.max(1, input.windowStartedAt + MCP_WRITE_WINDOW_MS - input.now),
+    };
+  }
+  return {
+    allowed: true,
+    windowStartedAt: input.windowStartedAt,
+    writeCount: input.writeCount + 1,
+    retryAfterMs: 0,
+  };
+}

@@ -37,7 +37,7 @@ async function registerClient(request: APIRequestContext, name: string): Promise
 }
 
 /** Walk the consent screen and hand back the code the redirect carried. */
-async function consent(page: Page, input: { slug: string; clientId: string; state: string }): Promise<string> {
+async function consent(page: Page, input: { slug: string; clientId: string; state: string; scope?: string }): Promise<string> {
   const params = new URLSearchParams({
     response_type: "code",
     client_id: input.clientId,
@@ -45,7 +45,7 @@ async function consent(page: Page, input: { slug: string; clientId: string; stat
     code_challenge: await codeChallenge(),
     code_challenge_method: "S256",
     resource: `${BASE}/w/${input.slug}/mcp`,
-    scope: "chat:read chat:write",
+    scope: input.scope ?? "chat:read chat:write",
     state: input.state,
   });
   await page.goto(`/oauth/authorize?${params.toString()}`);
@@ -59,6 +59,21 @@ async function consent(page: Page, input: { slug: string; clientId: string; stat
   const code = landed.searchParams.get("code");
   expect(code).not.toBeNull();
   return code as string;
+}
+
+async function callTool(
+  request: APIRequestContext,
+  input: { slug: string; accessToken: string; id: number; name: string; arguments?: Record<string, unknown> },
+) {
+  return request.post(`${BASE}/w/${input.slug}/mcp`, {
+    headers: { authorization: `Bearer ${input.accessToken}` },
+    data: {
+      jsonrpc: "2.0",
+      id: input.id,
+      method: "tools/call",
+      params: { name: input.name, arguments: input.arguments ?? {} },
+    },
+  });
 }
 
 async function exchange(
@@ -246,4 +261,186 @@ test("MCP-INT-010 refuses one workspace's token at another workspace", async ({ 
   // rather than about the token having been spent.
   expect((await initialize(page.request, firstSlug, grant.access_token)).status()).toBe(200);
   await secondContext.close();
+});
+
+test("MCP-INT-011 lists and executes scoped chat and agent tools with stable attribution", async ({ page }) => {
+  const account = freshAccount();
+  await signUp(page, account);
+  const slug = slugFor(account);
+  const request = page.request;
+
+  await page.goto("/agents");
+  await page.getByLabel("Handle").fill("releasebot");
+  await page.getByLabel("What it does").fill("Replies to release questions.");
+  await page.getByRole("button", { name: "Create agent" }).click();
+  await expect(page.locator(".agent-list li")).toContainText("@a.releasebot");
+
+  const clientId = await registerClient(request, "Codex Agent");
+  const tokens = await exchange(request, {
+    code: await consent(page, {
+      slug,
+      clientId,
+      state: "state-011",
+      scope: "chat:read chat:write agent",
+    }),
+    clientId,
+    slug,
+  });
+
+  const listedResponse = await request.post(`${BASE}/w/${slug}/mcp`, {
+    headers: { authorization: `Bearer ${tokens.access_token}` },
+    data: { jsonrpc: "2.0", id: 11, method: "tools/list", params: {} },
+  });
+  expect(listedResponse.status()).toBe(200);
+  const listed = (await listedResponse.json()) as { result: { tools: { name: string }[] } };
+  expect(listed.result.tools.map((tool) => tool.name)).toEqual(
+    expect.arrayContaining(["whoami", "read_channel", "post_message", "agent_next", "agent_post"]),
+  );
+  // D08e: no callable agent surface can manufacture a human vote.
+  expect(listed.result.tools.map((tool) => tool.name)).not.toContain("vote");
+  expect(listed.result.tools.map((tool) => tool.name)).not.toContain("cast_vote");
+
+  const channelsCall = await callTool(request, { slug, accessToken: tokens.access_token, id: 12, name: "list_channels" });
+  const channels = (await channelsCall.json()) as {
+    result: { structuredContent: { channels: { id: string; name: string }[]; attribution: { memberHandle: string } } };
+  };
+  expect(channels.result.structuredContent.attribution.memberHandle).toBe(account.handle);
+  const general = channels.result.structuredContent.channels.find((channel) => channel.name === "general");
+  expect(general).toBeDefined();
+
+  const agentsCall = await callTool(request, { slug, accessToken: tokens.access_token, id: 13, name: "list_agents" });
+  const agents = (await agentsCall.json()) as {
+    result: { structuredContent: { agents: { id: string; handle: string }[] } };
+  };
+  expect(agents.result.structuredContent.agents).toHaveLength(1);
+  const agent = agents.result.structuredContent.agents[0];
+
+  const workOrder = await callTool(request, {
+    slug,
+    accessToken: tokens.access_token,
+    id: 14,
+    name: "post_message",
+    arguments: {
+      channel_id: general!.id,
+      content: "@a.releasebot is the release ready?",
+      idempotency_key: "browser:mcp:work:post:0001",
+    },
+  });
+  const workOrderBody = (await workOrder.json()) as {
+    result: { structuredContent: { message_id: string }; isError?: boolean };
+  };
+  expect(workOrderBody.result.isError).not.toBe(true);
+  const workMessageId = workOrderBody.result.structuredContent.message_id;
+
+  const leaseToken = "browser-runner-lease-token".padEnd(40, "x");
+  const claimed = await callTool(request, {
+    slug,
+    accessToken: tokens.access_token,
+    id: 15,
+    name: "agent_next",
+    arguments: {
+      agent: agent.id,
+      claim_id: "browser-claim-0001",
+      lease_token: leaseToken,
+      session_id: "browser-session-0001",
+    },
+  });
+  const claimedBody = (await claimed.json()) as {
+    result: {
+      structuredContent: {
+        item: { message_id: string };
+        lease: { itemId: string; leaseGeneration: number; sessionId: string };
+      };
+      isError?: boolean;
+    };
+  };
+  expect(claimedBody.result.isError).not.toBe(true);
+  expect(claimedBody.result.structuredContent.item.message_id).toBe(workMessageId);
+  const lease = claimedBody.result.structuredContent.lease;
+  const proof = {
+    agent: agent.id,
+    item_id: lease.itemId,
+    session_id: lease.sessionId,
+    lease_generation: lease.leaseGeneration,
+    lease_token: leaseToken,
+  };
+
+  const started = await callTool(request, {
+    slug,
+    accessToken: tokens.access_token,
+    id: 16,
+    name: "agent_start",
+    arguments: proof,
+  });
+  expect(((await started.json()) as { result: { isError?: boolean } }).result.isError).not.toBe(true);
+  const renewed = await callTool(request, {
+    slug,
+    accessToken: tokens.access_token,
+    id: 17,
+    name: "agent_renew",
+    arguments: proof,
+  });
+  expect(((await renewed.json()) as { result: { isError?: boolean } }).result.isError).not.toBe(true);
+
+  const posted = await callTool(request, {
+    slug,
+    accessToken: tokens.access_token,
+    id: 18,
+    name: "agent_post",
+    arguments: {
+      agent: agent.id,
+      channel_id: general!.id,
+      parent_id: workMessageId,
+      content: "Release is ready.",
+      idempotency_key: "browser:mcp:agent:post:001",
+    },
+  });
+  expect(((await posted.json()) as { result: { isError?: boolean } }).result.isError).not.toBe(true);
+  const completed = await callTool(request, {
+    slug,
+    accessToken: tokens.access_token,
+    id: 19,
+    name: "agent_complete",
+    arguments: {
+      ...proof,
+      completion_id: "browser-completion-0001",
+      output_digest: "sha256:browser-answer",
+      result: { replied: true },
+    },
+  });
+  expect(((await completed.json()) as { result: { isError?: boolean } }).result.isError).not.toBe(true);
+
+  const historyCall = await callTool(request, {
+    slug,
+    accessToken: tokens.access_token,
+    id: 20,
+    name: "read_thread",
+    arguments: { message_id: workMessageId },
+  });
+  const history = (await historyCall.json()) as {
+    result: {
+      structuredContent: {
+        messages: { author: { kind: string; id: string }; mcp_attribution: { agent_id: string; client: string } }[];
+      };
+    };
+  };
+  expect(history.result.structuredContent.messages[1]).toMatchObject({
+    author: { kind: "agent", id: agent.id },
+    mcp_attribution: { agent_id: agent.id, client: "Codex Agent" },
+  });
+
+  const chatOnlyClient = await registerClient(request, "Read Only Client");
+  const chatOnly = await exchange(request, {
+    code: await consent(page, { slug, clientId: chatOnlyClient, state: "state-011b", scope: "chat:read" }),
+    clientId: chatOnlyClient,
+    slug,
+  });
+  const insufficient = await callTool(request, {
+    slug,
+    accessToken: chatOnly.access_token,
+    id: 16,
+    name: "list_agents",
+  });
+  expect(insufficient.status()).toBe(403);
+  expect(insufficient.headers()["www-authenticate"]).toContain("insufficient_scope");
 });

@@ -55,6 +55,16 @@ export type MessageRow = {
   isPinned?: boolean;
   /** Present when this message carries a snippet rather than only prose. */
   snippet?: SnippetRow | null;
+  /** Server-authored provenance for a write made through an MCP connection. */
+  mcpAttribution?: McpMessageAttribution | null;
+};
+
+export type McpMessageAttribution = {
+  connectionId: string;
+  operatingMemberId: string;
+  agentId: string | null;
+  clientId: string;
+  clientName: string | null;
 };
 
 export type MessageForwardSource = {
@@ -1472,11 +1482,21 @@ export function enqueueAgentWork(
   );
 }
 
-export function agentQueueDepth(storage: DurableObjectStorage, agentId: string): number {
+export function visibleAgentQueueDepth(
+  storage: DurableObjectStorage,
+  agentId: string,
+  memberId: string,
+): number {
   return storage.sql
     .exec<{ depth: number }>(
-      "SELECT COUNT(*) AS depth FROM agent_queue WHERE agent_id = ? AND read_at IS NULL",
+      `SELECT COUNT(*) AS depth
+       FROM agent_queue q JOIN channels c ON c.id = q.channel_id JOIN messages m ON m.id = q.message_id
+       WHERE q.agent_id = ? AND q.read_at IS NULL AND m.deleted_at IS NULL
+         AND (c.kind = 'public' OR EXISTS (
+           SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_id = ?
+         ))`,
       agentId,
+      memberId,
     )
     .one().depth;
 }
@@ -1492,14 +1512,31 @@ export type QueueItemRow = {
   authorDisplaySnapshot: string;
 };
 
-/** Keyset order, because a queue is written to while it is read. */
-export function listAgentQueue(
+export type AgentQueueCursor = { enqueuedAt: number; messageId: string };
+
+export type AgentQueuePage = {
+  items: readonly QueueItemRow[];
+  nextCursor: AgentQueueCursor | null;
+};
+
+/**
+ * An owner's MCP inbox view. The private-room predicate is part of the query so
+ * an item that became invisible cannot leak through pagination or counts.
+ */
+export function pageAgentQueue(
   storage: DurableObjectStorage,
-  agentId: string,
-  limit: number,
-  unreadOnly: boolean,
-): QueueItemRow[] {
-  return storage.sql
+  input: {
+    agentId: string;
+    memberId: string;
+    limit: number;
+    unreadOnly: boolean;
+    order: "oldest" | "newest";
+    cursor: AgentQueueCursor | null;
+  },
+): AgentQueuePage {
+  const direction = input.order === "oldest" ? "ASC" : "DESC";
+  const comparator = input.order === "oldest" ? ">" : "<";
+  const rows = storage.sql
     .exec<{
       id: string;
       message_id: string;
@@ -1512,24 +1549,111 @@ export function listAgentQueue(
     }>(
       `SELECT q.id, q.message_id, q.channel_id, q.enqueued_at, q.read_at, q.flags_json,
               m.body_markdown, m.author_display_snapshot
-       FROM agent_queue q JOIN messages m ON m.id = q.message_id
-       WHERE q.agent_id = ? AND (? = 0 OR q.read_at IS NULL) AND m.deleted_at IS NULL
-       ORDER BY q.enqueued_at, q.id LIMIT ?`,
-      agentId,
-      unreadOnly ? 1 : 0,
-      limit,
+       FROM agent_queue q
+       JOIN messages m ON m.id = q.message_id
+       JOIN channels c ON c.id = q.channel_id
+       WHERE q.agent_id = ?
+         AND (? = 0 OR q.read_at IS NULL)
+         AND m.deleted_at IS NULL
+         AND (c.kind = 'public' OR EXISTS (
+           SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_id = ?
+         ))
+         AND (? IS NULL OR q.enqueued_at ${comparator} ? OR (q.enqueued_at = ? AND q.message_id ${comparator} ?))
+       ORDER BY q.enqueued_at ${direction}, q.message_id ${direction}
+       LIMIT ?`,
+      input.agentId,
+      input.unreadOnly ? 1 : 0,
+      input.memberId,
+      input.cursor?.enqueuedAt ?? null,
+      input.cursor?.enqueuedAt ?? 0,
+      input.cursor?.enqueuedAt ?? 0,
+      input.cursor?.messageId ?? "",
+      input.limit + 1,
     )
-    .toArray()
-    .map((row) => ({
-      id: row.id,
-      messageId: row.message_id,
-      channelId: row.channel_id,
-      enqueuedAt: row.enqueued_at,
-      readAt: row.read_at,
-      flags: JSON.parse(row.flags_json) as string[],
-      bodyMarkdown: row.body_markdown,
-      authorDisplaySnapshot: row.author_display_snapshot,
-    }));
+    .toArray();
+  const hasMore = rows.length > input.limit;
+  const visible = hasMore ? rows.slice(0, input.limit) : rows;
+  const items = visible.map((row) => ({
+    id: row.id,
+    messageId: row.message_id,
+    channelId: row.channel_id,
+    enqueuedAt: row.enqueued_at,
+    readAt: row.read_at,
+    flags: JSON.parse(row.flags_json) as string[],
+    bodyMarkdown: row.body_markdown,
+    authorDisplaySnapshot: row.author_display_snapshot,
+  }));
+  const last = items.at(-1);
+  return {
+    items,
+    nextCursor: hasMore && last ? { enqueuedAt: last.enqueuedAt, messageId: last.messageId } : null,
+  };
+}
+
+export function setAgentQueueReadState(
+  storage: DurableObjectStorage,
+  input: { agentId: string; itemId: string; readAt: number | null },
+): boolean {
+  return (
+    storage.sql.exec(
+      "UPDATE agent_queue SET read_at = ? WHERE id = ? AND agent_id = ?",
+      input.readAt,
+      input.itemId,
+      input.agentId,
+    ).rowsWritten > 0
+  );
+}
+
+export function insertMcpMessageAttribution(
+  storage: DurableObjectStorage,
+  input: McpMessageAttribution & { messageId: string; createdAt: number },
+): void {
+  storage.sql.exec(
+    `INSERT INTO mcp_message_attribution(
+       message_id, connection_id, operating_member_id, agent_id, client_id,
+       client_name_snapshot, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    input.messageId,
+    input.connectionId,
+    input.operatingMemberId,
+    input.agentId,
+    input.clientId,
+    input.clientName,
+    input.createdAt,
+  );
+}
+
+export function readMcpMessageAttributions(
+  storage: DurableObjectStorage,
+  messageIds: readonly string[],
+): Map<string, McpMessageAttribution> {
+  const result = new Map<string, McpMessageAttribution>();
+  if (messageIds.length === 0) return result;
+  const placeholders = messageIds.map(() => "?").join(", ");
+  for (const row of storage.sql
+    .exec<{
+      message_id: string;
+      connection_id: string;
+      operating_member_id: string;
+      agent_id: string | null;
+      client_id: string;
+      client_name_snapshot: string | null;
+    }>(
+      `SELECT message_id, connection_id, operating_member_id, agent_id, client_id,
+              client_name_snapshot
+       FROM mcp_message_attribution WHERE message_id IN (${placeholders})`,
+      ...messageIds,
+    )
+    .toArray()) {
+    result.set(row.message_id, {
+      connectionId: row.connection_id,
+      operatingMemberId: row.operating_member_id,
+      agentId: row.agent_id,
+      clientId: row.client_id,
+      clientName: row.client_name_snapshot,
+    });
+  }
+  return result;
 }
 
 /* -------------------------------------------------------------------------- */
