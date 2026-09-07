@@ -75,6 +75,53 @@ export function base64url(bytes: ArrayBuffer | Uint8Array): string {
   return Buffer.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)).toString("base64url");
 }
 
+/**
+ * The three envelope headers, for a caller that is not making a JSON POST.
+ *
+ * The runner's socket upgrade is a GET with no body and cannot go through the
+ * request helper, but it must be signed over exactly the same canonical claims
+ * — so both paths build them here rather than one of them drifting.
+ */
+export async function signedHeaders(input: {
+  keys: DeviceKeys;
+  enrolment: Enrolment;
+  method: string;
+  path: string;
+  body: string;
+  nonce?: string;
+  configRevision?: number;
+  tamper?: "signature";
+}): Promise<Record<string, string>> {
+  const claims = {
+    method: input.method.toUpperCase(),
+    path: input.path,
+    bodyHash: base64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input.body))),
+    workspaceId: input.enrolment.workspaceId,
+    memberId: input.enrolment.memberId,
+    authorizationEpoch: input.enrolment.authorizationEpoch,
+    deviceId: input.enrolment.deviceId,
+    deviceKeyEpoch: input.enrolment.deviceKeyEpoch,
+    timestamp: Date.now(),
+    nonce: input.nonce ?? base64url(crypto.getRandomValues(new Uint8Array(18))),
+    requestId: base64url(crypto.getRandomValues(new Uint8Array(18))),
+    projectId: PROJECT,
+    configRevision: input.configRevision ?? 1,
+  };
+  const signature = new Uint8Array(
+    await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      input.keys.signing.privateKey,
+      new TextEncoder().encode(canonical(claims)),
+    ),
+  );
+  if (input.tamper === "signature") signature[0] ^= 0xff;
+  return {
+    "x-lepidy-device-credential": input.enrolment.deviceCredential,
+    "x-lepidy-device-claims": base64url(new TextEncoder().encode(JSON.stringify(claims))),
+    "x-lepidy-device-signature": base64url(signature),
+  };
+}
+
 export async function signedRequest(
   request: APIRequestContext,
   input: {
@@ -85,39 +132,22 @@ export async function signedRequest(
     tamper?: "body" | "signature";
     nonce?: string;
     base?: string;
+    configRevision?: number;
   },
 ) {
   const raw = JSON.stringify(input.body);
-  const claims = {
+  const headers = await signedHeaders({
+    keys: input.keys,
+    enrolment: input.enrolment,
     method: "POST",
     path: input.path,
-    bodyHash: base64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw))),
-    workspaceId: input.enrolment.workspaceId,
-    memberId: input.enrolment.memberId,
-    authorizationEpoch: input.enrolment.authorizationEpoch,
-    deviceId: input.enrolment.deviceId,
-    deviceKeyEpoch: input.enrolment.deviceKeyEpoch,
-    timestamp: Date.now(),
-    nonce: input.nonce ?? base64url(crypto.getRandomValues(new Uint8Array(18))),
-    requestId: base64url(crypto.getRandomValues(new Uint8Array(18))),
-    projectId: PROJECT,
-    configRevision: 1,
-  };
-  const signature = new Uint8Array(
-    await crypto.subtle.sign(
-      { name: "ECDSA", hash: "SHA-256" },
-      input.keys.signing.privateKey,
-      new TextEncoder().encode(canonical(claims)),
-    ),
-  );
-  if (input.tamper === "signature") signature[0] ^= 0xff;
+    body: raw,
+    ...(input.nonce === undefined ? {} : { nonce: input.nonce }),
+    ...(input.configRevision === undefined ? {} : { configRevision: input.configRevision }),
+    ...(input.tamper === "signature" ? { tamper: "signature" as const } : {}),
+  });
   return request.post(`${input.base ?? BASE}${input.path}`, {
-    headers: {
-      "content-type": "application/json",
-      "x-lepidy-device-credential": input.enrolment.deviceCredential,
-      "x-lepidy-device-claims": base64url(new TextEncoder().encode(JSON.stringify(claims))),
-      "x-lepidy-device-signature": base64url(signature),
-    },
+    headers: { "content-type": "application/json", ...headers },
     data: input.tamper === "body" ? `${raw} ` : raw,
   });
 }

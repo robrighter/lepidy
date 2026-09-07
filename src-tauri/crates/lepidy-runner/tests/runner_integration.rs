@@ -88,7 +88,7 @@ fn assert_absent_for(path: &std::path::Path, window: Duration, what: &str) {
 }
 
 #[test]
-fn runner_int_001_keeps_launch_configuration_off_the_command_line_and_out_of_the_cloud() {
+fn runner_cli_int_001_keeps_launch_configuration_off_the_command_line_and_out_of_the_cloud() {
     let home = TempHome::create("preset");
     let key = enrol(&home, "http://127.0.0.1:1");
     let _ = key;
@@ -161,7 +161,7 @@ fn runner_int_001_keeps_launch_configuration_off_the_command_line_and_out_of_the
 }
 
 #[test]
-fn runner_int_002_signs_its_registration_and_sends_no_launch_configuration() {
+fn runner_cli_int_002_signs_its_registration_and_sends_no_launch_configuration() {
     let home = TempHome::create("register");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
     // Re-enrol against the address the double actually bound.
@@ -204,7 +204,7 @@ fn runner_int_002_signs_its_registration_and_sends_no_launch_configuration() {
 }
 
 #[test]
-fn runner_int_003_refuses_to_register_for_a_preset_this_machine_does_not_have() {
+fn runner_cli_int_003_refuses_to_register_for_a_preset_this_machine_does_not_have() {
     let home = TempHome::create("unknown-preset");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
     let key = enrol(&home, &double.url());
@@ -227,7 +227,7 @@ fn runner_int_003_refuses_to_register_for_a_preset_this_machine_does_not_have() 
 }
 
 #[test]
-fn runner_int_004_holds_an_outbound_socket_and_runs_the_preset_a_wake_names() {
+fn runner_cli_int_004_holds_an_outbound_socket_and_runs_the_preset_a_wake_names() {
     let home = TempHome::create("wake");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
     let key = enrol(&home, &double.url());
@@ -251,7 +251,7 @@ fn runner_int_004_holds_an_outbound_socket_and_runs_the_preset_a_wake_names() {
 }
 
 #[test]
-fn runner_int_005_refuses_a_wake_that_tries_to_say_what_to_run() {
+fn runner_cli_int_005_refuses_a_wake_that_tries_to_say_what_to_run() {
     let home = TempHome::create("smuggled");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
     let key = enrol(&home, &double.url());
@@ -295,7 +295,7 @@ fn runner_int_005_refuses_a_wake_that_tries_to_say_what_to_run() {
 }
 
 #[test]
-fn runner_int_006_refuses_a_wake_naming_a_preset_it_does_not_hold() {
+fn runner_cli_int_006_refuses_a_wake_naming_a_preset_it_does_not_hold() {
     let home = TempHome::create("elsewhere");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
     let key = enrol(&home, &double.url());
@@ -317,7 +317,7 @@ fn runner_int_006_refuses_a_wake_naming_a_preset_it_does_not_hold() {
 }
 
 #[test]
-fn runner_int_007_finds_work_no_wake_announced() {
+fn runner_cli_int_007_finds_work_no_wake_announced() {
     let home = TempHome::create("lost-wake");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
     let key = enrol(&home, &double.url());
@@ -349,7 +349,7 @@ fn runner_int_007_finds_work_no_wake_announced() {
 }
 
 #[test]
-fn runner_int_008_stops_the_whole_tree_when_it_is_told_to_stop() {
+fn runner_cli_int_008_stops_the_whole_tree_when_it_is_told_to_stop() {
     let home = TempHome::create("stop");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
     let key = enrol(&home, &double.url());
@@ -421,7 +421,7 @@ fn runner_int_008_stops_the_whole_tree_when_it_is_told_to_stop() {
 }
 
 #[test]
-fn runner_int_009_starts_one_run_for_a_storm_of_wakes() {
+fn runner_cli_int_009_starts_one_run_for_a_storm_of_wakes() {
     let home = TempHome::create("storm");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
     let key = enrol(&home, &double.url());
@@ -479,7 +479,7 @@ fn runner_int_009_starts_one_run_for_a_storm_of_wakes() {
 }
 
 #[test]
-fn runner_int_010_refuses_a_wake_for_a_revision_this_machine_has_moved_past() {
+fn runner_cli_int_010_refuses_a_wake_for_a_revision_this_machine_has_moved_past() {
     let home = TempHome::create("stale");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
     let key = enrol(&home, &double.url());
@@ -504,7 +504,7 @@ fn runner_int_010_refuses_a_wake_for_a_revision_this_machine_has_moved_past() {
 }
 
 #[test]
-fn runner_int_011_refuses_an_unsigned_socket() {
+fn runner_cli_int_011_refuses_an_unsigned_socket() {
     let home = TempHome::create("unsigned");
     // The double is given a key that is not this machine's, so every signature
     // it checks will fail. A socket that opened anyway would put wakes — and
@@ -529,7 +529,7 @@ fn runner_int_011_refuses_an_unsigned_socket() {
 }
 
 #[test]
-fn runner_int_012_never_puts_a_secret_on_a_command_line() {
+fn runner_cli_int_012_never_puts_a_secret_on_a_command_line() {
     let home = TempHome::create("argv");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
     let key = enrol(&home, &double.url());
