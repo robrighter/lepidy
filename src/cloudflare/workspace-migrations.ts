@@ -911,6 +911,40 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `ALTER TABLE vault_credentials ADD COLUMN captured_from TEXT`,
     ],
   },
+  {
+    version: 22,
+    name: "Designated runners and pending wakes",
+    statements: [
+      // Which device serves which agents. A runner is designated per agent, so
+      // two machines cannot both decide they are the one that answers.
+      `CREATE TABLE runner_devices (
+        device_id TEXT PRIMARY KEY,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        runner_epoch INTEGER NOT NULL CHECK (runner_epoch > 0),
+        preset_revision INTEGER NOT NULL CHECK (preset_revision > 0),
+        registered_at INTEGER NOT NULL,
+        last_seen_at INTEGER
+      ) STRICT`,
+      `CREATE TABLE runner_agents (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL REFERENCES runner_devices(device_id) ON DELETE CASCADE,
+        assigned_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE INDEX runner_agents_device_idx ON runner_agents(device_id)`,
+      // A wake is persisted in the same transaction as the work it is about, so
+      // a wake can never be lost by a delivery that failed. It carries an agent
+      // id and nothing else: no executable, no arguments, no path, no prompt.
+      `CREATE TABLE runner_wakes (
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        enqueued_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        PRIMARY KEY (agent_id, device_id)
+      ) STRICT`,
+      `CREATE INDEX runner_wakes_pending_idx ON runner_wakes(device_id, delivered_at)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

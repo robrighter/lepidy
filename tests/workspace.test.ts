@@ -12,7 +12,7 @@ describe("Workspace Durable Object migrations", () => {
 
     await expect(stub.health()).resolves.toEqual({
       ok: true,
-      schemaVersion: 21,
+      schemaVersion: 22,
       status: "ready",
       error: null,
     });
@@ -30,7 +30,7 @@ describe("Workspace Durable Object migrations", () => {
         .toArray()
         .map(({ name }) => name);
 
-      expect(schemaRows).toEqual([{ singleton: 1, version: 21, status: "ready" }]);
+      expect(schemaRows).toEqual([{ singleton: 1, version: 22, status: "ready" }]);
       expect(tables).toEqual(
         expect.arrayContaining([
           "members",
@@ -79,12 +79,15 @@ describe("Workspace Durable Object migrations", () => {
           "vault_approvals",
           "vault_approval_items",
           "vault_approval_approvers",
+          "runner_devices",
+          "runner_agents",
+          "runner_wakes",
         ]),
       );
     });
   });
 
-  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])("MIGRATION-INT-001 upgrades a historical version-%s workspace", async (version) => {
+  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21])("MIGRATION-INT-001 upgrades a historical version-%s workspace", async (version) => {
     const stub = env.MIGRATION_FIXTURE.getByName(`historical-v${version}`);
 
     await expect(stub.migrateThrough(version)).resolves.toEqual({
@@ -93,12 +96,12 @@ describe("Workspace Durable Object migrations", () => {
       error: null,
     });
     await expect(stub.migrateCurrent()).resolves.toEqual({
-      version: 21,
+      version: 22,
       status: "ready",
       error: null,
     });
     await expect(stub.migrateCurrent()).resolves.toEqual({
-      version: 21,
+      version: 22,
       status: "ready",
       error: null,
     });
@@ -128,7 +131,7 @@ describe("Workspace Durable Object migrations", () => {
     });
 
     await expect(healthy.migrateCurrent()).resolves.toEqual({
-      version: 21,
+      version: 22,
       status: "ready",
       error: null,
     });
