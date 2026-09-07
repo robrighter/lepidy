@@ -3,6 +3,8 @@
 import { ShieldCheck, Sparkles } from "lucide-react";
 import { useActionState } from "react";
 
+import Link from "next/link";
+
 import { createAgentAction, type AgentsResult } from "@/app/(app)/agents/actions";
 import type { AgentSummary } from "@/src/cloudflare/workspace";
 import { SECURITY_PREAMBLE } from "@/src/domain/agent-preamble";
@@ -71,7 +73,9 @@ export function AgentDirectory({
               <AgentAvatar size={34} />
               <div>
                 <p className="agent-name">
-                  <strong>@{agent.handle}</strong>
+                  <Link href={`/agents/${encodeURIComponent(agent.id)}`}>
+                    <strong>@{agent.handle}</strong>
+                  </Link>
                   <span className="tag">{agent.status}</span>
                   {agent.isOwner ? <span className="tag">you own this</span> : null}
                 </p>

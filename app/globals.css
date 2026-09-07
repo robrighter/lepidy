@@ -466,3 +466,68 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 .approval-actions form { margin: 0; }
 .approval-note { display: inline-flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 12.5px; }
 @media (max-width: 640px) { .approval-card dl { grid-template-columns: 1fr; } }
+
+/* Vault and agent activity (V04). A reading surface: the facts before the buttons. */
+.panel-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.panel-head h2 { margin: 0; }
+.vault-switch { display: grid; gap: 6px; justify-items: start; }
+.vault-switch form { margin: 0; }
+/*
+ * These buttons carry their own surface rather than the browser's default one,
+ * which does not follow the theme and left dark mode with unreadable text.
+ */
+.vault-switch button, .vault-table button, .approval-actions button {
+  padding: 7px 12px; border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--text-1); font-size: 13px; font-weight: 600;
+}
+.vault-switch button:hover:not(:disabled), .vault-table button:hover:not(:disabled),
+.approval-actions button:hover:not(:disabled) { background: var(--surface-2); }
+.vault-switch button:disabled, .vault-table button:disabled, .approval-actions button:disabled {
+  opacity: .55; cursor: not-allowed;
+}
+.approval-actions .primary { border-color: transparent; background: var(--accent); color: var(--on-accent); }
+button.danger { border-color: #d8a3ae; color: #b03a52; }
+button.danger:hover:not(:disabled) { background: #fdf2f4; }
+/* The light-mode red is unreadable on the dark surface. */
+:root[data-theme="dark"] button.danger { border-color: var(--line-strong); color: var(--coral); }
+:root[data-theme="dark"] button.danger:hover:not(:disabled) { background: var(--surface-2); }
+:root[data-theme="dark"] .vault-frozen { color: var(--coral); }
+.stat-row { display: flex; flex-wrap: wrap; gap: 22px; margin: 12px 0 0; padding: 0; list-style: none; }
+.stat-row li { display: grid; gap: 2px; }
+.stat-row strong { font: 650 20px/1.1 var(--font-display); }
+.stat-row span { color: var(--text-3); font-size: 12.5px; }
+.table-scroll { overflow-x: auto; }
+.vault-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.vault-table th, .vault-table td { padding: 8px 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+.vault-table thead th { color: var(--text-3); font-weight: 600; font-size: 12px; }
+.vault-table tbody th { font-weight: 650; }
+.vault-table form { margin: 0; }
+.via { color: var(--text-3); font-size: 12.5px; }
+.vault-empty { color: var(--text-2); }
+.vault-list { display: grid; gap: 10px; margin: 12px 0 0; padding: 0; list-style: none; }
+.vault-list li { padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.vault-list a { display: inline-flex; align-items: center; gap: 8px; }
+.vault-list p { margin: 2px 0 0; color: var(--text-2); font-size: 13px; }
+.vault-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 10px 0 0; font-size: 13px; }
+.vault-facts dt { color: var(--text-3); }
+.vault-facts dd { margin: 0; }
+.vault-deliveries { display: grid; gap: 10px; margin: 10px 0 0; padding-left: 18px; font-size: 13px; }
+.vault-note { margin-top: 10px; padding: 10px 12px; border-left: 3px solid var(--line-strong); background: var(--surface-2); color: var(--text-2); font-size: 12.5px; }
+.vault-frozen { margin: 0; color: #b03a52; font-size: 13px; font-weight: 600; }
+.preamble { overflow-x: auto; margin: 10px 0 0; padding: 12px; border-radius: var(--r-md); background: var(--surface-2); font-size: 12px; white-space: pre-wrap; }
+@media (max-width: 640px) { .vault-facts { grid-template-columns: 1fr; } }
+
+/*
+ * Narrow screens stack each row instead of scrolling it sideways. A table that
+ * scrolls puts its last column — the one with the button — where a thumb cannot
+ * reach it, which is exactly the column somebody on a phone came for.
+ */
+@media (max-width: 640px) {
+  .vault-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .vault-table, .vault-table tbody, .vault-table tr, .vault-table th, .vault-table td { display: block; width: auto; }
+  .vault-table tr { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .vault-table th, .vault-table td { padding: 2px 0; border: 0; }
+  .vault-table tbody th { font: 650 14px/1.3 var(--font-display); }
+  .vault-table td[data-label]::before { content: attr(data-label) ": "; color: var(--text-3); }
+  .vault-table form { margin-top: 6px; }
+}

@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -23,7 +23,27 @@ if (migrated.status !== 0) {
   cleanup();
   process.exit(migrated.status ?? 1);
 }
-const child = spawn(process.execPath, [cli, "dev", "--port", environment === "development" ? "3100" : "3101", ...common], { stdio: "inherit" });
+// The dev server's stdout goes to a file rather than being inherited, and this
+// is not a tidiness preference. Playwright starts this script with
+// `stdout: "ignore"`, which gives it a pipe nobody reads; inheriting that fd
+// hands it to workerd, whose logging fills the 64 KiB pipe buffer partway
+// through a long suite and then fails on `write(): Broken pipe`. A file is
+// always drainable, and unlike `/dev/null` it keeps whatever the dev server
+// said about its own death, which is the thing you need when it dies.
+const logDirectory = path.join(root, "playwright-report");
+mkdirSync(logDirectory, { recursive: true });
+const logPath = path.join(logDirectory, `worker-${environment}.log`);
+const child = spawn(
+  process.execPath,
+  [cli, "dev", "--port", environment === "development" ? "3100" : "3101", ...common],
+  { stdio: ["ignore", openSync(logPath, "w"), "inherit"] },
+);
 for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => child.kill(signal));
 child.on("error", (error) => { cleanup(); throw error; });
-child.on("exit", (code) => { cleanup(); process.exit(code ?? 0); });
+child.on("exit", (code, signal) => {
+  // Said on stderr, which Playwright drains, so a mid-suite death names itself
+  // instead of appearing only as a hundred refused connections.
+  process.stderr.write(`lepidy: the ${environment} worker exited (code ${code}, signal ${signal}); see ${logPath}\n`);
+  cleanup();
+  process.exit(code ?? 0);
+});

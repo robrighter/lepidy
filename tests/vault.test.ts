@@ -649,4 +649,167 @@ describe("encrypted credential vault", () => {
       expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM vault_approvals").one().status).toBe("pending");
     });
   });
+
+  /* -- the vault and agent activity surfaces (V04) ----------------------- */
+
+  it("VAULT-INT-015 lists live grants with all three parties, and never a credential the reader cannot see", async () => {
+    const seeded = await seed("vault-grant-list");
+    const mine = await createCredential(seeded, "MINE", { aclMember: true });
+    const theirs = await createCredential(seeded, "THEIRS");
+    for (const credentialId of [mine.credentialId, theirs.credentialId]) {
+      await seeded.stub.issueVaultGrant({
+        actor: seeded.owner, credentialId, memberId: "owner", deviceId: "device-a", projectId: "project-a",
+        delivery: "inject", originChannelId: seeded.channelId, originMessageId: seeded.messageId,
+        expiresAt: NOW + 50_000, approvalVerified: true, freshUserVerification: true, now: NOW + 3,
+      });
+    }
+
+    const owner = await seeded.stub.listVaultGrants({ actor: seeded.owner, now: NOW + 4 });
+    expect(owner.grants).toHaveLength(2);
+    expect(owner.grants[0]).toMatchObject({
+      memberHandle: "owner", approverHandle: "owner", agentHandle: null,
+      deviceId: "device-a", projectId: "project-a", delivery: "inject", singleUse: false, viewerMayRevoke: true,
+    });
+
+    // A member who can only see one credential sees only its grant, and cannot
+    // revoke it: seeing a grant is not holding authority over it.
+    const member = await seeded.stub.listVaultGrants({ actor: seeded.member, now: NOW + 4 });
+    expect(member.grants.map((grant) => grant.credentialName)).toEqual(["TOKEN_MINE"]);
+    expect(member.grants[0].viewerMayRevoke).toBe(false);
+    expect((await seeded.stub.listVaultGrants({ actor: seeded.outsider, now: NOW + 4 })).grants).toEqual([]);
+
+    // Revoking is refused for the member who may not, reported as missing, and
+    // the grant survives.
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      await expect(
+        instance.revokeVaultGrant({ actor: seeded.member, grantId: member.grants[0].grantId, now: NOW + 5 }),
+      ).rejects.toThrow(/not found/);
+      await expect(
+        instance.revokeVaultGrant({ actor: seeded.outsider, grantId: member.grants[0].grantId, now: NOW + 5 }),
+      ).rejects.toThrow(/not found/);
+    });
+    expect((await seeded.stub.listVaultGrants({ actor: seeded.member, now: NOW + 6 })).grants).toHaveLength(1);
+
+    // The manager may, once, and the row disappears from the live list.
+    await expect(
+      seeded.stub.revokeVaultGrant({ actor: seeded.owner, grantId: member.grants[0].grantId, now: NOW + 7 }),
+    ).resolves.toEqual({ revoked: true });
+    await expect(
+      seeded.stub.revokeVaultGrant({ actor: seeded.owner, grantId: member.grants[0].grantId, now: NOW + 8 }),
+    ).resolves.toEqual({ revoked: false });
+    expect((await seeded.stub.listVaultGrants({ actor: seeded.member, now: NOW + 9 })).grants).toEqual([]);
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      expect(
+        state.storage.sql.exec<{ revoked_reason: string }>(
+          "SELECT revoked_reason FROM vault_grants WHERE id = ?", member.grants[0].grantId,
+        ).one().revoked_reason,
+      ).toBe("revoked_by_member");
+    });
+  });
+
+  it("VAULT-INT-016 describes a credential as metadata and rights, never as a value", async () => {
+    const seeded = await seed("vault-describe");
+    const made = await createCredential(seeded, "DESCRIBE", { aclMember: true, plaintext: "describe-plaintext-canary" });
+
+    const detail = await seeded.stub.describeVaultCredential({
+      actor: seeded.owner, credentialId: made.credentialId, now: NOW + 3,
+    });
+    expect(detail.credential).toMatchObject({ name: "TOKEN_DESCRIBE", version: 1 });
+    expect(detail.createdByHandle).toBe("owner");
+    expect(detail.frozen).toBe(false);
+    expect(detail.manage.map((subject) => subject.label)).toEqual(["@owner"]);
+    expect(detail.use.map((subject) => subject.label).sort()).toEqual(["@member", "@owner"]);
+    expect(detail.viewer).toEqual({ mayUse: true, mayReveal: false, mayManage: true });
+    // There is no field for any of these, so nothing downstream can serialise one.
+    const serialised = JSON.stringify(detail);
+    expect(serialised).not.toContain("describe-plaintext-canary");
+    expect(serialised).not.toContain(made.encrypted.envelope.ciphertext);
+    expect(serialised).not.toContain("wrappedDek");
+
+    // A member with use but not manage sees the same facts and different rights.
+    const asMember = await seeded.stub.describeVaultCredential({
+      actor: seeded.member, credentialId: made.credentialId, now: NOW + 3,
+    });
+    expect(asMember.viewer).toEqual({ mayUse: true, mayReveal: false, mayManage: false });
+
+    // Somebody with no rights is told it does not exist rather than that it is
+    // forbidden, so the page cannot be used to enumerate credentials.
+    // Synchronous reads, so they throw rather than returning a rejected promise.
+    await runInDurableObject<Workspace, void>(seeded.stub, (instance) => {
+      expect(() =>
+        instance.describeVaultCredential({ actor: seeded.outsider, credentialId: made.credentialId, now: NOW + 3 }),
+      ).toThrow(/not found/);
+      expect(() =>
+        instance.describeVaultCredential({ actor: seeded.owner, credentialId: "credential-nope", now: NOW + 3 }),
+      ).toThrow(/not found/);
+    });
+  });
+
+  it("VAULT-INT-017 keeps requester, operating owner and approver apart in the activity log", async () => {
+    const seeded = await seed("vault-activity");
+    const made = await sharedCredential(seeded, "ACTIVITY");
+    const requested = await requestApproval(seeded, [made.credentialId], NOW + 10);
+    const approvalId = requested.approvals[0].approvalId;
+    const decisions = [{ credentialId: made.credentialId, outcome: "allowed" as const, window: "once" as const }];
+    // The second owner answers, so the approver is demonstrably not the person
+    // who asked.
+    await seeded.stub.decideVaultApproval({
+      actor: seeded.member, approvalId, decisions, now: NOW + 11,
+      stepUp: {
+        verified: true,
+        digest: canonicalApprovalDigest({
+          approvalId,
+          items: [{ credentialId: made.credentialId, name: "TOKEN_ACTIVITY", version: 1, policyEpoch: 1 }],
+          decisions,
+        }),
+      },
+    });
+    await seeded.stub.releaseVaultCredential({
+      actor: seeded.owner, credentialId: made.credentialId,
+      device: { id: "device-a", active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+      origin: { channelId: seeded.channelId, messageId: seeded.messageId },
+      projectId: "project-a", delivery: "inject", now: NOW + 12,
+    });
+
+    const activity = await seeded.stub.listVaultActivity({ actor: seeded.owner, credentialId: made.credentialId, now: NOW + 13 });
+    const used = activity.activity.find((row) => row.kind === "used")!;
+    const decided = activity.activity.find((row) => row.kind === "decided")!;
+    // Asked by one owner, allowed by the other, used by the first: three fields,
+    // three answers, and the log says which is which.
+    expect(used).toMatchObject({ memberHandle: "owner", approverHandle: "member", detail: "under a grant" });
+    expect(decided).toMatchObject({ memberHandle: "owner", approverHandle: "member", outcome: "allowed", detail: "run the deploy" });
+    expect(activity.activity.every((row) => row.at <= NOW + 13)).toBe(true);
+    expect(JSON.stringify(activity)).not.toContain("canary-ACTIVITY");
+
+    // The log is filtered by what the reader may see, like everything else.
+    expect((await seeded.stub.listVaultActivity({ actor: seeded.outsider, now: NOW + 13 })).activity).toEqual([]);
+  });
+
+  it("VAULT-INT-018 describes an agent with its vault switch and hides somebody else's", async () => {
+    const seeded = await seed("vault-agent-detail");
+    const agent = await seeded.stub.createAgent({
+      actor: seeded.owner, idempotencyKey: "vault:agent:detail:0001", handle: "activitybot",
+      description: "Watches deploys", now: NOW + 3,
+    });
+
+    const detail = await seeded.stub.describeAgent({ actor: seeded.owner, agentId: agent.agentId, now: NOW + 4 });
+    expect(detail).toMatchObject({
+      handle: "a.activitybot", status: "active", vaultAccessOff: false, isOwner: true, ownerHandles: ["owner"],
+    });
+
+    await seeded.stub.setAgentVaultAccess({ actor: seeded.owner, agentId: agent.agentId, enabled: false, now: NOW + 5 });
+    const off = await seeded.stub.describeAgent({ actor: seeded.owner, agentId: agent.agentId, now: NOW + 6 });
+    // Cut off from credentials, still active: the two switches are separate.
+    expect(off).toMatchObject({ vaultAccessOff: true, vaultAccessOffAt: NOW + 5, status: "active" });
+
+    // A member who does not own it still sees it — agents are public in the
+    // workspace — but is not shown as an owner.
+    const asMember = await seeded.stub.describeAgent({ actor: seeded.member, agentId: agent.agentId, now: NOW + 6 });
+    expect(asMember.isOwner).toBe(false);
+    await runInDurableObject<Workspace, void>(seeded.stub, (instance) => {
+      expect(() => instance.describeAgent({ actor: seeded.owner, agentId: "agent-nope", now: NOW + 6 })).toThrow(
+        /not found/,
+      );
+    });
+  });
 });

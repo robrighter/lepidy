@@ -215,8 +215,11 @@ test("SHELL-INT-006 states plainly that a surface is not built yet", async ({ pa
   await expect(page.getByRole("heading", { name: "Nothing is waiting on you" })).toBeVisible();
   await expect(page.getByText(/join them with C06/)).toBeVisible();
 
-  await page.goto("/vault");
-  await expect(page.getByRole("heading", { name: "The vault is not built yet" })).toBeVisible();
+  // The vault is a real surface now (V03/V04), so the unbuilt example moved to
+  // one that genuinely is: profile editing, which C07 owns.
+  await page.goto("/profile");
+  await expect(page.getByRole("heading", { name: "Editing your profile is not built yet" })).toBeVisible();
+  await expect(page.getByText(/arrive with C07/)).toBeVisible();
 
   // A channel nobody can see is refused rather than invented.
   await page.goto("/c/does-not-exist");

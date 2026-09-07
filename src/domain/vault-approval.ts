@@ -353,6 +353,22 @@ export function windowLabel(window: ApprovalWindow): string {
 /* The kill switch                                                             */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * What a step-up gesture authorises when it is not an approval.
+ *
+ * Switching protection back *on* is the direction that needs proof of a person:
+ * the matrix asks for fresh user verification to turn agent access on, and the
+ * same reasoning covers unfreezing a credential or restoring an agent's access.
+ * Switching protection off never does. The digest names the exact action and
+ * subject so a gesture collected for one cannot be spent on another.
+ */
+export function canonicalVaultActionDigest(input: { action: string; subjectId: string; epoch: number }): string {
+  if (!/^[a-z_.]{1,64}$/u.test(input.action)) throw new Error("vault action is invalid");
+  assertOpaqueId(input.subjectId, "subject id");
+  if (!Number.isSafeInteger(input.epoch) || input.epoch < 0) throw new Error("vault action epoch is invalid");
+  return JSON.stringify(["lepidy-vault-action", 1, input.action, input.subjectId, input.epoch]);
+}
+
 export type KillSwitchScope =
   | { kind: "workspace" }
   | { kind: "agent"; handle: string }

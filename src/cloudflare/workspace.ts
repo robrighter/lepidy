@@ -445,6 +445,78 @@ type VaultApprovalItemRow = {
   name: string; description: string; high_risk: number; grant_ttl_ms: number | null;
 };
 
+export type VaultGrantRow = {
+  grantId: string;
+  credentialId: string;
+  credentialName: string;
+  memberId: string;
+  memberHandle: string;
+  agentId: string | null;
+  agentHandle: string | null;
+  approverMemberId: string;
+  approverHandle: string;
+  deviceId: string;
+  projectId: string;
+  delivery: VaultDelivery;
+  expiresAt: number | null;
+  singleUse: boolean;
+  createdAt: number;
+  viewerMayRevoke: boolean;
+};
+
+export type VaultAclSubject = {
+  subjectType: VaultAclEntry["subjectType"];
+  subjectId: string;
+  /** Ready to render: `@handle` or `#slug`, resolved inside the tenant. */
+  label: string;
+};
+
+export type VaultCredentialDetail = {
+  credential: VaultCredentialSummary;
+  frozen: boolean;
+  frozenAt: number | null;
+  frozenByHandle: string | null;
+  createdByHandle: string;
+  use: readonly VaultAclSubject[];
+  reveal: readonly VaultAclSubject[];
+  manage: readonly VaultAclSubject[];
+  viewer: { mayUse: boolean; mayReveal: boolean; mayManage: boolean };
+};
+
+export type VaultActivityRow = {
+  kind: "used" | "asked" | "decided" | "timed_out";
+  at: number;
+  credentialId: string;
+  credentialName: string;
+  delivery: VaultDelivery;
+  deviceId: string;
+  projectId: string;
+  /** The member the request was made for; an agent operates under this person. */
+  memberId: string;
+  memberHandle: string;
+  agentId: string | null;
+  agentHandle: string | null;
+  /** Whoever answered, kept separate from whoever asked. */
+  approverHandle: string | null;
+  detail: string;
+  outcome?: "allowed" | "denied";
+};
+
+export type AgentDetail = {
+  id: string;
+  handle: string;
+  displayName: string;
+  description: string | null;
+  status: "active" | "paused" | "archived";
+  vaultAccessOff: boolean;
+  vaultAccessOffAt: number | null;
+  isOwner: boolean;
+  ownerHandles: readonly string[];
+  scopeMode: "any" | "listed";
+  scopeChannelIds: readonly string[];
+  scopeChannelCount: number;
+};
+
 export type VaultAccessRequest = {
   actor: Actor;
   credentialId: string;
@@ -464,7 +536,8 @@ type VaultCredentialRow = {
   key_epoch: number; version: number; policy_epoch: number;
   mode: VaultPolicy["mode"]; allowed_deliveries_json: string; project_ids_json: string;
   grant_ttl_ms: number | null; available_until: number | null; max_uses_per_hour: number | null;
-  high_risk: number; created_at: number; updated_at: number; last_accessed_at: number | null; access_count: number;
+  high_risk: number; created_by_member_id: string; created_at: number; updated_at: number;
+  last_accessed_at: number | null; access_count: number;
   frozen_at: number | null; frozen_by_member_id: string | null;
 };
 
@@ -4293,6 +4366,14 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     return { envelope: this.vaultEnvelope(row), wraps: this.readVaultWraps(row.id, row.version) };
   }
 
+  /** Whether agents may use the vault at all, for a page that shows the switch. */
+  getVaultAgentAccess(input: { actor: Actor }): { enabled: boolean; accessEpoch: number } {
+    this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const settings = this.vaultSettings();
+    return { enabled: settings.enabled, accessEpoch: settings.access_epoch };
+  }
+
   /**
    * Publish this member's vault wrapping public key.
    *
@@ -4461,20 +4542,6 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         result: { grantId, ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }), ...(remainingUses === undefined ? {} : { remainingUses }) },
         effects: this.vaultEffects("vault.grant_issued", row.id, actor, { grant_id: grantId, item_version: row.version, policy_epoch: row.policy_epoch, delivery: input.delivery }),
       };
-    });
-    return outcome.result;
-  }
-
-  async revokeVaultGrant(input: { actor: Actor; credentialId: string; grantId: string; now: number }): Promise<{ revoked: boolean }> {
-    const actor = this.authorizeActor(input.actor);
-    this.requireVaultManager(input.credentialId, actor.id);
-    const outcome = await this.commitMutation({ scope: "vault.grant.revoke", now: input.now }, () => {
-      const revoked = this.ctx.storage.sql.exec(
-        "UPDATE vault_grants SET revoked_at = ?, revoked_reason = 'manual' WHERE id = ? AND credential_id = ? AND revoked_at IS NULL",
-        input.now, input.grantId, input.credentialId,
-      ).rowsWritten === 1;
-      if (!revoked) return { result: { revoked: false } };
-      return { result: { revoked: true }, effects: this.vaultEffects("vault.grant_revoked", input.credentialId, actor, { grant_id: input.grantId }) };
     });
     return outcome.result;
   }
@@ -5273,6 +5340,280 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     ).toArray()) {
       this.postVaultMessage(member.id, body, null, now);
     }
+  }
+
+  /* -------------------------------------------------------------------- */
+  /* Vault and agent activity (V04)                                        */
+  /* -------------------------------------------------------------------- */
+
+  /**
+   * The grants that are live right now, with a countdown and who holds them.
+   *
+   * Only for credentials this member can already see, so the list never
+   * discloses that a credential exists. Each row names the three parties
+   * separately — the member the grant is for, the agent operating under it, and
+   * whoever approved it — because "who has this" and "who let them" are
+   * different questions and a log that blurs them is no use in an incident.
+   */
+  listVaultGrants(input: {
+    actor: Actor;
+    credentialId?: string;
+    agentId?: string;
+    now: number;
+  }): { grants: readonly VaultGrantRow[] } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const rows = this.ctx.storage.sql.exec<{
+      id: string; credential_id: string; member_id: string; device_id: string; project_id: string;
+      agent_id: string | null; delegation_id: string | null; delivery: VaultDelivery;
+      expires_at: number | null; remaining_uses: number | null; approved_by_member_id: string; created_at: number;
+      name: string;
+    }>(
+      `SELECT g.id, g.credential_id, g.member_id, g.device_id, g.project_id, g.agent_id, g.delegation_id,
+              g.delivery, g.expires_at, g.remaining_uses, g.approved_by_member_id, g.created_at, c.name
+       FROM vault_grants g JOIN vault_credentials c ON c.id = g.credential_id
+       WHERE g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at > ?)
+         AND (g.remaining_uses IS NULL OR g.remaining_uses > 0)
+       ORDER BY g.created_at DESC LIMIT 200`,
+      input.now,
+    ).toArray();
+
+    return {
+      grants: rows
+        .filter((row) => input.credentialId === undefined || row.credential_id === input.credentialId)
+        .filter((row) => input.agentId === undefined || row.agent_id === input.agentId)
+        .filter((row) => this.vaultCanDiscover(row.credential_id, actor.id))
+        .map((row) => ({
+          grantId: row.id,
+          credentialId: row.credential_id,
+          credentialName: row.name,
+          memberId: row.member_id,
+          memberHandle: this.memberHandle(row.member_id),
+          agentId: row.agent_id,
+          agentHandle: row.agent_id === null ? null : (readAgent(this.ctx.storage, row.agent_id)?.handle ?? null),
+          approverMemberId: row.approved_by_member_id,
+          approverHandle: this.memberHandle(row.approved_by_member_id),
+          deviceId: row.device_id,
+          projectId: row.project_id,
+          delivery: row.delivery,
+          expiresAt: row.expires_at,
+          // A grant with no expiry is spent by one use; the UI says so rather
+          // than showing a countdown that would never move.
+          singleUse: row.expires_at === null,
+          createdAt: row.created_at,
+          viewerMayRevoke: this.mayRevokeVaultGrant(actor, row.member_id, row.credential_id),
+        })),
+    };
+  }
+
+  /**
+   * Take one grant back.
+   *
+   * No step-up, and deliberately wide: the credential's managers, an admin, and
+   * the person the grant was issued to may all revoke it. Making somebody find
+   * the right owner before they can close a hole is how holes stay open.
+   */
+  async revokeVaultGrant(input: { actor: Actor; grantId: string; now: number }): Promise<{ revoked: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const row = this.ctx.storage.sql.exec<{ credential_id: string; member_id: string; revoked_at: number | null }>(
+      "SELECT credential_id, member_id, revoked_at FROM vault_grants WHERE id = ?", input.grantId,
+    ).toArray()[0];
+    // Reported as missing rather than forbidden when the member cannot see the
+    // credential at all, the same as a room they are not in.
+    if (row === undefined || !this.vaultCanDiscover(row.credential_id, actor.id)) throw new Error("grant not found");
+    if (!this.mayRevokeVaultGrant(actor, row.member_id, row.credential_id)) throw new Error("grant not found");
+    if (row.revoked_at !== null) return { revoked: false };
+
+    const outcome = await this.commitMutation({ scope: "vault.grant.revoke", now: input.now }, () => {
+      this.revokeVaultGrants("revoked_by_member", input.now, "id = ?", input.grantId);
+      return {
+        result: { revoked: true },
+        effects: this.vaultEffects("vault.grant_revoked", row.credential_id, actor, {
+          grant_id: input.grantId, subject_member_id: row.member_id,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /**
+   * One credential's page: what it is, what it permits, and who may do what.
+   *
+   * Metadata and policy only. There is no field on this result for ciphertext,
+   * a wrap or a value, so no future caller can accidentally serialise one.
+   */
+  describeVaultCredential(input: { actor: Actor; credentialId: string; now: number }): VaultCredentialDetail {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const row = this.readVaultCredential(input.credentialId);
+    if (row === null || !this.vaultCanDiscover(row.id, actor.id)) throw new Error("vault credential not found");
+    const scope = (verb: "use" | "reveal" | "manage") =>
+      this.ctx.storage.sql.exec<{ subject_type: VaultAclEntry["subjectType"]; subject_id: string }>(
+        "SELECT subject_type, subject_id FROM vault_credential_acl WHERE credential_id = ? AND verb = ? ORDER BY subject_type, subject_id",
+        row.id, verb,
+      ).toArray().map((entry) => ({
+        subjectType: entry.subject_type,
+        subjectId: entry.subject_id,
+        label: this.vaultSubjectLabel(entry.subject_type, entry.subject_id),
+      }));
+
+    return {
+      credential: this.vaultSummary(row),
+      frozen: row.frozen_at !== null,
+      frozenAt: row.frozen_at,
+      frozenByHandle: row.frozen_by_member_id === null ? null : this.memberHandle(row.frozen_by_member_id),
+      createdByHandle: this.memberHandle(row.created_by_member_id),
+      use: scope("use"),
+      reveal: scope("reveal"),
+      manage: scope("manage"),
+      viewer: {
+        mayUse: this.vaultHasAcl(row.id, actor.id, undefined, undefined, "use"),
+        mayReveal: this.vaultHasAcl(row.id, actor.id, undefined, undefined, "reveal"),
+        mayManage: this.vaultHasAcl(row.id, actor.id, undefined, undefined, "manage"),
+      },
+    };
+  }
+
+  /**
+   * What has happened to a credential, or to an agent's use of credentials.
+   *
+   * Assembled from the durable records rather than from the audit chain, so a
+   * reader sees the same facts the authorization path acted on. Every row keeps
+   * the requester, the operating owner and the approver in separate fields; the
+   * value has never been in any of these tables and cannot appear here.
+   */
+  listVaultActivity(input: {
+    actor: Actor;
+    credentialId?: string;
+    agentId?: string;
+    limit?: number;
+    now: number;
+  }): { activity: readonly VaultActivityRow[] } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
+    const visible = (credentialId: string) =>
+      (input.credentialId === undefined || credentialId === input.credentialId)
+      && this.vaultCanDiscover(credentialId, actor.id);
+
+    const rows: VaultActivityRow[] = [];
+    for (const use of this.ctx.storage.sql.exec<{
+      credential_id: string; member_id: string; device_id: string; project_id: string; agent_id: string | null;
+      delivery: VaultDelivery; used_at: number; grant_id: string | null; name: string; approved_by_member_id: string | null;
+    }>(
+      `SELECT u.credential_id, u.member_id, u.device_id, u.project_id, u.agent_id, u.delivery, u.used_at, u.grant_id,
+              c.name, g.approved_by_member_id
+       FROM vault_usage_events u JOIN vault_credentials c ON c.id = u.credential_id
+       LEFT JOIN vault_grants g ON g.id = u.grant_id
+       ORDER BY u.used_at DESC LIMIT ?`, limit * 2,
+    ).toArray()) {
+      if (!visible(use.credential_id)) continue;
+      if (input.agentId !== undefined && use.agent_id !== input.agentId) continue;
+      rows.push({
+        kind: "used", at: use.used_at, credentialId: use.credential_id, credentialName: use.name,
+        delivery: use.delivery, deviceId: use.device_id, projectId: use.project_id,
+        memberId: use.member_id, memberHandle: this.memberHandle(use.member_id),
+        agentId: use.agent_id, agentHandle: use.agent_id === null ? null : (readAgent(this.ctx.storage, use.agent_id)?.handle ?? null),
+        approverHandle: use.approved_by_member_id === null ? null : this.memberHandle(use.approved_by_member_id),
+        detail: use.grant_id === null ? "automatic" : "under a grant",
+      });
+    }
+
+    for (const approval of this.ctx.storage.sql.exec<VaultApprovalRow>(
+      "SELECT * FROM vault_approvals ORDER BY created_at DESC LIMIT ?", limit * 2,
+    ).toArray()) {
+      const items = this.readVaultApprovalItems(approval.id);
+      for (const item of items) {
+        if (!visible(item.credential_id)) continue;
+        if (input.agentId !== undefined && approval.agent_id !== input.agentId) continue;
+        rows.push({
+          kind: approval.status === "pending" ? "asked" : approval.status === "expired" ? "timed_out" : "decided",
+          at: approval.decided_at ?? approval.created_at,
+          credentialId: item.credential_id, credentialName: item.name,
+          delivery: approval.delivery, deviceId: approval.device_id, projectId: approval.project_id,
+          memberId: approval.requester_member_id, memberHandle: this.memberHandle(approval.requester_member_id),
+          agentId: approval.agent_id,
+          agentHandle: approval.agent_id === null ? null : (readAgent(this.ctx.storage, approval.agent_id)?.handle ?? null),
+          approverHandle: approval.decided_by_member_id === null ? null : this.memberHandle(approval.decided_by_member_id),
+          // The reason is the requester's own words, which is the whole point of
+          // making it mandatory.
+          detail: approval.reason,
+          ...(item.outcome === null ? {} : { outcome: item.outcome }),
+        });
+      }
+    }
+
+    return { activity: rows.sort((left, right) => right.at - left.at).slice(0, limit) };
+  }
+
+  /**
+   * One agent's page, including what it may do with credentials.
+   *
+   * Somebody else's agent is reported as missing rather than forbidden, the
+   * same as everywhere else an agent is addressed.
+   */
+  describeAgent(input: { actor: Actor; agentId: string; now: number }): AgentDetail {
+    const actor = this.authorizeActor(input.actor);
+    const agent = readAgent(this.ctx.storage, input.agentId);
+    if (agent === null || agent.status === "archived") throw new Error("agent not found");
+    const owners = this.ctx.storage.sql.exec<{ member_id: string }>(
+      "SELECT member_id FROM agent_owners WHERE agent_id = ? ORDER BY member_id", agent.id,
+    ).toArray().map((row) => row.member_id);
+    const scope = this.agentScope(agent);
+    return {
+      id: agent.id,
+      handle: agent.handle,
+      displayName: agent.displayName,
+      description: agent.description,
+      status: agent.status,
+      vaultAccessOff: agent.vaultAccessOffAt !== null,
+      vaultAccessOffAt: agent.vaultAccessOffAt,
+      isOwner: owners.includes(actor.id),
+      ownerHandles: owners.map((memberId) => this.memberHandle(memberId)),
+      scopeMode: scope.mode,
+      // Only the scoped rooms this reader may see, the same rule the directory
+      // already uses: a private room in a scope is not disclosed by listing it.
+      scopeChannelIds:
+        scope.mode === "listed"
+          ? scope.channelIds.filter((channelId) => {
+              const channel = readChannel(this.ctx.storage, channelId);
+              return channel !== null && canSeeChannel(this.channelVisibility(channel, actor.id));
+            })
+          : [],
+      scopeChannelCount: scope.mode === "listed" ? scope.channelIds.length : 0,
+    };
+  }
+
+  private memberHandle(memberId: string): string {
+    return (
+      this.ctx.storage.sql
+        .exec<{ handle: string }>("SELECT handle FROM members WHERE id = ?", memberId)
+        .toArray()[0]?.handle ?? memberId
+    );
+  }
+
+  private vaultSubjectLabel(subjectType: VaultAclEntry["subjectType"], subjectId: string): string {
+    switch (subjectType) {
+      case "member":
+        return `@${this.memberHandle(subjectId)}`;
+      case "agent":
+        return `@${readAgent(this.ctx.storage, subjectId)?.handle ?? subjectId}`;
+      case "group":
+        return `@${this.ctx.storage.sql.exec<{ handle: string }>("SELECT handle FROM groups WHERE id = ?", subjectId).toArray()[0]?.handle ?? subjectId}`;
+      case "channel":
+        return `#${readChannel(this.ctx.storage, subjectId)?.slug ?? subjectId}`;
+    }
+  }
+
+  /** Managers, admins, and the person the grant is for. */
+  private mayRevokeVaultGrant(actor: ActiveMember, grantMemberId: string, credentialId: string): boolean {
+    return (
+      actor.role === "owner"
+      || actor.role === "admin"
+      || grantMemberId === actor.id
+      || this.vaultHasAcl(credentialId, actor.id, undefined, undefined, "manage")
+    );
   }
 
   /* -- agent helpers ---------------------------------------------------- */
