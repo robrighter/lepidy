@@ -64,6 +64,58 @@ export class Workspace extends ProductionWorkspace {
   }
 
   /**
+   * A runner session that may actually drain a queue, plus work waiting in it.
+   *
+   * The delegated-session fixture above deliberately carries only read and post
+   * capabilities; the waiting spike needs the queue tools as well, and it needs
+   * mentions already enqueued so a harness has something to come back for.
+   */
+  async seedRunnerQueue(actor: { memberId: string; authorizationEpoch: number }, mentions: number) {
+    const now = Date.now();
+    const channel = await this.createChannel({ actor, idempotencyKey: `browser-wait:channel:${now}`, kind: "public", slug: `waiting-${String(now).slice(-6)}`, now });
+    const agent = await this.createAgent({ actor, idempotencyKey: `browser-wait:agent:${now}`, handle: `waiter${String(now).slice(-6)}`, now });
+    const delegation = await this.createAgentDelegation({ actor, agent: agent.agentId, channelIds: [channel.channelId], expiresAt: now + 60 * 60 * 1000, now });
+    const session = await this.startAgentSession({
+      actor,
+      delegationId: delegation.id,
+      deviceId: "browser-runner-device",
+      runnerEpoch: 1,
+      presetRevision: 1,
+      capabilities: ["whoami", "read_channel", "read_thread", "agent_next", "agent_start", "agent_complete", "agent_post"],
+      now,
+    });
+    const messageIds = await this.enqueueRunnerMentions(actor, channel.channelId, agent.handle, mentions, now);
+    return {
+      token: session.token, sessionId: session.sessionId, delegationId: delegation.id,
+      agentId: agent.agentId, agentHandle: agent.handle, channelId: channel.channelId, messageIds,
+    };
+  }
+
+  /** More work for a session that has already drained, as a lost wake would leave. */
+  async enqueueRunnerMentions(
+    actor: { memberId: string; authorizationEpoch: number },
+    channelId: string,
+    agentHandle: string,
+    count: number,
+    now = Date.now(),
+  ) {
+    const messageIds: string[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const sent = await this.sendMessage({
+        actor, channelId, idempotencyKey: `browser-wait:mention:${now}:${index}:${crypto.randomUUID().slice(0, 8)}`,
+        bodyMarkdown: `@${agentHandle} please answer question ${index}`, now: now + index,
+      });
+      messageIds.push(sent.messageId);
+    }
+    return messageIds;
+  }
+
+  /** Ending a delegation, so the spike can watch a live session learn it stopped. */
+  async revokeRunnerDelegation(actor: { memberId: string; authorizationEpoch: number }, delegationId: string) {
+    return this.revokeAgentDelegation({ actor, delegationId, now: Date.now() });
+  }
+
+  /**
    * A real channel and message for a device release to cite as its origin.
    *
    * The vault's policy requires verified provenance, so a CLI scenario needs an
@@ -141,7 +193,7 @@ export default {
         credentialId: await onboarding.finishPasskeyRegistration({ accountId, ...body }),
       });
     }
-    if (["/__fixture/seed", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/session-token", "/__fixture/vault", "/__fixture/device-origin"].includes(url.pathname) && request.method === "POST") {
+    if (["/__fixture/seed", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/session-token", "/__fixture/vault", "/__fixture/device-origin", "/__fixture/runner-queue", "/__fixture/runner-enqueue", "/__fixture/runner-revoke"].includes(url.pathname) && request.method === "POST") {
       const authorization = new AuthorizationService(env.CONTROL_DB, env.WORKSPACE);
       const resolved = await resolveViewerWorkspace({ db: env.CONTROL_DB, workspaces: env.WORKSPACE, authenticateSession: (token) => authorization.authenticateBrowserSession(token) }, request.headers.get("authorization"));
       if (resolved.status !== "ok") return new Response("Unauthorized", { status: 401 });
@@ -152,6 +204,23 @@ export default {
       }
       if (url.pathname.endsWith("vault")) {
         return Response.json(await stub.seedBrowserVault({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch }));
+      }
+      if (url.pathname.endsWith("runner-queue")) {
+        const body = (await request.json()) as { mentions: number };
+        return Response.json(await stub.seedRunnerQueue({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch }, body.mentions));
+      }
+      if (url.pathname.endsWith("runner-enqueue")) {
+        const body = (await request.json()) as { channelId: string; agentHandle: string; count: number };
+        return Response.json({
+          messageIds: await stub.enqueueRunnerMentions(
+            { memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch },
+            body.channelId, body.agentHandle, body.count,
+          ),
+        });
+      }
+      if (url.pathname.endsWith("runner-revoke")) {
+        const body = (await request.json()) as { delegationId: string };
+        return Response.json(await stub.revokeRunnerDelegation({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch }, body.delegationId));
       }
       if (url.pathname.endsWith("device-origin")) {
         const actor = { memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch };

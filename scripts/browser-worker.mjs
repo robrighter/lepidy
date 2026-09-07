@@ -30,7 +30,9 @@ if (migrated.status !== 0) {
 // through a long suite and then fails on `write(): Broken pipe`. A file is
 // always drainable, and unlike `/dev/null` it keeps whatever the dev server
 // said about its own death, which is the thing you need when it dies.
-const logDirectory = path.join(root, "playwright-report");
+// Not `playwright-report`: the HTML reporter clears that directory when a run
+// starts, which silently emptied this log every time it was most wanted.
+const logDirectory = path.join(root, ".wrangler");
 mkdirSync(logDirectory, { recursive: true });
 const logPath = path.join(logDirectory, `worker-${environment}.log`);
 const child = spawn(

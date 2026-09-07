@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { blockPrefetch, expect, test } from "./harness";
 
 import { LOCALHOST_BASE } from "./device-helpers";
 import { CANARY, registerPasskey, requestRelease, seedAskCredential } from "./vault-helpers";
@@ -96,6 +96,7 @@ test("VAULT-APPROVAL-INT-002 lets anyone deny with no gesture, before the page h
   // the action that always works, including on a phone that has not finished
   // loading.
   const context = await browser.newContext({ javaScriptEnabled: false });
+  await blockPrefetch(context);
   const page = await context.newPage();
   const fixture = await seedAskCredential(page);
   const asked = await requestRelease(page, fixture);

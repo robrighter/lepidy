@@ -85,6 +85,14 @@ Leak tests scan HTTP bodies, WebSocket messages, MCP results, browser storage, c
 
 Security boundary tests also scan every cloud migration and serialized cloud protocol fixture for vault roots, recovery codes and local launch configuration. The runner suite sends validly authenticated requests containing each forbidden launch field and proves rejection before any process or durable write. Vault setup and recovery tests capture every local cloud-bound request and prove that only ciphertext, wraps, salts and KDF parameters leave the client.
 
+## The browser harness
+
+Browser scenarios import `test` and `expect` from `tests/browser/harness.ts`, not from `@playwright/test` directly, and a scenario that builds its own context calls `blockPrefetch` on it. The fixture stops the browser issuing speculative Next.js prefetches — roughly ten per page on this shell, thirty-four measured in one short scenario — which the test then abandons by navigating or closing.
+
+That is not tidiness. `wrangler dev` proxies every request through a ProxyWorker, and when the proxied fetch rejects — which is what an abandoned request looks like from inside — it reports the failure to its controller as fatal and the dev server exits, failing every remaining scenario on a refused connection. It is the instability recorded against C01a as "not concurrency and not memory". Prefetching is a browser optimisation for a route the test is about to fetch anyway; no assertion depends on it, and removing the abandoned requests removed the failure. A scenario that genuinely needs to assert on prefetching should build its own context without the fixture and accept the consequence.
+
+The dev server's stdout goes to `.wrangler/worker-<env>.log` rather than being inherited, because Playwright is configured to ignore that stream and an undrained pipe eventually kills workerd with `EPIPE`; an unexpected exit is announced on stderr with its code.
+
 ## Flake policy
 
 - Local tests run with zero retries. A failure must remain visible.
@@ -172,6 +180,7 @@ Manual review and screenshots can supplement visual judgment, store review and h
 | `AGENT-SESSION-RULE-001–003` | `src/domain/agent-session.test.ts` | Delegation and session lifetime ceilings, normalized non-widening capabilities, and exact tool/channel intersection rules. |
 | `AGENT-SESSION-INT-001–005` | `tests/agent-sessions.test.ts` | Digest-only scoped session credentials; delegated channel limits on posting and queue claims; exact-tuple token rotation; immediate denial after delegation revoke, owner removal, member offboarding, agent pause or expiry; single-live-session replacement; and cross-workspace refusal. |
 | `MCP-INT-008–013` | `tests/browser/mcp-oauth.spec.ts` | The whole dance against the built Worker: discovery, registration, consent, redemption, rotation, disconnect and cross-workspace refusal, followed by tool discovery and scoped channel/agent reads, human posting, claim/start/renew/complete, an agent reply in the originating thread, stable connection/client or session/delegation/device attribution after a fresh read, refusal of agent tools on read-only connections, a runner session confined to its delegated tools/channels, and vault metadata discovery whose HTTP results exclude plaintext, ciphertext and wraps. |
+| `MCP-WAIT-INT-001–003` | `tests/browser/mcp-waiting.spec.ts` | The D03 waiting spike against the built Worker: three separate pieces of work drained in one session with one set of credentials and every call bounded; an empty queue answered immediately rather than parked, which is the measurement the decision rests on; a wake that never arrived recovered by one bounded call; and a session stopped mid-work refused at its next call and still refused after. Each scenario records the latencies it observed, so "bounded" stays a measured claim. |
 | `MOCKUP-SEC-001/002/003` | `tests/browser/mockup-contracts.spec.ts` | Rendered Solo storage, local-only runner configuration and user-held vault recovery disclosures. |
 | Supporting rule cases | `src/domain/idempotency-key.test.ts` | Bounded transport-safe idempotency keys; a command integration test must consume this rule when mutation handling lands. |
 

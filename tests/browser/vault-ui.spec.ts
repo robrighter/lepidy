@@ -1,5 +1,5 @@
 import AxeBuilder from "@axe-core/playwright";
-import { expect, test } from "@playwright/test";
+import { blockPrefetch, expect, test } from "./harness";
 
 import { freshAccount, signUp } from "./auth-helpers";
 import { LOCALHOST_BASE } from "./device-helpers";
@@ -101,6 +101,7 @@ test("VAULT-UI-INT-003 cuts one agent off from the vault without silencing it, w
   // Scripting off: switching something off has to work before a page can
   // hydrate, because that is when somebody reaches for it.
   const context = await browser.newContext({ javaScriptEnabled: false });
+  await blockPrefetch(context);
   const page = await context.newPage();
   const account = freshAccount();
   await signUp(page, account, LOCALHOST_BASE);

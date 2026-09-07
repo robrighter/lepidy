@@ -47,7 +47,7 @@ This distinction prevents duplicate messages, file changes, purchases and other 
 
 ## 5. Session lifecycle and idle timeout
 
-The durable states are `starting`, `running`, `waiting`, `stopping`, `stopped` and `failed`; absence of a live session is shown as `idle`. A runner reuses the live session for later work by asking the harness to perform another bounded `agent_next` call after a wake. The workspace object never holds that request open.
+The durable states are `starting`, `running`, `waiting`, `stopping`, `stopped` and `failed`; absence of a live session is shown as `idle`. A runner reuses the live session for later work by asking the harness to perform another bounded `agent_next` call after a wake. The workspace object never holds that request open. D03 settled and measured that transport; see the [MCP waiting and harness contract](./mcp-waiting-and-harness-contract.md), which records why a parked wait is refused and what a bounded call actually costs.
 
 After the queue drains, the harness waits locally. The default idle timeout is ten minutes and may be configured locally between one and sixty minutes. A session has an eight-hour hard lifetime. At timeout the runner asks the harness to exit, waits ten seconds, then terminates its process tree. When a process exits, cleanly or otherwise, the runner rechecks queue depth before declaring the agent idle; nonzero depth starts a fresh session subject to cooldown and concurrency.
 

@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./harness";
 
 const mockups = "http://127.0.0.1:4174";
 
