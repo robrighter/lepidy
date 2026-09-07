@@ -21,8 +21,13 @@ export function freshAccount() {
   };
 }
 
-export async function signUp(page: Page, account: ReturnType<typeof freshAccount>) {
-  await page.goto("/signup");
+/**
+ * `origin` exists for the one suite that cannot use the default host: WebAuthn
+ * refuses a bare IP address as a relying party, so the approval scenarios sign
+ * up on `localhost` and stay there.
+ */
+export async function signUp(page: Page, account: ReturnType<typeof freshAccount>, origin = "") {
+  await page.goto(`${origin}/signup`);
   await page.getByLabel("Your name").fill(account.displayName);
   await page.getByLabel("Handle").fill(account.handle);
   await page.getByLabel("Email").fill(account.email);

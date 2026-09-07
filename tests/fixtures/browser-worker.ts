@@ -2,6 +2,8 @@
 import worker from "../../custom-worker";
 import { Workspace as ProductionWorkspace } from "../../src/cloudflare/workspace";
 import { AuthorizationService } from "../../src/control/authorization";
+import { OnboardingService } from "../../src/control/onboarding";
+import { SimpleWebAuthnPasskeyProvider } from "../../src/control/passkeys";
 import { resolveViewerWorkspace } from "../../src/shell/workspace-shell-source";
 import { encryptVaultValue } from "../../src/domain/vault-client-crypto";
 import { encodeVaultBytes } from "../../src/domain/vault-envelope";
@@ -104,6 +106,40 @@ export default {
         counts[table] = row!.count;
       }
       return Response.json(counts);
+    }
+    // Passkey enrolment has no production route yet — the registration UI is
+    // F04/C07's remaining surface — but V03's approval step-up is a real
+    // WebAuthn assertion, so the browser suite needs a real registered passkey
+    // to make one with. This runs the production ceremony against the host the
+    // request actually arrived on.
+    if (url.pathname.startsWith("/__fixture/passkey/") && request.method === "POST") {
+      const authorization = new AuthorizationService(env.CONTROL_DB, env.WORKSPACE);
+      let accountId: string;
+      try {
+        ({ accountId } = await authorization.authenticateBrowserSession(request.headers.get("authorization") ?? ""));
+      } catch {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const host = new URL(request.url).host;
+      const onboarding = new OnboardingService(
+        env.CONTROL_DB,
+        env.WORKSPACE,
+        () => Date.now(),
+        new SimpleWebAuthnPasskeyProvider(host.split(":")[0], [`http://${host}`]),
+      );
+      if (url.pathname.endsWith("/begin")) {
+        return Response.json(
+          await onboarding.beginPasskeyRegistration(accountId, {
+            freshSession: true,
+            stepUpVerified: true,
+            confirmed: true,
+          }),
+        );
+      }
+      const body = (await request.json()) as { challengeId: string; response: unknown };
+      return Response.json({
+        credentialId: await onboarding.finishPasskeyRegistration({ accountId, ...body }),
+      });
     }
     if (["/__fixture/seed", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/session-token", "/__fixture/vault", "/__fixture/device-origin"].includes(url.pathname) && request.method === "POST") {
       const authorization = new AuthorizationService(env.CONTROL_DB, env.WORKSPACE);

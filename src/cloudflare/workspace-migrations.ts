@@ -831,6 +831,66 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       ) STRICT`,
     ],
   },
+  {
+    version: 20,
+    name: "Conversational approvals and kill-switch scopes",
+    statements: [
+      // An approval holds the question, never the answer's material: credential
+      // ids, versions and policy epochs, the requester tuple, the origin and the
+      // reason. No ciphertext, no wrap, no key.
+      `CREATE TABLE vault_approvals (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'allowed', 'denied', 'expired')),
+        requester_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,
+        delegation_id TEXT REFERENCES agent_delegations(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        origin_channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        origin_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        delivery TEXT NOT NULL CHECK (delivery IN ('inject', 'file', 'device_proxy', 'reveal')),
+        reason TEXT NOT NULL,
+        access_epoch INTEGER NOT NULL CHECK (access_epoch > 0),
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        decided_at INTEGER,
+        decided_by_member_id TEXT REFERENCES members(id) ON DELETE SET NULL,
+        decision_digest TEXT,
+        CHECK ((agent_id IS NULL AND delegation_id IS NULL) OR (agent_id IS NOT NULL AND delegation_id IS NOT NULL))
+      ) STRICT`,
+      `CREATE INDEX vault_approvals_pending_idx ON vault_approvals(status, expires_at)`,
+      // Each credential in a batch keeps its own decision: one card, one
+      // gesture, but an approver may allow one and deny another.
+      `CREATE TABLE vault_approval_items (
+        approval_id TEXT NOT NULL REFERENCES vault_approvals(id) ON DELETE CASCADE,
+        credential_id TEXT NOT NULL REFERENCES vault_credentials(id) ON DELETE CASCADE,
+        credential_version INTEGER NOT NULL CHECK (credential_version > 0),
+        policy_epoch INTEGER NOT NULL CHECK (policy_epoch > 0),
+        outcome TEXT CHECK (outcome IN ('allowed', 'denied')),
+        grant_window TEXT CHECK (grant_window IN ('once', 'fifteen_minutes', 'session')),
+        grant_id TEXT REFERENCES vault_grants(id) ON DELETE SET NULL,
+        PRIMARY KEY (approval_id, credential_id)
+      ) STRICT`,
+      // Who may answer, and where their copy of the card was posted, so the
+      // answer can be written back into the same conversation.
+      `CREATE TABLE vault_approval_approvers (
+        approval_id TEXT NOT NULL REFERENCES vault_approvals(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        card_channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
+        card_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        PRIMARY KEY (approval_id, member_id)
+      ) STRICT`,
+      `CREATE INDEX vault_approval_approvers_member_idx ON vault_approval_approvers(member_id, approval_id)`,
+      // The per-credential and per-agent kill switches. Separate from policy
+      // mode and from agent status on purpose: turning a switch off is a
+      // protective action that must never require a step-up, and cutting an
+      // agent off from credentials must not require silencing it everywhere.
+      `ALTER TABLE vault_credentials ADD COLUMN frozen_at INTEGER`,
+      `ALTER TABLE vault_credentials ADD COLUMN frozen_by_member_id TEXT REFERENCES members(id) ON DELETE SET NULL`,
+      `ALTER TABLE agents ADD COLUMN vault_access_off_at INTEGER`,
+      `ALTER TABLE agents ADD COLUMN vault_access_off_by_member_id TEXT REFERENCES members(id) ON DELETE SET NULL`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

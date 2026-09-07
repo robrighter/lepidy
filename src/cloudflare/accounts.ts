@@ -18,6 +18,21 @@ import type { Workspace } from "./workspace";
  */
 export { ACCOUNTS_OBJECT_NAME } from "./accounts-address";
 
+/**
+ * The assertion options as they cross RPC and then the network.
+ *
+ * Spelled out rather than passed through as the library's own type: this value
+ * is serialised twice before a browser rebuilds a `PublicKeyCredentialRequestOptions`
+ * from it, and only plain JSON survives that trip.
+ */
+export type ApprovalAssertionOptions = {
+  challenge: string;
+  timeout?: number;
+  rpId?: string;
+  userVerification?: string;
+  allowCredentials?: { id: string; type: string; transports?: string[] }[];
+};
+
 export type SignUpInput = {
   email: string;
   password: string;
@@ -43,6 +58,34 @@ export class Accounts extends DurableObject<CloudflareEnv> {
    */
   async authenticatePassword(email: string, password: string): Promise<string | null> {
     return this.onboarding.authenticatePassword(email, password);
+  }
+
+  /**
+   * The approver's gesture for one credential approval.
+   *
+   * It lives here for the same reason password work does: the ceremony belongs
+   * with the account, and the verification libraries belong in a bundle
+   * Wrangler builds rather than in the Next.js one. The digest travels with the
+   * challenge so the assertion authorises one exact decision and nothing else.
+   */
+  async beginVaultApprovalAssertion(input: {
+    accountId: string;
+    digest: string;
+    relyingParty?: { rpId: string; origin: string };
+  }): Promise<{ id: string; options: ApprovalAssertionOptions }> {
+    const begun = await this.onboarding.beginVaultApprovalAssertion(input);
+    return { id: begun.id, options: begun.options as unknown as ApprovalAssertionOptions };
+  }
+
+  async verifyVaultApprovalAssertion(input: {
+    accountId: string;
+    challengeId: string;
+    credentialId: string;
+    response: unknown;
+    digest: string;
+    relyingParty?: { rpId: string; origin: string };
+  }): Promise<boolean> {
+    return this.onboarding.verifyVaultApprovalAssertion(input);
   }
 
   /**

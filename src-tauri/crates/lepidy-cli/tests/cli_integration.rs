@@ -240,6 +240,8 @@ fn vault_cli_int_006_run_injects_and_redacts_the_value_it_injected() {
             "channel-1",
             "--origin-message",
             "message-1",
+            "--reason",
+            "run the deploy",
             "--",
             probe(),
             "--echo-env",
@@ -298,6 +300,8 @@ fn vault_cli_int_007_scrubbing_survives_a_split_write() {
             "channel-1",
             "--origin-message",
             "message-1",
+            "--reason",
+            "run the deploy",
             "--",
             probe(),
             "--split-env",
@@ -336,6 +340,8 @@ fn vault_cli_int_008_a_file_delivery_is_written_owner_only_and_removed() {
             "channel-1",
             "--origin-message",
             "message-1",
+            "--reason",
+            "run the deploy",
             "--scrub",
             "never",
             "--",
@@ -372,6 +378,8 @@ fn vault_cli_int_008_a_file_delivery_is_written_owner_only_and_removed() {
             "channel-1",
             "--origin-message",
             "message-1",
+            "--reason",
+            "run the deploy",
             "--scrub",
             "never",
             "--",
@@ -417,6 +425,8 @@ fn vault_cli_int_009_a_file_delivery_is_owner_only_while_it_exists() {
             "channel-1",
             "--origin-message",
             "message-1",
+            "--reason",
+            "run the deploy",
             "--scrub",
             "never",
             "--",
@@ -459,10 +469,10 @@ fn vault_cli_int_010_a_denied_release_never_runs_the_command() {
     assert!(login(&home, &double).status.success());
     double.with_state(|state| {
         state.credentials = vec![credential_metadata()];
-        state.release = serde_json::json!({
-            "decision": { "kind": "deny", "reason": "project_refused" },
-            "hint": "PROBE_TOKEN is not available to this project. Stop and tell the user.",
-        });
+        state.release = deny_release(
+            "project_refused",
+            "PROBE_TOKEN is not available to this project. Stop and tell the user.",
+        );
     });
 
     let output = cli(
@@ -475,6 +485,8 @@ fn vault_cli_int_010_a_denied_release_never_runs_the_command() {
             "channel-1",
             "--origin-message",
             "message-1",
+            "--reason",
+            "run the deploy",
             "--",
             probe(),
             "--print",
@@ -496,10 +508,46 @@ fn vault_cli_int_011_a_pending_approval_is_distinguishable_from_a_refusal() {
     assert!(login(&home, &double).status.success());
     double.with_state(|state| {
         state.credentials = vec![credential_metadata()];
-        state.release = serde_json::json!({ "decision": { "kind": "needs_approval" } });
+        state.release = pending_release("approval-0001", 1_800_000_300_000);
     });
 
     let output = cli(
+        &home,
+        &[
+            "run",
+            "--with",
+            CREDENTIAL_NAME,
+            "--origin-channel",
+            "channel-1",
+            "--origin-message",
+            "message-1",
+            "--reason",
+            "run the deploy",
+            "--",
+            probe(),
+            "--print",
+            "THE-COMMAND-RAN",
+        ],
+        &[PASSPHRASE],
+    );
+    assert_eq!(output.status.code(), Some(78));
+    assert_absent(
+        &text(&output.stdout),
+        "THE-COMMAND-RAN",
+        "a run awaiting approval",
+    );
+    let reported = text(&output.stderr);
+    // The card's identity and the workspace's own waiting wording both reach
+    // the agent, so it knows what is outstanding and that it must not poll.
+    assert!(reported.contains("a human has to approve this use"));
+    assert!(reported.contains("approval-0001"));
+    assert!(reported.contains("do not retry in a loop"));
+
+    // The reason travelled with the request, and there is no way to make one
+    // without it: a card with no reason on it is one nobody can answer well.
+    let sent = double.with_state(|state| state.bodies("/api/device/vault/release"));
+    assert!(String::from_utf8_lossy(&sent[0]).contains("run the deploy"));
+    let missing = cli(
         &home,
         &[
             "run",
@@ -516,13 +564,64 @@ fn vault_cli_int_011_a_pending_approval_is_distinguishable_from_a_refusal() {
         ],
         &[PASSPHRASE],
     );
-    assert_eq!(output.status.code(), Some(78));
-    assert_absent(
-        &text(&output.stdout),
-        "THE-COMMAND-RAN",
-        "a run awaiting approval",
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(text(&missing.stderr).contains("--reason is required"));
+}
+
+/// VAULT-CLI-INT-016 — one command's credentials are one request, not several.
+#[test]
+fn vault_cli_int_016_one_command_asks_once_for_everything_it_needs() {
+    let double = Double::start();
+    let home = TempHome::create("run-batch");
+    assert!(login(&home, &double).status.success());
+    let vault_public_key = double
+        .with_state(|state| state.vault_public_key.clone())
+        .expect("a published key");
+    double.with_state(|state| {
+        state.credentials = vec![credential_metadata(), second_credential_metadata()];
+        state.release =
+            allow_release_many(&vault_public_key, &[CREDENTIAL_ID, SECOND_CREDENTIAL_ID]);
+    });
+
+    let output = cli(
+        &home,
+        &[
+            "run",
+            "--with",
+            CREDENTIAL_NAME,
+            "--with",
+            SECOND_CREDENTIAL_NAME,
+            "--origin-channel",
+            "channel-1",
+            "--origin-message",
+            "message-1",
+            "--reason",
+            "run the deploy",
+            "--",
+            probe(),
+            "--echo-env",
+            "PROBE_TOKEN",
+        ],
+        &[PASSPHRASE],
     );
-    assert!(text(&output.stderr).contains("needs a human to approve"));
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        text(&output.stderr)
+    );
+
+    // One release request naming both credentials, so the workspace can raise a
+    // single card rather than one per value.
+    let sent = double.with_state(|state| state.bodies("/api/device/vault/release"));
+    assert_eq!(sent.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&sent[0]).expect("a JSON body");
+    let asked: Vec<&str> = body["credentialIds"]
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|id| id.as_str().unwrap())
+        .collect();
+    assert_eq!(asked, vec![CREDENTIAL_ID, SECOND_CREDENTIAL_ID]);
 }
 
 /// VAULT-CLI-INT-012 — an unknown credential is refused locally, without a
@@ -544,6 +643,8 @@ fn vault_cli_int_012_an_invisible_credential_is_refused_before_any_release() {
             "channel-1",
             "--origin-message",
             "message-1",
+            "--reason",
+            "run the deploy",
             "--",
             probe(),
             "--print",
@@ -576,7 +677,7 @@ fn vault_cli_int_013_a_stale_key_epoch_fails_closed() {
     double.with_state(|state| {
         state.credentials = vec![credential_metadata()];
         let mut release = allow_release(&vault_public_key);
-        release["wrap"]["recipientKeyEpoch"] = serde_json::json!(2);
+        release["results"][0]["wrap"]["recipientKeyEpoch"] = serde_json::json!(2);
         state.release = release;
     });
 
@@ -590,6 +691,8 @@ fn vault_cli_int_013_a_stale_key_epoch_fails_closed() {
             "channel-1",
             "--origin-message",
             "message-1",
+            "--reason",
+            "run the deploy",
             "--",
             probe(),
             "--print",

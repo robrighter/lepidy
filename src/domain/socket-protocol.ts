@@ -85,6 +85,15 @@ export type ServerFrame =
   | { type: "thread_read"; threadRootId: string; sequence: number }
   | { type: "typing"; channelId: string; memberId: string; at: number }
   | { type: "presence"; memberId: string; online: boolean }
+  /**
+   * A vault decision addressed to one member rather than to a room.
+   *
+   * An approval's card is an ordinary message and arrives as a channel event
+   * like any other. This carries the decision itself, which the person who
+   * *asked* has no room to hear it in — their request was made from a CLI, not
+   * from a conversation they are sitting in.
+   */
+  | { type: "vault"; kind: string; approvalId: string; payload: unknown }
   /** The client's cursor is older than the replay window; refetch current state. */
   | { type: "reset"; reason: string }
   | { type: "error"; reason: string };

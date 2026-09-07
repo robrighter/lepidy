@@ -1,6 +1,17 @@
-import { expect, test, type APIRequestContext } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
 import { freshAccount, signUp } from "./auth-helpers";
+import {
+  BASE,
+  CANARY,
+  PROJECT,
+  base64url,
+  generateKeys,
+  publicJwk,
+  signedRequest,
+  slugFor,
+  type Enrolment,
+} from "./device-helpers";
 import { unwrapVaultDek, wrapVaultDek } from "../../src/domain/vault-client-crypto";
 import { decryptVaultValue, encryptVaultValue } from "../../src/domain/vault-client-crypto";
 import { encodeVaultBytes, VAULT_WRAP_SUITE } from "../../src/domain/vault-envelope";
@@ -14,114 +25,6 @@ import { encodeVaultBytes, VAULT_WRAP_SUITE } from "../../src/domain/vault-envel
  * does, that the workspace's policy decides every release, and that no request
  * or response in the whole flow carries a credential in the clear.
  */
-
-const BASE = "http://127.0.0.1:3100";
-const CANARY = "device-api-plaintext-canary-8813";
-const PROJECT = "cli-project";
-
-function slugFor(account: ReturnType<typeof freshAccount>): string {
-  return account.workspaceName.toLowerCase().replaceAll(/[^a-z0-9]+/gu, "-");
-}
-
-type Enrolment = {
-  deviceId: string;
-  deviceCredential: string;
-  deviceKeyEpoch: number;
-  workspaceId: string;
-  memberId: string;
-  authorizationEpoch: number;
-  vaultKey: { keyEpoch: number; published: boolean };
-};
-
-type DeviceKeys = {
-  signing: CryptoKeyPair;
-  vault: CryptoKeyPair;
-  vaultPublicKey: Uint8Array;
-};
-
-async function generateKeys(): Promise<DeviceKeys> {
-  const signing = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
-  const vault = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits", "deriveKey"]);
-  return { signing, vault, vaultPublicKey: new Uint8Array(await crypto.subtle.exportKey("raw", vault.publicKey)) };
-}
-
-async function publicJwk(key: CryptoKey): Promise<JsonWebKey> {
-  const { kty, crv, x, y } = (await crypto.subtle.exportKey("jwk", key)) as JsonWebKey;
-  return { kty, crv, x, y };
-}
-
-/** The canonical string from `src/control/authorization.ts`, rebuilt client-side. */
-function canonical(claims: Record<string, string | number | undefined>): string {
-  return [
-    "lepidy-device-request-v1",
-    String(claims.method).toUpperCase(),
-    claims.path,
-    claims.bodyHash,
-    claims.workspaceId,
-    claims.memberId,
-    String(claims.authorizationEpoch),
-    claims.deviceId,
-    String(claims.deviceKeyEpoch),
-    String(claims.timestamp),
-    claims.nonce,
-    claims.requestId,
-    claims.projectId,
-    String(claims.configRevision),
-    claims.agentId ?? "",
-    claims.delegationId ?? "",
-    claims.originId ?? "",
-  ].join("\n");
-}
-
-function base64url(bytes: ArrayBuffer | Uint8Array): string {
-  return Buffer.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)).toString("base64url");
-}
-
-async function signedRequest(
-  request: APIRequestContext,
-  input: {
-    keys: DeviceKeys;
-    enrolment: Enrolment;
-    path: string;
-    body: unknown;
-    tamper?: "body" | "signature";
-    nonce?: string;
-  },
-) {
-  const raw = JSON.stringify(input.body);
-  const claims = {
-    method: "POST",
-    path: input.path,
-    bodyHash: base64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw))),
-    workspaceId: input.enrolment.workspaceId,
-    memberId: input.enrolment.memberId,
-    authorizationEpoch: input.enrolment.authorizationEpoch,
-    deviceId: input.enrolment.deviceId,
-    deviceKeyEpoch: input.enrolment.deviceKeyEpoch,
-    timestamp: Date.now(),
-    nonce: input.nonce ?? base64url(crypto.getRandomValues(new Uint8Array(18))),
-    requestId: base64url(crypto.getRandomValues(new Uint8Array(18))),
-    projectId: PROJECT,
-    configRevision: 1,
-  };
-  const signature = new Uint8Array(
-    await crypto.subtle.sign(
-      { name: "ECDSA", hash: "SHA-256" },
-      input.keys.signing.privateKey,
-      new TextEncoder().encode(canonical(claims)),
-    ),
-  );
-  if (input.tamper === "signature") signature[0] ^= 0xff;
-  return request.post(`${BASE}${input.path}`, {
-    headers: {
-      "content-type": "application/json",
-      "x-lepidy-device-credential": input.enrolment.deviceCredential,
-      "x-lepidy-device-claims": base64url(new TextEncoder().encode(JSON.stringify(claims))),
-      "x-lepidy-device-signature": base64url(signature),
-    },
-    data: input.tamper === "body" ? `${raw} ` : raw,
-  });
-}
 
 test("VAULT-DEVICE-INT-001 enrols a local client, seals a value on it, and releases it back only under policy", async ({
   page,
@@ -242,10 +145,12 @@ test("VAULT-DEVICE-INT-001 enrols a local client, seals a value on it, and relea
   expect(listedBody).not.toContain("ciphertext");
   expect(listedBody).not.toContain("wrappedDek");
 
-  // The release: allowed by policy, and still ciphertext on the wire.
+  // The release: allowed by policy, and still ciphertext on the wire. One
+  // command asks once, so the request and the answer are both batch-shaped.
   const releaseBody = {
-    credentialId,
+    credentialIds: [credentialId],
     delivery: "inject",
+    reason: "run the browser suite",
     origin: { channelId: origin.channelId, messageId: origin.messageId },
   };
   const released = await signedRequest(page.request, {
@@ -257,11 +162,13 @@ test("VAULT-DEVICE-INT-001 enrols a local client, seals a value on it, and relea
   expect(released.status()).toBe(200);
   const releasedText = await released.text();
   expect(releasedText).not.toContain(CANARY);
-  const payload = (await released.json()) as {
-    decision: { kind: string };
-    envelope: Parameters<typeof decryptVaultValue>[0]["envelope"];
-    wrap: Parameters<typeof unwrapVaultDek>[0]["wrap"];
-  };
+  const payload = ((await released.json()) as {
+    results: {
+      decision: { kind: string };
+      envelope: Parameters<typeof decryptVaultValue>[0]["envelope"];
+      wrap: Parameters<typeof unwrapVaultDek>[0]["wrap"];
+    }[];
+  }).results[0];
   expect(payload.decision).toEqual({ kind: "allow", via: "automatic" });
 
   // Only this client's private key turns that into the value.
@@ -336,15 +243,16 @@ test("VAULT-DEVICE-INT-002 refuses a replayed request, a wrong origin and an uns
     enrolment,
     path: "/api/device/vault/release",
     body: {
-      credentialId: "cred-does-not-exist",
+      credentialIds: ["cred-does-not-exist"],
       delivery: "inject",
+      reason: "run the browser suite",
       origin: { channelId: origin.channelId, messageId: "message-that-does-not-exist" },
     },
   });
   expect(refused.status()).toBe(200);
-  const body = (await refused.json()) as { decision: { kind: string }; envelope?: unknown };
-  expect(body.decision.kind).toBe("deny");
-  expect(body.envelope).toBeUndefined();
+  const body = (await refused.json()) as { results: { decision: { kind: string }; envelope?: unknown }[] };
+  expect(body.results[0].decision.kind).toBe("deny");
+  expect(body.results[0].envelope).toBeUndefined();
 
   // Enrolment credentials are per-device: another device's credential does not
   // authorise this one's claims.

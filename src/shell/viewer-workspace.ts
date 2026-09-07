@@ -12,6 +12,8 @@ export type ViewerWorkspace = {
   workspaceId: string;
   /** What routes an MCP token to this tenant, so a page can show its address. */
   workspaceSlug: string;
+  /** The signed-in account, for a step-up ceremony the control plane owns. */
+  accountId: string;
 };
 
 export type ActionFailure = { ok: false; reason: string };
@@ -61,6 +63,7 @@ export async function viewerWorkspace(
     },
     workspaceId: resolved.row.id,
     workspaceSlug: resolved.row.slug,
+    accountId: resolved.row.account_id,
   };
 }
 

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Actor, Workspace } from "../src/cloudflare/workspace";
 import { decryptVaultValue, encryptVaultValue, unwrapVaultDek, wrapVaultDek } from "../src/domain/vault-client-crypto";
+import { VAULT_APPROVAL_TTL_MS, canonicalApprovalDigest } from "../src/domain/vault-approval";
 import { VAULT_WRAP_SUITE, encodeVaultBytes, type VaultKeyWrap } from "../src/domain/vault-envelope";
 
 const NOW = 1_800_000_000_000;
@@ -59,6 +60,37 @@ async function createCredential(seeded: Awaited<ReturnType<typeof seed>>, suffix
     envelope: encrypted.envelope, wraps: [wrap()], acl, freshUserVerification: true, localVaultUnlocked: true, now: NOW + 2,
   });
   return { credentialId, encrypted, created };
+}
+
+/** A credential two people manage, so a card has two possible answerers. */
+async function sharedCredential(seeded: Awaited<ReturnType<typeof seed>>, suffix: string) {
+  const credentialId = `credential-${suffix}`;
+  const encrypted = await encryptVaultValue({
+    workspaceId: seeded.stub.id.toString(), credentialId, version: 1, keyEpoch: 1,
+    plaintext: encoder.encode(`canary-${suffix}`),
+  });
+  await seeded.stub.createVaultCredential({
+    actor: seeded.owner, idempotencyKey: `vault:create:${suffix}:000001`, credentialId,
+    metadata: { name: `TOKEN_${suffix.toUpperCase()}`, description: "Shared token", envVar: "TOKEN", tags: [], commands: [], proxyHosts: [] },
+    policy: { mode: "ask", allowedDeliveries: ["inject"], projectIds: ["project-a"], highRisk: false },
+    envelope: encrypted.envelope, wraps: [wrap("owner"), wrap("member")],
+    acl: [
+      { subjectType: "member", subjectId: "owner", verb: "manage" },
+      { subjectType: "member", subjectId: "member", verb: "manage" },
+      { subjectType: "member", subjectId: "owner", verb: "use" },
+    ],
+    freshUserVerification: true, localVaultUnlocked: true, now: NOW + 2,
+  });
+  return { credentialId, encrypted };
+}
+
+function requestApproval(seeded: Awaited<ReturnType<typeof seed>>, credentialIds: readonly string[], now: number) {
+  return seeded.stub.requestVaultApproval({
+    actor: seeded.owner, credentialIds,
+    device: { id: "device-a", active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+    origin: { channelId: seeded.channelId, messageId: seeded.messageId },
+    projectId: "project-a", delivery: "inject", reason: "run the deploy", now,
+  });
 }
 
 describe("encrypted credential vault", () => {
@@ -261,6 +293,360 @@ describe("encrypted credential vault", () => {
     await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
       const usage = state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_usage_events").one();
       expect(usage.count).toBe(1);
+    });
+  });
+
+  /* -- conversational approvals and the kill switch (V03) ---------------- */
+
+  it("VAULT-INT-009 turns an ask into a card in every owner's vault DM and nothing else", async () => {
+    const seeded = await seed("vault-approval-card");
+    const ask = await createCredential(seeded, "ASK", { plaintext: "approval-plaintext-canary" });
+    const auto = await createCredential(seeded, "AUTO", { mode: "auto" });
+
+    const requested = await seeded.stub.requestVaultApproval({
+      actor: seeded.owner,
+      credentialIds: [ask.credentialId, auto.credentialId],
+      device: { id: "device-a", active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+      origin: { channelId: seeded.channelId, messageId: seeded.messageId },
+      projectId: "project-a", delivery: "inject", reason: "deploy the staging migration", now: NOW + 10,
+    });
+
+    // Only what the policy leaves to a human becomes a card; an automatic
+    // allow is answered on the spot rather than waking somebody up.
+    expect(requested.approvals).toHaveLength(1);
+    expect(requested.approvals[0].credentialIds).toEqual([ask.credentialId]);
+    expect(requested.approvals[0].expiresAt).toBe(NOW + 10 + VAULT_APPROVAL_TTL_MS);
+    expect(requested.decisions).toEqual([
+      { credentialId: auto.credentialId, decision: { kind: "allow", via: "automatic" } },
+    ]);
+    expect(requested.approvals[0].hint).toContain("do not retry in a loop");
+
+    // The card is a real message from a real identity in a real conversation.
+    const listed = await seeded.stub.listVaultApprovals({ actor: seeded.owner, now: NOW + 11 });
+    expect(listed.approvals).toHaveLength(1);
+    expect(listed.approvals[0]).toMatchObject({
+      status: "pending", requesterHandle: "owner", reason: "deploy the staging migration", viewerMayDecide: true,
+    });
+    expect(listed.approvals[0].items[0]).toMatchObject({ name: "TOKEN_ASK", windows: ["once"] });
+
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      const card = state.storage.sql.exec<{ body_markdown: string; author_kind: string; author_display_snapshot: string; kind: string }>(
+        `SELECT m.body_markdown, m.author_kind, m.author_display_snapshot, c.kind
+         FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.dm_key = ?`,
+        "vault-dm:owner",
+      ).one();
+      expect(card.author_kind).toBe("agent");
+      expect(card.author_display_snapshot).toBe("a.vault");
+      expect(card.kind).toBe("dm");
+      expect(card.body_markdown).toContain("deploy the staging migration");
+      expect(card.body_markdown).toContain("TOKEN_ASK");
+      expect(card.body_markdown).toContain("@owner");
+      expect(card.body_markdown).toContain("No answer is a denial");
+      // A card carries the question, never the answer's material.
+      expect(card.body_markdown).not.toContain("approval-plaintext-canary");
+      expect(card.body_markdown).not.toContain(ask.encrypted.envelope.ciphertext);
+
+      // Somebody who does not own the credential is not shown the card at all.
+      expect(
+        state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM channels WHERE dm_key = ?", "vault-dm:member").one().count,
+      ).toBe(0);
+      const stored = state.storage.sql.exec<{ reason: string; status: string }>("SELECT reason, status FROM vault_approvals").one();
+      expect(stored).toEqual({ reason: "deploy the staging migration", status: "pending" });
+    });
+
+    // The requester's push carries the facts a phone needs, and no value.
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      const queued = state.storage.sql.exec<{ kind: string; payload_json: string }>(
+        "SELECT kind, payload_json FROM pending_events WHERE kind = 'vault_approval_requested'",
+      ).toArray();
+      expect(queued).toHaveLength(1);
+      expect(JSON.parse(queued[0].payload_json)).toMatchObject({ urgent: true, credentialNames: ["TOKEN_ASK"] });
+      expect(queued[0].payload_json).not.toContain("approval-plaintext-canary");
+    });
+  });
+
+  it("VAULT-INT-010 lets the first answer win, binds the gesture, and issues exactly one grant", async () => {
+    const seeded = await seed("vault-approval-race");
+    const made = await sharedCredential(seeded, "RACE");
+    const requested = await requestApproval(seeded, [made.credentialId], NOW + 10);
+    const approvalId = requested.approvals[0].approvalId;
+    const decisions = [{ credentialId: made.credentialId, outcome: "allowed" as const, window: "once" as const }];
+    const digest = canonicalApprovalDigest({
+      approvalId,
+      items: [{ credentialId: made.credentialId, name: "TOKEN_RACE", version: 1, policyEpoch: 1 }],
+      decisions,
+    });
+
+    // Allowing without a verified gesture, or with one bound to a different
+    // decision, is refused before anything is written.
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      await expect(
+        instance.decideVaultApproval({ actor: seeded.owner, approvalId, decisions, now: NOW + 11 }),
+      ).rejects.toThrow(/verified approval gesture/);
+      await expect(
+        instance.decideVaultApproval({ actor: seeded.owner, approvalId, decisions, stepUp: { verified: true, digest: "another-digest" }, now: NOW + 11 }),
+      ).rejects.toThrow(/authorises a different decision/);
+      // Somebody who is not an eligible approver is told it does not exist
+      // rather than that it is none of their business.
+      await expect(
+        instance.decideVaultApproval({ actor: seeded.outsider, approvalId, decisions, stepUp: { verified: true, digest }, now: NOW + 11 }),
+      ).rejects.toThrow(/does not exist/);
+    });
+
+    const first = await seeded.stub.decideVaultApproval({
+      actor: seeded.owner, approvalId, decisions, stepUp: { verified: true, digest }, now: NOW + 12,
+    });
+    expect(first).toMatchObject({ status: "allowed", accepted: true, decidedByMemberId: "owner" });
+    expect(first.decisions[0].grantId).toEqual(expect.any(String));
+
+    // The second owner's answer is refused and told what happened, rather than
+    // silently overwriting the first or issuing a second grant.
+    const second = await seeded.stub.decideVaultApproval({
+      actor: seeded.member, approvalId,
+      decisions: [{ credentialId: made.credentialId, outcome: "denied", window: "once" }],
+      now: NOW + 13,
+    });
+    expect(second).toMatchObject({ status: "allowed", accepted: false, reason: "that request was already allowed", decidedByMemberId: "owner" });
+
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_grants").one().count).toBe(1);
+      const grant = state.storage.sql.exec<{ remaining_uses: number | null; expires_at: number | null; approved_by_member_id: string }>(
+        "SELECT remaining_uses, expires_at, approved_by_member_id FROM vault_grants",
+      ).one();
+      // "Allow once" is a grant with no expiry, which the grant rules spend on
+      // one use.
+      expect(grant).toEqual({ remaining_uses: 1, expires_at: null, approved_by_member_id: "owner" });
+      // Both owners' copies of the card carry the answer, so neither is left
+      // looking at an open request.
+      const answers = state.storage.sql.exec<{ body_markdown: string }>(
+        "SELECT body_markdown FROM messages WHERE body_markdown LIKE '%Answered by%'",
+      ).toArray();
+      expect(answers).toHaveLength(2);
+      expect(answers[0].body_markdown).toContain("Answered by @owner");
+      expect(answers[0].body_markdown).toContain("**TOKEN_RACE** — allowed once");
+    });
+
+    // And the grant the approval issued is the one the release path honours.
+    const released = await seeded.stub.releaseVaultCredential({
+      actor: seeded.owner, credentialId: made.credentialId,
+      device: { id: "device-a", active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+      origin: { channelId: seeded.channelId, messageId: seeded.messageId },
+      projectId: "project-a", delivery: "inject", now: NOW + 14,
+    });
+    expect(released.decision).toEqual({ kind: "allow", via: "grant" });
+  });
+
+  it("VAULT-INT-011 denies by timing out at five minutes and tells the agent to stop", async () => {
+    const seeded = await seed("vault-approval-expiry");
+    const made = await createCredential(seeded, "EXPIRE");
+    const requested = await requestApproval(seeded, [made.credentialId], NOW + 10);
+    const approvalId = requested.approvals[0].approvalId;
+    const expiresAt = requested.approvals[0].expiresAt;
+
+    // A second before the deadline the card is still answerable.
+    await expect(seeded.stub.expireVaultApprovals(expiresAt - 1)).resolves.toEqual({ expired: 0 });
+    expect((await seeded.stub.listVaultApprovals({ actor: seeded.owner, now: expiresAt - 1 })).approvals).toHaveLength(1);
+
+    await expect(seeded.stub.expireVaultApprovals(expiresAt)).resolves.toEqual({ expired: 1 });
+    // Sweeping again is a no-op rather than a second denial.
+    await expect(seeded.stub.expireVaultApprovals(expiresAt + 1)).resolves.toEqual({ expired: 0 });
+    expect((await seeded.stub.listVaultApprovals({ actor: seeded.owner, now: expiresAt + 1 })).approvals).toEqual([]);
+
+    // Answering afterwards cannot resurrect it.
+    const late = await seeded.stub.decideVaultApproval({
+      actor: seeded.owner, approvalId,
+      decisions: [{ credentialId: made.credentialId, outcome: "denied", window: "once" }],
+      now: expiresAt + 2,
+    });
+    expect(late).toMatchObject({ status: "expired", accepted: false });
+
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM vault_approvals").one().status).toBe("expired");
+      // A timeout is a denial in the row as well as in the wording.
+      expect(state.storage.sql.exec<{ outcome: string }>("SELECT outcome FROM vault_approval_items").one().outcome).toBe("denied");
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_grants").one().count).toBe(0);
+      const timedOut = state.storage.sql.exec<{ body_markdown: string }>(
+        "SELECT body_markdown FROM messages WHERE body_markdown LIKE '%Timed out%'",
+      ).one();
+      expect(timedOut.body_markdown).toContain("TOKEN_EXPIRE");
+      const queued = state.storage.sql.exec<{ payload_json: string }>(
+        "SELECT payload_json FROM pending_events WHERE kind = 'vault_approval_expired'",
+      ).one();
+      expect(JSON.parse(queued.payload_json).hint).toContain("counts as a denial");
+    });
+  });
+
+  it("VAULT-INT-012 coalesces one command into one card, and never across owners", async () => {
+    const seeded = await seed("vault-approval-batch");
+    const mine = await createCredential(seeded, "BATCH_A");
+    const alsoMine = await createCredential(seeded, "BATCH_B");
+    const shared = await sharedCredential(seeded, "BATCH_C");
+
+    const requested = await requestApproval(
+      seeded, [mine.credentialId, alsoMine.credentialId, shared.credentialId], NOW + 10,
+    );
+
+    // Two credentials only the owner manages are one question; the one a second
+    // person also owns is a different question with a different answerer.
+    expect(requested.approvals).toHaveLength(2);
+    const solo = requested.approvals.find((approval) => approval.approverMemberIds.length === 1)!;
+    const both = requested.approvals.find((approval) => approval.approverMemberIds.length === 2)!;
+    expect([...solo.credentialIds].sort()).toEqual([mine.credentialId, alsoMine.credentialId].sort());
+    expect(both.credentialIds).toEqual([shared.credentialId]);
+    expect(both.approverMemberIds).toEqual(["member", "owner"]);
+
+    // The owner sees both cards; the second person sees only the one they can
+    // actually answer.
+    expect((await seeded.stub.listVaultApprovals({ actor: seeded.owner, now: NOW + 11 })).approvals).toHaveLength(2);
+    const theirs = (await seeded.stub.listVaultApprovals({ actor: seeded.member, now: NOW + 11 })).approvals;
+    expect(theirs).toHaveLength(1);
+    expect(theirs[0].approvalId).toBe(both.approvalId);
+
+    // One card, one message, listing everything it is asking for.
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      const card = state.storage.sql.exec<{ body_markdown: string }>(
+        `SELECT m.body_markdown FROM messages m JOIN channels c ON c.id = m.channel_id
+         WHERE c.dm_key = 'vault-dm:owner' AND m.body_markdown LIKE '%TOKEN_BATCH_A%'`,
+      ).one();
+      expect(card.body_markdown).toContain("TOKEN_BATCH_B");
+      expect(card.body_markdown).not.toContain("TOKEN_BATCH_C");
+    });
+
+    // Mixed per-item answers are atomic: one is allowed, the other denied, and
+    // exactly one grant exists.
+    const items = [
+      { credentialId: mine.credentialId, outcome: "allowed" as const, window: "once" as const },
+      { credentialId: alsoMine.credentialId, outcome: "denied" as const, window: "once" as const },
+    ];
+    const digest = canonicalApprovalDigest({
+      approvalId: solo.approvalId,
+      items: [
+        { credentialId: mine.credentialId, name: "TOKEN_BATCH_A", version: 1, policyEpoch: 1 },
+        { credentialId: alsoMine.credentialId, name: "TOKEN_BATCH_B", version: 1, policyEpoch: 1 },
+      ],
+      decisions: items,
+    });
+    const answered = await seeded.stub.decideVaultApproval({
+      actor: seeded.owner, approvalId: solo.approvalId, decisions: items, stepUp: { verified: true, digest }, now: NOW + 12,
+    });
+    expect(answered.accepted).toBe(true);
+    expect(answered.decisions.filter((decision) => decision.grantId !== undefined)).toHaveLength(1);
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_grants").one().count).toBe(1);
+    });
+  });
+
+  it("VAULT-INT-013 gives each kill-switch scope an immediate, announced, non-restoring effect", async () => {
+    const seeded = await seed("vault-kill-switch");
+    const made = await createCredential(seeded, "SWITCH");
+    // The live grant belongs to another device, so the request from this one
+    // still has to ask: the scenario needs both a grant to revoke and a card to
+    // end.
+    await seeded.stub.issueVaultGrant({
+      actor: seeded.owner, credentialId: made.credentialId, memberId: "owner", deviceId: "device-b",
+      projectId: "project-a", delivery: "inject", originChannelId: seeded.channelId, originMessageId: seeded.messageId,
+      approvalVerified: true, freshUserVerification: true, now: NOW + 10,
+    });
+    const requested = await requestApproval(seeded, [made.credentialId], NOW + 11);
+    expect(requested.approvals).toHaveLength(1);
+
+    // Switching one credential off takes no step-up, revokes what is live and
+    // ends what is pending.
+    const off = await seeded.stub.setVaultCredentialFreeze({
+      actor: seeded.owner, credentialId: made.credentialId, frozen: true, now: NOW + 12,
+    });
+    expect(off).toEqual({ frozen: true, revokedGrants: 1, expiredApprovals: 1 });
+    expect((await seeded.stub.listVaultApprovals({ actor: seeded.owner, now: NOW + 13 })).approvals).toEqual([]);
+
+    // It outranks every policy, including a request that would otherwise be
+    // allowed automatically.
+    const refused = await seeded.stub.releaseVaultCredential({
+      actor: seeded.owner, credentialId: made.credentialId,
+      device: { id: "device-a", active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+      origin: { channelId: seeded.channelId, messageId: seeded.messageId },
+      projectId: "project-a", delivery: "inject", now: NOW + 14,
+    });
+    expect(refused.decision).toEqual({ kind: "deny", reason: "credential_frozen" });
+    expect(refused).not.toHaveProperty("envelope");
+
+    // Turning it back on does not bring the revoked grant back.
+    await expect(
+      seeded.stub.setVaultCredentialFreeze({ actor: seeded.owner, credentialId: made.credentialId, frozen: false, now: NOW + 15 }),
+    ).resolves.toEqual({ frozen: false, revokedGrants: 0, expiredApprovals: 0 });
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ revoked_reason: string }>("SELECT revoked_reason FROM vault_grants").one().revoked_reason)
+        .toBe("credential_switched_off");
+      // Both flips were announced to everyone who could be surprised by them.
+      const announcements = state.storage.sql.exec<{ body_markdown: string }>(
+        "SELECT body_markdown FROM messages WHERE body_markdown LIKE '%switched%' ORDER BY created_at",
+      ).toArray();
+      expect(announcements[0].body_markdown).toContain("The credential TOKEN_SWITCH was switched off by @owner");
+      expect(announcements[0].body_markdown).toContain("1 active grant was revoked");
+      expect(announcements.at(-1)!.body_markdown).toContain("were not restored");
+    });
+
+    // The per-agent scope cuts an agent off without silencing it.
+    const agent = await seeded.stub.createAgent({ actor: seeded.owner, idempotencyKey: "vault:switch:agent:0001", handle: "switchbot", now: NOW + 16 });
+    const agentOff = await seeded.stub.setAgentVaultAccess({ actor: seeded.owner, agentId: agent.agentId, enabled: false, now: NOW + 17 });
+    expect(agentOff).toMatchObject({ enabled: false });
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      const row = state.storage.sql.exec<{ status: string; vault_access_off_at: number | null }>(
+        "SELECT status, vault_access_off_at FROM agents WHERE id = ?", agent.agentId,
+      ).one();
+      // Still active: it may keep working, it may not touch credentials.
+      expect(row.status).toBe("active");
+      expect(row.vault_access_off_at).toBe(NOW + 17);
+      expect(
+        state.storage.sql.exec<{ body_markdown: string }>(
+          "SELECT body_markdown FROM messages WHERE body_markdown LIKE '%@a.switchbot%' ORDER BY created_at DESC",
+        ).toArray()[0].body_markdown,
+      ).toContain("was switched off by @owner");
+    });
+
+    // The workspace scope ends every pending card at once.
+    const stillPending = await requestApproval(seeded, [made.credentialId], NOW + 18);
+    expect(stillPending.approvals).toHaveLength(1);
+    await seeded.stub.setVaultAgentAccess({ actor: seeded.owner, enabled: false, freshUserVerification: false, now: NOW + 19 });
+    expect((await seeded.stub.listVaultApprovals({ actor: seeded.owner, now: NOW + 20 })).approvals).toEqual([]);
+  });
+
+  it("VAULT-INT-014 refuses to honour a card after the credential it described changed", async () => {
+    const seeded = await seed("vault-approval-stale");
+    const made = await createCredential(seeded, "STALE");
+    const requested = await requestApproval(seeded, [made.credentialId], NOW + 10);
+    const approvalId = requested.approvals[0].approvalId;
+    const decisions = [{ credentialId: made.credentialId, outcome: "allowed" as const, window: "once" as const }];
+    const digest = canonicalApprovalDigest({
+      approvalId, items: [{ credentialId: made.credentialId, name: "TOKEN_STALE", version: 1, policyEpoch: 1 }], decisions,
+    });
+
+    // Rotating the value moves the credential past the version the approver read.
+    const rotated = await encryptVaultValue({
+      workspaceId: seeded.stub.id.toString(), credentialId: made.credentialId, version: 2, keyEpoch: 2,
+      plaintext: encoder.encode("rotated-canary"),
+    });
+    await seeded.stub.updateVaultCredential({
+      actor: seeded.owner, credentialId: made.credentialId,
+      metadata: { name: "TOKEN_STALE", description: "Test token", envVar: "TOKEN", tags: ["test"], commands: ["tool"], proxyHosts: ["api.example.test"] },
+      policy: { mode: "ask", allowedDeliveries: ["inject"], projectIds: ["project-a"], grantTtlMs: 60_000, highRisk: true },
+      envelope: rotated.envelope, wraps: [wrap()],
+      acl: [
+        { subjectType: "member", subjectId: "owner", verb: "manage" },
+        { subjectType: "member", subjectId: "owner", verb: "use" },
+      ],
+      freshUserVerification: true, localVaultUnlocked: true, now: NOW + 11,
+    });
+
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      await expect(
+        instance.decideVaultApproval({ actor: seeded.owner, approvalId, decisions, stepUp: { verified: true, digest }, now: NOW + 12 }),
+      ).rejects.toThrow(/changed after the request was made/);
+    });
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      // Nothing was written: no grant, and the card is still open for a fresh
+      // request to replace.
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_grants").one().count).toBe(0);
+      expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM vault_approvals").one().status).toBe("pending");
     });
   });
 });

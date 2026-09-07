@@ -19,6 +19,13 @@ export type VaultAuthorizationInput = {
   origin: { verified: boolean; channelId: string; memberCanAccess: boolean };
   credential: {
     active: boolean;
+    /**
+     * The per-credential kill switch. Separate from `mode` and from the ACL
+     * because switching a credential off is a protective action that takes no
+     * step-up, and because it must outrank every policy a compromised session
+     * could otherwise satisfy.
+     */
+    frozen?: boolean;
     mode: "never" | "ask" | "auto";
     use: VaultScope;
     reveal: VaultScope;
@@ -27,7 +34,8 @@ export type VaultAuthorizationInput = {
     availableUntil?: number;
     rateAvailable: boolean;
   };
-  request: { delivery: VaultDelivery; agentId?: string };
+  /** `agentVaultAccessOff` is the per-agent kill switch: this agent may keep working, and may not touch credentials. */
+  request: { delivery: VaultDelivery; agentId?: string; agentVaultAccessOff?: boolean };
   delegation?: {
     active: boolean;
     ownerIsMember: boolean;
@@ -41,7 +49,13 @@ export type VaultAuthorizationInput = {
 };
 
 export function decideVaultAuthorization(input: VaultAuthorizationInput): VaultDecision {
+  // The three kill-switch scopes come first, ahead of everything a request
+  // could argue with. "Off" has to mean off before any other question is asked.
   if (!input.workspaceAccessOn) return deny("agent_access_off");
+  if (input.request.agentId !== undefined && input.request.agentVaultAccessOff === true) {
+    return deny("agent_vault_access_off");
+  }
+  if (input.credential.frozen === true) return deny("credential_frozen");
   if (!input.member.active || !input.member.authorizationEpochCurrent) return deny("membership_inactive");
   if (!input.device.active || !input.device.ownedByMember) return deny("device_inactive");
   if (!input.device.signatureVerified || !input.device.nonceFresh) return deny("request_unverified");
@@ -112,6 +126,10 @@ export function vaultDenialHint(reason: string, name: string, retryAfter?: numbe
       return `${name} hit its hourly use ceiling.${retryAfter ? ` Retry after ${new Date(retryAfter).toISOString()}.` : ""} Stop rather than retrying in a loop.`;
     case "delivery_refused":
       return `${name} does not permit that delivery. Use the delivery described by its metadata; never read it from a file or ask for it in chat.`;
+    case "agent_vault_access_off":
+      return `This agent's access to the vault was switched off, so ${name} is unavailable to it. Ask a human to turn it back on; do not use another agent or another route.`;
+    case "credential_frozen":
+      return `${name} was switched off by a human and cannot be used by anyone until they turn it back on. Stop and tell the user; there is no way around this.`;
     case "no_custodian_wrap":
       return `${name} has no key wrapped for this member, so this device cannot open it. Ask a custodian to share it; do not look for the value elsewhere.`;
     case "policy_never":

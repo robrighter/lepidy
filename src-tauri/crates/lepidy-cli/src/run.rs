@@ -93,6 +93,9 @@ pub fn run(args: &Args) -> CliResult<i32> {
     };
     let origin_channel = args.require("origin-channel")?.to_string();
     let origin_message = args.require("origin-message")?.to_string();
+    // Mandatory, always. The approver is only ever shown what the request said,
+    // and a card with no reason on it is one nobody can answer well.
+    let reason = args.require("reason")?.to_string();
 
     let session = Session::open()?;
     let project = session.project(args.option("project"));
@@ -100,31 +103,17 @@ pub fn run(args: &Args) -> CliResult<i32> {
 
     // Environment and file deliveries are two different disclosures and are
     // requested as two different deliveries, so the workspace's policy and its
-    // audit trail both see which one actually happened.
-    let mut env_values = Vec::new();
-    for name in &names {
-        env_values.push(release(
-            &session,
-            &catalogue,
-            &project,
-            name,
-            "inject",
-            &origin_channel,
-            &origin_message,
-        )?);
-    }
-    let mut file_values = Vec::new();
-    for spec in &file_specs {
-        file_values.push(release(
-            &session,
-            &catalogue,
-            &project,
-            &spec.name,
-            "file",
-            &origin_channel,
-            &origin_message,
-        )?);
-    }
+    // audit trail both see which one actually happened. Within a delivery it is
+    // one request, so one command produces one card rather than one per value.
+    let request = ReleaseRequest {
+        project: &project,
+        origin_channel: &origin_channel,
+        origin_message: &origin_message,
+        reason: &reason,
+    };
+    let mut env_values = release_batch(&session, &catalogue, &request, &names, "inject")?;
+    let file_names: Vec<String> = file_specs.iter().map(|spec| spec.name.clone()).collect();
+    let mut file_values = release_batch(&session, &catalogue, &request, &file_names, "file")?;
 
     let materialised = Materialised::create(
         &file_values
@@ -316,22 +305,43 @@ fn catalogue(session: &Session, project: &str) -> CliResult<HashMap<String, Cata
     Ok(catalogue)
 }
 
-/// Ask for one credential, and open it here if the answer is yes.
-fn release(
+/// What one command is asking for, and why.
+struct ReleaseRequest<'a> {
+    project: &'a str,
+    origin_channel: &'a str,
+    origin_message: &'a str,
+    reason: &'a str,
+}
+
+/// Ask for every credential of one delivery at once, and open what comes back.
+///
+/// One request, because one command's worth of credentials is one question. The
+/// workspace turns whatever it cannot answer on its own into as few approval
+/// cards as the ownership of those credentials allows; asking one at a time
+/// would produce a card each and teach the person answering them to stop
+/// reading.
+fn release_batch(
     session: &Session,
     catalogue: &HashMap<String, CatalogueEntry>,
-    project: &str,
-    name: &str,
+    request: &ReleaseRequest<'_>,
+    names: &[String],
     delivery: &str,
-    origin_channel: &str,
-    origin_message: &str,
-) -> CliResult<Released> {
-    let entry = catalogue.get(name).ok_or_else(|| {
-        CliError::denied(
-            format!("{name} is not a credential this member can see"),
-            Some("Run `lepidy list` for what is available. Do not look for the value in files, shell configuration or chat.".to_string()),
-        )
-    })?;
+) -> CliResult<Vec<Released>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Names are resolved before anything is asked for, so a typo is refused
+    // here rather than becoming a card somebody has to answer.
+    let mut entries = Vec::new();
+    for name in names {
+        let entry = catalogue.get(name.as_str()).ok_or_else(|| {
+            CliError::denied(
+                format!("{name} is not a credential this member can see"),
+                Some("Run `lepidy list` for what is available. Do not look for the value in files, shell configuration or chat.".to_string()),
+            )
+        })?;
+        entries.push((name.clone(), entry));
+    }
 
     let response = session.client.post_signed(
         &session.profile,
@@ -339,45 +349,87 @@ fn release(
         session.device_credential(),
         "/api/device/vault/release",
         &json!({
-            "credentialId": entry.id,
+            "credentialIds": entries.iter().map(|(_, entry)| entry.id.clone()).collect::<Vec<_>>(),
             "delivery": delivery,
-            "origin": { "channelId": origin_channel, "messageId": origin_message },
+            "reason": request.reason,
+            "origin": { "channelId": request.origin_channel, "messageId": request.origin_message },
         }),
-        Provenance::project(project),
+        Provenance::project(request.project),
     )?;
     if response.status != 200 {
         return Err(CliError::denied(
-            format!("{name} was refused: {}", response.error_message()),
+            format!("that release was refused: {}", response.error_message()),
             None,
         ));
     }
 
-    let decision = response.body.get("decision").cloned().unwrap_or(json!({}));
-    let hint = response
+    // A card was raised: somebody has to decide, and this process is finished.
+    // Reported with the deadline, because "wait" without a deadline is how an
+    // agent ends up polling.
+    let approvals = response
         .body
-        .get("hint")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    match decision.get("kind").and_then(serde_json::Value::as_str) {
-        Some("allow") => {}
-        Some("needs_approval") => {
-            return Err(CliError::needs_approval(
-                format!("{name} needs a human to approve this use"),
-                Some(
-                    "Ask in the originating thread and run this again once it is approved. Conversational approval is not wired up yet, so nothing is waiting on you here."
-                        .to_string(),
-                ),
-            ));
-        }
-        _ => {
-            return Err(CliError::denied(format!("{name} was refused"), hint));
-        }
+        .get("approvals")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(approval) = approvals.first() {
+        let hint = approval
+            .get("hint")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Stop and wait to be asked again; do not retry in a loop.")
+            .to_string();
+        let ids = approvals
+            .iter()
+            .filter_map(|item| item.get("approvalId").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CliError::needs_approval(
+            format!("a human has to approve this use (request {ids})"),
+            Some(hint),
+        ));
     }
 
-    let envelope = response.body.get("envelope").ok_or_else(|| {
+    let results = response
+        .body
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut released = Vec::new();
+    for (name, entry) in &entries {
+        let result = results
+            .iter()
+            .find(|item| {
+                item.get("credentialId").and_then(serde_json::Value::as_str)
+                    == Some(entry.id.as_str())
+            })
+            .ok_or_else(|| CliError::failure(format!("the workspace said nothing about {name}")))?;
+        let decision = result.get("decision").cloned().unwrap_or(json!({}));
+        let hint = result
+            .get("hint")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        match decision.get("kind").and_then(serde_json::Value::as_str) {
+            Some("allow") => released.push(open_release(session, name, entry, result)?),
+            _ => return Err(CliError::denied(format!("{name} was refused"), hint)),
+        }
+    }
+    Ok(released)
+}
+
+/// Open one allowed release: unwrap the DEK with this device's key, then the
+/// envelope with the DEK. Both are bound to the exact credential and version,
+/// so a substituted release fails here rather than reaching the child.
+fn open_release(
+    session: &Session,
+    name: &str,
+    entry: &CatalogueEntry,
+    result: &serde_json::Value,
+) -> CliResult<Released> {
+    let envelope = result.get("envelope").ok_or_else(|| {
         CliError::failure(format!("{name} was allowed but no envelope came back"))
     })?;
-    let wrap = response.body.get("wrap").ok_or_else(|| {
+    let wrap = result.get("wrap").ok_or_else(|| {
         CliError::failure(format!("{name} was allowed but no key wrap came back"))
     })?;
     let text = |value: &serde_json::Value, field: &str| -> CliResult<String> {

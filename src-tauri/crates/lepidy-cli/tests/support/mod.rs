@@ -32,6 +32,8 @@ pub const DEVICE_ID: &str = "device-test";
 pub const DEVICE_CREDENTIAL: &str = "device-credential-token-0001";
 pub const CREDENTIAL_ID: &str = "cred-test-0001";
 pub const CREDENTIAL_NAME: &str = "PROBE_TOKEN";
+pub const SECOND_CREDENTIAL_ID: &str = "cred-test-0002";
+pub const SECOND_CREDENTIAL_NAME: &str = "PROBE_SECOND";
 /// Recognisable enough to spot in any output, worthless everywhere.
 pub const CANARY: &str = "lepidy-synthetic-canary-4f2a91c7";
 pub const PASSPHRASE: &str = "correct horse battery staple";
@@ -77,7 +79,7 @@ impl Double {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let address = listener.local_addr().expect("a bound address");
         let state = Arc::new(Mutex::new(State {
-            release: json!({ "decision": { "kind": "deny", "reason": "credential_inactive" } }),
+            release: deny_release("credential_inactive", "That credential is not available."),
             enrol_status: 200,
             vault_key_published: true,
             ..State::default()
@@ -417,49 +419,95 @@ pub fn credential_metadata() -> Value {
     })
 }
 
+pub fn second_credential_metadata() -> Value {
+    let mut metadata = credential_metadata();
+    metadata["id"] = json!(SECOND_CREDENTIAL_ID);
+    metadata["name"] = json!(SECOND_CREDENTIAL_NAME);
+    metadata["envVar"] = json!(SECOND_CREDENTIAL_NAME);
+    metadata
+}
+
 /// Seal the canary the way a custodian client would, so `run` has something
 /// real to open. Uses the CLI's own crypto, which is the code under test on the
 /// other side of the wire.
+/// A refusal in the batch shape the endpoint answers in.
+pub fn deny_release(reason: &str, hint: &str) -> Value {
+    json!({
+        "workspaceId": WORKSPACE_ID,
+        "results": [{ "credentialId": CREDENTIAL_ID, "decision": { "kind": "deny", "reason": reason }, "hint": hint }],
+        "approvals": [],
+    })
+}
+
+/// A card was raised: nothing is released, and the CLI is told what to wait for.
+pub fn pending_release(approval_id: &str, expires_at: u64) -> Value {
+    json!({
+        "workspaceId": WORKSPACE_ID,
+        "results": [{ "credentialId": CREDENTIAL_ID, "decision": { "kind": "needs_approval" } }],
+        "approvals": [{
+            "approvalId": approval_id,
+            "expiresAt": expires_at,
+            "credentialIds": [CREDENTIAL_ID],
+            "credentialNames": [CREDENTIAL_NAME],
+            "approverMemberIds": [MEMBER_ID],
+            "hint": "PROBE_TOKEN needs a human to approve this use. Stop and wait to be asked again; do not retry in a loop.",
+        }],
+    })
+}
+
 pub fn allow_release(vault_public_key: &[u8]) -> Value {
+    allow_release_many(vault_public_key, &[CREDENTIAL_ID])
+}
+
+/// Seal the canary the way a custodian client would, once per credential, so
+/// `run` has something real to open. Uses the CLI's own crypto, which is the
+/// code under test on the other side of the wire.
+pub fn allow_release_many(vault_public_key: &[u8], credential_ids: &[&str]) -> Value {
     use lepidy_cli::crypto::{
         aes_gcm_encrypt, credential_aad, encode, random_bytes, wrap_aad, wrap_dek, DEK_BYTES,
         IV_BYTES,
     };
-    let dek = random_bytes(DEK_BYTES);
-    let iv = random_bytes(IV_BYTES);
-    let ciphertext = aes_gcm_encrypt(
-        &dek,
-        &iv,
-        &credential_aad(WORKSPACE_ID, CREDENTIAL_ID, 1),
-        CANARY.as_bytes(),
-    )
-    .expect("a sealed canary");
-    let wrap = wrap_dek(
-        vault_public_key,
-        &dek,
-        &wrap_aad(WORKSPACE_ID, CREDENTIAL_ID, 1, MEMBER_ID, 1),
-    )
-    .expect("a sealed DEK");
-    json!({
-        "workspaceId": WORKSPACE_ID,
-        "decision": { "kind": "allow", "via": "automatic" },
-        "envelope": {
-            "cipherSuite": "AES-256-GCM",
-            "aadVersion": 1,
-            "version": 1,
-            "keyEpoch": 1,
-            "iv": encode(&iv),
-            "ciphertext": encode(&ciphertext),
-        },
-        "wrap": {
-            "custodianMemberId": MEMBER_ID,
-            "recipientKeyEpoch": 1,
-            "wrapSuite": "P256-HKDF-SHA256-AES256GCM",
-            "ephemeralPublicKey": encode(&wrap.ephemeral_public_key),
-            "iv": encode(&wrap.iv),
-            "wrappedDek": encode(&wrap.wrapped_dek),
-        },
-    })
+    let results: Vec<Value> = credential_ids
+        .iter()
+        .map(|credential_id| {
+            let dek = random_bytes(DEK_BYTES);
+            let iv = random_bytes(IV_BYTES);
+            let ciphertext = aes_gcm_encrypt(
+                &dek,
+                &iv,
+                &credential_aad(WORKSPACE_ID, credential_id, 1),
+                CANARY.as_bytes(),
+            )
+            .expect("a sealed canary");
+            let wrap = wrap_dek(
+                vault_public_key,
+                &dek,
+                &wrap_aad(WORKSPACE_ID, credential_id, 1, MEMBER_ID, 1),
+            )
+            .expect("a sealed DEK");
+            json!({
+                "credentialId": credential_id,
+                "decision": { "kind": "allow", "via": "automatic" },
+                "envelope": {
+                    "cipherSuite": "AES-256-GCM",
+                    "aadVersion": 1,
+                    "version": 1,
+                    "keyEpoch": 1,
+                    "iv": encode(&iv),
+                    "ciphertext": encode(&ciphertext),
+                },
+                "wrap": {
+                    "custodianMemberId": MEMBER_ID,
+                    "recipientKeyEpoch": 1,
+                    "wrapSuite": "P256-HKDF-SHA256-AES256GCM",
+                    "ephemeralPublicKey": encode(&wrap.ephemeral_public_key),
+                    "iv": encode(&wrap.iv),
+                    "wrappedDek": encode(&wrap.wrapped_dek),
+                },
+            })
+        })
+        .collect();
+    json!({ "workspaceId": WORKSPACE_ID, "approvals": [], "results": results })
 }
 
 pub fn assert_absent(haystack: &str, needle: &str, what: &str) {

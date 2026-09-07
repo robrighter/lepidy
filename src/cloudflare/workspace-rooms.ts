@@ -1375,9 +1375,11 @@ export type AgentRow = {
   status: "active" | "paused" | "archived";
   prompt: string | null;
   scopeMode: "any" | "listed";
+  /** The per-agent vault kill switch, independent of whether the agent is paused. */
+  vaultAccessOffAt: number | null;
 };
 
-const AGENT_COLUMNS = `id, handle, display_name, description, status, prompt, scope_mode`;
+const AGENT_COLUMNS = `id, handle, display_name, description, status, prompt, scope_mode, vault_access_off_at`;
 
 type RawAgent = {
   id: string;
@@ -1387,6 +1389,7 @@ type RawAgent = {
   status: AgentRow["status"];
   prompt: string | null;
   scope_mode: AgentRow["scopeMode"];
+  vault_access_off_at: number | null;
 };
 
 function toAgent(row: RawAgent): AgentRow {
@@ -1398,6 +1401,7 @@ function toAgent(row: RawAgent): AgentRow {
     status: row.status,
     prompt: row.prompt,
     scopeMode: row.scope_mode,
+    vaultAccessOffAt: row.vault_access_off_at,
   };
 }
 

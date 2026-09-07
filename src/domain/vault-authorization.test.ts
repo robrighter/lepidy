@@ -27,6 +27,43 @@ function valid(): VaultAuthorizationInput {
 }
 
 describe("vault authorization contract", () => {
+  it("VAULT-AUTH-007 lets each kill-switch scope outrank every policy that would otherwise allow", () => {
+    // A credential switched off is unavailable to everyone, including the
+    // member whose own ACL and exact grant would otherwise allow it.
+    const frozen = valid();
+    frozen.credential.frozen = true;
+    frozen.grantMatchesExactly = true;
+    expect(decideVaultAuthorization(frozen)).toEqual({ kind: "deny", reason: "credential_frozen" });
+
+    // An agent cut off from the vault is refused while the same request from
+    // the human is allowed, which is the point of the scope existing at all.
+    const agentOff = valid();
+    agentOff.credential.use.agents = ["agent-1"];
+    agentOff.request = { delivery: "inject", agentId: "agent-1", agentVaultAccessOff: true };
+    agentOff.delegation = {
+      active: true, ownerIsMember: true, agentMatches: true, channelAllowed: true,
+      credentialAllowed: true, deliveryAllowed: true, projectAllowed: true,
+    };
+    expect(decideVaultAuthorization(agentOff)).toEqual({ kind: "deny", reason: "agent_vault_access_off" });
+    expect(decideVaultAuthorization({ ...valid(), request: { delivery: "inject" } })).toEqual({
+      kind: "allow",
+      via: "automatic",
+    });
+
+    // The per-agent switch is about agents; it cannot silently deny a person.
+    const humanUnaffected = valid();
+    humanUnaffected.request = { delivery: "inject", agentVaultAccessOff: true };
+    expect(decideVaultAuthorization(humanUnaffected)).toEqual({ kind: "allow", via: "automatic" });
+
+    // Both denials name the credential and close the door rather than
+    // suggesting another route to the same value.
+    expect(vaultDenialHint("credential_frozen", "PROD_KEY")).toContain("PROD_KEY");
+    expect(vaultDenialHint("credential_frozen", "PROD_KEY")).toContain("no way around this");
+    expect(vaultDenialHint("agent_vault_access_off", "PROD_KEY")).toContain(
+      "do not use another agent or another route",
+    );
+  });
+
   it("VAULT-AUTH-001 unions ACL entries within the use verb", () => {
     for (const use of [
       { members: ["member-1"], groups: [], agents: [], channels: [] },

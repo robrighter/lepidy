@@ -21,6 +21,9 @@ type WorkspaceRole = "owner" | "admin" | "member" | "guest";
 
 export type IssuedChallenge = { id: string; token: string; expiresAt: number };
 
+/** Where a WebAuthn ceremony is happening, when it is not the configured default. */
+export type RelyingParty = { rpId: string; origin: string };
+
 export class OnboardingService {
   constructor(
     private readonly db: D1Database,
@@ -122,6 +125,95 @@ export class OnboardingService {
       .bind(counter, now, input.accountId, new TextEncoder().encode(input.credentialId))
       .run();
     return input.accountId;
+  }
+
+  /**
+   * Begin the gesture that authorises one approval decision.
+   *
+   * It is an ordinary passkey assertion with user verification, and what makes
+   * it an *approval* gesture is the digest recorded beside the challenge: the
+   * decision the approver is about to authorise, in full. At the end of the
+   * ceremony the caller must present the same digest, so an assertion collected
+   * for one card cannot be spent on another, or on the same card after a
+   * credential in it changed.
+   */
+  /**
+   * The relying party a ceremony runs under.
+   *
+   * A passkey is bound to the origin that created it, so a deployment serving a
+   * different host has to say so or every assertion fails verification for a
+   * reason nobody can see. Callers that know the host they were addressed on
+   * pass it; everything else keeps the configured default.
+   */
+  private providerFor(relyingParty?: RelyingParty): PasskeyProvider {
+    if (relyingParty === undefined) return this.passkeyProvider;
+    return new SimpleWebAuthnPasskeyProvider(relyingParty.rpId, [relyingParty.origin]);
+  }
+
+  async beginVaultApprovalAssertion(input: {
+    accountId: string;
+    digest: string;
+    relyingParty?: RelyingParty;
+  }): Promise<{ id: string; options: Awaited<ReturnType<PasskeyProvider["authenticationOptions"]>> }> {
+    const existing = await this.loadPasskeys(input.accountId);
+    // Fail closed and say why. An account with no passkey cannot allow a
+    // credential — which is the documented consequence of the step-up matrix,
+    // not an accident of this code path.
+    if (existing.length === 0) throw new Error("account has no passkey");
+    const options = await this.providerFor(input.relyingParty).authenticationOptions(
+      existing.map(({ id, transports }) => ({ id, transports })),
+    );
+    const id = crypto.randomUUID();
+    const now = this.now();
+    await this.db
+      .prepare(
+        `INSERT INTO auth_challenges(id, kind, account_id, challenge, payload_json, expires_at, created_at)
+         VALUES (?, 'passkey_authentication', ?, ?, ?, ?, ?)`,
+      )
+      // Five minutes, the same ceiling the approval itself lives under.
+      .bind(id, input.accountId, options.challenge, JSON.stringify({ approvalDigest: input.digest }), now + 5 * 60_000, now)
+      .run();
+    return { id, options };
+  }
+
+  /**
+   * Finish it, and answer one question: may this account authorise exactly this
+   * decision, right now? Anything else is a refusal.
+   */
+  async verifyVaultApprovalAssertion(input: {
+    accountId: string;
+    challengeId: string;
+    credentialId: string;
+    response: unknown;
+    digest: string;
+    relyingParty?: RelyingParty;
+  }): Promise<boolean> {
+    const row = await this.db
+      .prepare(
+        `UPDATE auth_challenges SET consumed_at = ?
+         WHERE id = ? AND account_id = ? AND kind = 'passkey_authentication' AND consumed_at IS NULL AND expires_at > ?
+         RETURNING challenge, payload_json`,
+      )
+      .bind(this.now(), input.challengeId, input.accountId, this.now())
+      .first<{ challenge: string; payload_json: string }>();
+    if (!row) throw new Error("that approval gesture is invalid, expired or already used");
+    const bound = (JSON.parse(row.payload_json) as { approvalDigest?: string }).approvalDigest;
+    if (bound === undefined || bound !== input.digest) {
+      throw new Error("that approval gesture authorises a different decision");
+    }
+    const credential = (await this.loadPasskeys(input.accountId)).find(({ id }) => id === input.credentialId);
+    if (!credential) throw new Error("passkey not found");
+    const counter = await this.providerFor(input.relyingParty).verifyAuthentication(
+      input.response,
+      row.challenge,
+      credential,
+    );
+    if (counter === null || counter < credential.counter) throw new Error("that approval gesture could not be verified");
+    await this.db
+      .prepare("UPDATE passkeys SET sign_count = ?, last_used_at = ? WHERE account_id = ? AND credential_id = ?")
+      .bind(counter, this.now(), input.accountId, new TextEncoder().encode(input.credentialId))
+      .run();
+    return true;
   }
 
   async issueEmailChallenge(email: string, kind: ChallengeKind): Promise<IssuedChallenge> {

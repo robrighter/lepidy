@@ -64,6 +64,11 @@ a command line is readable by other processes and is captured verbatim by the
 harness logs this CLI exists to keep credentials out of. `LEPIDY_HOME` chooses
 the profile directory.
 
+`run` requires `--reason`: a credential that asks every time raises an approval
+card, and the reason is what the person deciding actually reads. When a card is
+raised the command does not run — the CLI reports the request and exits 78, and
+the card is answered in the Inbox or in the direct message from `@a.vault`.
+
 ## Desktop shell
 
 Run `npm run desktop:dev` after installing the Tauri system prerequisites. The desktop window follows the current Slipchat platform pattern:

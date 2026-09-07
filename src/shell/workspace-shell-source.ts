@@ -42,6 +42,8 @@ export type WorkspaceRow = {
   durable_object_id: string;
   member_id: string;
   authorization_epoch: number;
+  /** The account behind the membership, for ceremonies that live in the control plane. */
+  account_id: string;
 };
 
 /**
@@ -72,7 +74,7 @@ export async function resolveViewerWorkspace(
   }
 
   const base = `SELECT w.id, w.slug, w.name, w.plan, w.jurisdiction, w.durable_object_id,
-                       m.member_id, m.authorization_epoch
+                       m.member_id, m.authorization_epoch, m.account_id
                 FROM memberships m
                 JOIN workspaces w ON w.id = m.workspace_id
                 WHERE m.account_id = ? AND m.status = 'active' AND w.status = 'active'`;

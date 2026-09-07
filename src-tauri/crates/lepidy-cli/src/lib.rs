@@ -41,9 +41,11 @@ lepidy — local credential injection for Lepidy workspaces
       password and the value, in that order. The value is encrypted here.
 
   lepidy run --with NAME [--with-file NAME:PATH] --origin-channel ID
-             --origin-message ID [--project ID] [--scrub auto|always|never] -- COMMAND...
+             --origin-message ID --reason TEXT [--project ID]
+             [--scrub auto|always|never] -- COMMAND...
       Release credentials for one command and run it. Reads the local vault
       passphrase first; the rest of standard input belongs to the command.
+      --reason is mandatory: it is what the person deciding actually reads.
 
 Exit codes: 0 or the command's own; 77 refused; 78 needs a human's approval;
 2 usage; 1 failure.

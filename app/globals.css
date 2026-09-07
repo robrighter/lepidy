@@ -449,3 +449,20 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
+
+/* Approval cards (V03). A decision surface, so the facts read before the buttons do. */
+.approval-list { display: grid; gap: 14px; }
+.approval-card { display: grid; gap: 10px; padding: 16px; border: 1px solid var(--line-strong); border-radius: var(--r-lg); background: var(--surface-2); }
+.approval-card.waiting { border-style: dashed; color: var(--text-2); }
+.approval-card header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.approval-card h3 { margin: 0; font: 650 14.5px/1.3 var(--font-display); }
+.approval-card p { margin: 0; color: var(--text-2); }
+.approval-risk { display: inline-flex; align-items: center; gap: 5px; margin: 0; color: #b03a52; font-size: 12.5px; font-weight: 600; }
+.approval-card dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; font-size: 13px; }
+.approval-card dt { color: var(--text-3); }
+.approval-card dd { margin: 0; color: var(--text-1); }
+.approval-items { display: grid; gap: 4px; margin: 0; padding-left: 18px; font-size: 13px; }
+.approval-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.approval-actions form { margin: 0; }
+.approval-note { display: inline-flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 12.5px; }
+@media (max-width: 640px) { .approval-card dl { grid-template-columns: 1fr; } }

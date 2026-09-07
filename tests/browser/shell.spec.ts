@@ -209,9 +209,14 @@ test("MSG-INT-009 keeps focus, preserves a draft and separates Enter from Shift+
 });
 
 test("SHELL-INT-006 states plainly that a surface is not built yet", async ({ page }) => {
+  // The Inbox itself now carries approvals (V03) and says which of its other
+  // tiers are still to come, rather than claiming the whole surface is absent.
   await page.goto("/inbox");
-  await expect(page.getByRole("heading", { name: "Your inbox is not built yet" })).toBeVisible();
-  await expect(page.getByText(/arrive with C06/)).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Nothing is waiting on you" })).toBeVisible();
+  await expect(page.getByText(/join them with C06/)).toBeVisible();
+
+  await page.goto("/vault");
+  await expect(page.getByRole("heading", { name: "The vault is not built yet" })).toBeVisible();
 
   // A channel nobody can see is refused rather than invented.
   await page.goto("/c/does-not-exist");

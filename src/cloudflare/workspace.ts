@@ -226,6 +226,31 @@ import {
   type VaultKeyWrap,
 } from "../domain/vault-envelope";
 import {
+  MAX_APPROVAL_CREDENTIALS,
+  VAULT_AGENT_HANDLE,
+  VAULT_APPROVAL_TTL_MS,
+  approvalAnswerMarkdown,
+  approvalCardMarkdown,
+  approvalExpiredMarkdown,
+  approvalGrantExpiry,
+  approvalPendingHint,
+  approvalTimeoutHint,
+  availableApprovalWindows,
+  canonicalApprovalDigest,
+  decideApprovalTransition,
+  isApprovalExpired,
+  killSwitchAnnouncement,
+  validateApprovalItems,
+  validateApprovalTuple,
+  vaultDirectMessageKey,
+  type ApprovalDecisionInput,
+  type ApprovalOutcome,
+  type ApprovalRequestTuple,
+  type ApprovalStatus,
+  type ApprovalWindow,
+  type KillSwitchScope,
+} from "../domain/vault-approval";
+import {
   normalizeVaultMetadata,
   normalizeVaultPolicy,
   validateVaultAcl,
@@ -281,6 +306,7 @@ export type DueWorkReport = {
   retention: RetentionSweepReport | null;
   anchor: AuditAnchor | null;
   scheduledSends: { sent: number; failed: number };
+  approvals: { expired: number };
   alarmAt: number | null;
 };
 
@@ -296,6 +322,8 @@ export type SchedulerState = {
 export const RETENTION_SWEEP_WORK_ID = "system:retention_sweep";
 export const AUDIT_ANCHOR_WORK_ID = "system:audit_anchor";
 export const OUTBOX_FLUSH_WORK_ID = "system:outbox_flush";
+/** One row for every pending card, re-armed at the earliest expiry. */
+export const VAULT_APPROVAL_EXPIRY_WORK_ID = "system:vault_approval_expiry";
 
 export type ShellChannel = {
   id: string;
@@ -356,6 +384,67 @@ export type VaultMemberKey = {
   publicKey: string;
 };
 
+export type VaultApprovalSummary = {
+  approvalId: string;
+  expiresAt: number;
+  credentialIds: readonly string[];
+  credentialNames: readonly string[];
+  approverMemberIds: readonly string[];
+  /** What the agent is told while it waits, in the product's own words. */
+  hint: string;
+};
+
+export type VaultApprovalRequestResult = {
+  approvals: readonly VaultApprovalSummary[];
+  /** Credentials that needed no card: already allowed, or already refused. */
+  decisions: readonly { credentialId: string; decision: VaultDecision; hint?: string }[];
+};
+
+export type VaultApprovalCard = {
+  approvalId: string;
+  status: ApprovalStatus;
+  requesterMemberId: string;
+  requesterHandle: string;
+  agentHandle: string | null;
+  deviceId: string;
+  projectId: string;
+  delivery: VaultDelivery;
+  reason: string;
+  createdAt: number;
+  expiresAt: number;
+  viewerMayDecide: boolean;
+  items: readonly {
+    credentialId: string;
+    name: string;
+    description: string;
+    highRisk: boolean;
+    version: number;
+    policyEpoch: number;
+    windows: readonly ApprovalWindow[];
+  }[];
+};
+
+export type VaultApprovalDecisionResult = {
+  status: ApprovalStatus;
+  accepted: boolean;
+  reason?: string;
+  decidedByMemberId?: string;
+  decisions: readonly { credentialId: string; name: string; outcome: ApprovalOutcome; window: ApprovalWindow; grantId?: string }[];
+};
+
+type VaultApprovalRow = {
+  id: string; status: ApprovalStatus; requester_member_id: string; agent_id: string | null; delegation_id: string | null;
+  device_id: string; project_id: string; origin_channel_id: string; origin_message_id: string;
+  delivery: VaultDelivery; reason: string; access_epoch: number; created_at: number; expires_at: number;
+  decided_at: number | null; decided_by_member_id: string | null; decision_digest: string | null;
+};
+
+type VaultApprovalItemRow = {
+  approval_id: string; credential_id: string; credential_version: number; policy_epoch: number;
+  outcome: ApprovalOutcome | null; grant_window: ApprovalWindow | null; grant_id: string | null;
+  name: string; description: string; high_risk: number; grant_ttl_ms: number | null;
+};
+
 export type VaultAccessRequest = {
   actor: Actor;
   credentialId: string;
@@ -376,6 +465,7 @@ type VaultCredentialRow = {
   mode: VaultPolicy["mode"]; allowed_deliveries_json: string; project_ids_json: string;
   grant_ttl_ms: number | null; available_until: number | null; max_uses_per_hour: number | null;
   high_risk: number; created_at: number; updated_at: number; last_accessed_at: number | null; access_count: number;
+  frozen_at: number | null; frozen_by_member_id: string | null;
 };
 
 export type CreatedChannel = { channelId: string; kind: ChannelKind; created: boolean };
@@ -4315,8 +4405,18 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       if ((current.agent_access_on === 1) === input.enabled) return { result: { enabled: input.enabled, accessEpoch: current.access_epoch } };
       const accessEpoch = current.access_epoch + 1;
       this.ctx.storage.sql.exec("UPDATE vault_settings SET agent_access_on = ?, access_epoch = ?, updated_by_member_id = ?, updated_at = ? WHERE singleton = 1", input.enabled ? 1 : 0, accessEpoch, actor.id, input.now);
+      const revokedGrants = this.countLiveVaultGrants("1 = 1");
       this.revokeVaultGrants("workspace_access_changed", input.now, "1 = 1");
-      return { result: { enabled: input.enabled, accessEpoch }, effects: this.vaultEffects("vault.agent_access_changed", "workspace", actor, { enabled: input.enabled, access_epoch: accessEpoch }) };
+      // A card answered after the switch was thrown would hand out exactly what
+      // the switch was thrown to stop, so every pending one ends with it.
+      const expiredApprovals = input.enabled ? 0 : this.cancelPendingApprovals(input.now, "1 = 1");
+      this.announceVaultKillSwitch({ kind: "workspace" }, !input.enabled, actor, revokedGrants, input.now);
+      return {
+        result: { enabled: input.enabled, accessEpoch },
+        effects: this.vaultEffects("vault.agent_access_changed", "workspace", actor, {
+          enabled: input.enabled, access_epoch: accessEpoch, revoked_grants: revokedGrants, expired_approvals: expiredApprovals,
+        }),
+      };
     });
     return outcome.result;
   }
@@ -4346,19 +4446,17 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     }
     const target = this.resolveActiveMemberIds([input.memberId]);
     if (target.length !== 1) throw new Error("grant member is not active");
-    const settings = this.vaultSettings();
-    const grantId = crypto.randomUUID();
     const remainingUses = input.expiresAt === undefined ? 1 : undefined;
+    let grantId = "";
     const outcome = await this.commitMutation({ scope: "vault.grant.issue", now: input.now }, () => {
-      this.ctx.storage.sql.exec(
-        `INSERT INTO vault_grants(id, credential_id, credential_version, policy_epoch, access_epoch, member_id, device_id,
-          project_id, agent_id, delegation_id, delivery, origin_channel_id, expires_at, remaining_uses,
-          origin_message_id, approved_by_member_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        grantId, row.id, row.version, row.policy_epoch, settings.access_epoch, input.memberId, input.deviceId, input.projectId,
-        input.agentId ?? null, input.delegationId ?? null, input.delivery, input.originChannelId, input.expiresAt ?? null,
-        remainingUses ?? null, input.originMessageId, actor.id, input.now,
-      );
+      grantId = this.insertVaultGrant({
+        row, memberId: input.memberId, deviceId: input.deviceId, projectId: input.projectId, delivery: input.delivery,
+        ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+        ...(input.delegationId === undefined ? {} : { delegationId: input.delegationId }),
+        originChannelId: input.originChannelId, originMessageId: input.originMessageId,
+        ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+        approverMemberId: actor.id, now: input.now,
+      });
       return {
         result: { grantId, ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }), ...(remainingUses === undefined ? {} : { remainingUses }) },
         effects: this.vaultEffects("vault.grant_issued", row.id, actor, { grant_id: grantId, item_version: row.version, policy_epoch: row.policy_epoch, delivery: input.delivery }),
@@ -4434,6 +4532,749 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     return outcome.result;
   }
 
+  /* -------------------------------------------------------------------- */
+  /* Conversational approvals and the kill switch (V03)                    */
+  /* -------------------------------------------------------------------- */
+
+  /**
+   * Ask the people who own these credentials.
+   *
+   * Every credential is evaluated first, because most requests never need to
+   * bother anybody: a denial is returned as a denial and an automatic allow as
+   * an allow. Only what the policy genuinely leaves to a human becomes a card.
+   *
+   * Cards are grouped by their eligible approver set rather than by the
+   * request, because a card is answered once by one person. Two credentials
+   * owned by different people are two questions however close together they
+   * were asked, and coalescing them would let one owner's gesture stand for
+   * another owner's credential.
+   */
+  async requestVaultApproval(input: {
+    actor: Actor;
+    credentialIds: readonly string[];
+    device: VaultAccessRequest["device"];
+    origin: { channelId: string; messageId: string };
+    projectId: string;
+    delivery: VaultDelivery;
+    reason: string;
+    agentId?: string;
+    delegationId?: string;
+    now: number;
+  }): Promise<VaultApprovalRequestResult> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const tuple = validateApprovalTuple({
+      requesterMemberId: actor.id,
+      ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+      ...(input.delegationId === undefined ? {} : { delegationId: input.delegationId }),
+      deviceId: input.device.id,
+      projectId: input.projectId,
+      originChannelId: input.origin.channelId,
+      originMessageId: input.origin.messageId,
+      delivery: input.delivery,
+      reason: input.reason,
+    });
+    const requested = [...new Set(input.credentialIds)];
+    validateApprovalItems(
+      requested.map((credentialId) => ({ credentialId, name: "", version: 1, policyEpoch: 1 })),
+    );
+
+    const decided: { credentialId: string; decision: VaultDecision; hint?: string }[] = [];
+    const pending: { row: VaultCredentialRow; approvers: readonly string[] }[] = [];
+    for (const credentialId of requested) {
+      const request: VaultAccessRequest = {
+        actor: input.actor, credentialId, device: input.device, origin: input.origin,
+        projectId: input.projectId, delivery: input.delivery,
+        ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+        ...(input.delegationId === undefined ? {} : { delegationId: input.delegationId }),
+        now: input.now,
+      };
+      const evaluated = this.evaluateVaultAccess(request, actor);
+      if (evaluated.decision.kind !== "needs_approval" || evaluated.row === null) {
+        decided.push({
+          credentialId,
+          decision: evaluated.decision,
+          ...(evaluated.decision.kind === "deny"
+            ? { hint: vaultDenialHint(evaluated.decision.reason, evaluated.row?.name ?? "credential", evaluated.retryAfter) }
+            : {}),
+        });
+        continue;
+      }
+      const approvers = this.vaultApproverMemberIds(evaluated.row.id);
+      if (approvers.length === 0) {
+        // Nobody can answer, so waiting five minutes would only waste them. A
+        // credential whose last manager left is a state a human has to fix.
+        decided.push({
+          credentialId,
+          decision: { kind: "deny", reason: "no_eligible_approver" },
+          hint: vaultDenialHint("no_eligible_approver", evaluated.row.name),
+        });
+        continue;
+      }
+      pending.push({ row: evaluated.row, approvers });
+    }
+    if (pending.length === 0) return { approvals: [], decisions: decided };
+
+    const groups = new Map<string, { approvers: readonly string[]; rows: VaultCredentialRow[] }>();
+    for (const item of pending) {
+      const key = [...item.approvers].sort().join("|");
+      const group = groups.get(key) ?? { approvers: [...item.approvers].sort(), rows: [] };
+      group.rows.push(item.row);
+      groups.set(key, group);
+    }
+
+    const approvals: VaultApprovalSummary[] = [];
+    for (const group of groups.values()) {
+      for (let index = 0; index < group.rows.length; index += MAX_APPROVAL_CREDENTIALS) {
+        approvals.push(
+          await this.createVaultApproval(
+            actor,
+            tuple,
+            group.rows.slice(index, index + MAX_APPROVAL_CREDENTIALS),
+            group.approvers,
+            input.now,
+          ),
+        );
+      }
+    }
+    return { approvals, decisions: decided };
+  }
+
+  private async createVaultApproval(
+    actor: ActiveMember,
+    tuple: ApprovalRequestTuple,
+    rows: readonly VaultCredentialRow[],
+    approvers: readonly string[],
+    now: number,
+  ): Promise<VaultApprovalSummary> {
+    const approvalId = crypto.randomUUID();
+    const expiresAt = now + VAULT_APPROVAL_TTL_MS;
+    const settings = this.vaultSettings();
+    const agent = tuple.agentId === undefined ? null : readAgent(this.ctx.storage, tuple.agentId);
+    const originChannel = readChannel(this.ctx.storage, tuple.originChannelId);
+    const card = approvalCardMarkdown({
+      requesterHandle: actor.handle,
+      ...(agent === null ? {} : { agentHandle: agent.handle }),
+      // The device and project are shown by the opaque labels the request was
+      // signed with. Paths, commands and environment values stay on the runner:
+      // the cloud has never seen them and an approval card is not where that
+      // changes.
+      deviceLabel: `device ${tuple.deviceId}`,
+      projectLabel: tuple.projectId,
+      originChannelLabel: originChannel?.slug ? `#${originChannel.slug}` : "a conversation",
+      delivery: tuple.delivery,
+      reason: tuple.reason,
+      expiresAt,
+      items: rows.map((row) => {
+        const usage = this.vaultRecentUsage(row.id, now);
+        return {
+          name: row.name,
+          description: row.description,
+          highRisk: row.high_risk === 1,
+          recentUses: usage.count,
+          ...(usage.lastUsedAt === null ? {} : { lastUsedAt: usage.lastUsedAt }),
+        };
+      }),
+    });
+
+    const outcome = await this.commitMutation({ scope: "vault.approval.request", now }, () => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO vault_approvals(id, status, requester_member_id, agent_id, delegation_id, device_id, project_id,
+           origin_channel_id, origin_message_id, delivery, reason, access_epoch, created_at, expires_at)
+         VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        approvalId, actor.id, tuple.agentId ?? null, tuple.delegationId ?? null, tuple.deviceId, tuple.projectId,
+        tuple.originChannelId, tuple.originMessageId, tuple.delivery, tuple.reason, settings.access_epoch, now, expiresAt,
+      );
+      for (const row of rows) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO vault_approval_items(approval_id, credential_id, credential_version, policy_epoch)
+           VALUES (?, ?, ?, ?)`,
+          approvalId, row.id, row.version, row.policy_epoch,
+        );
+      }
+      // The card is a real message in a real conversation, so it can be read on
+      // a phone, quoted, and answered by whichever owner gets there first.
+      for (const memberId of approvers) {
+        const posted = this.postVaultMessage(memberId, card, null, now);
+        this.ctx.storage.sql.exec(
+          `INSERT INTO vault_approval_approvers(approval_id, member_id, card_channel_id, card_message_id)
+           VALUES (?, ?, ?, ?)`,
+          approvalId, memberId, posted.channelId, posted.messageId,
+        );
+      }
+      return {
+        result: { approvalId, expiresAt },
+        effects: {
+          audit: {
+            eventType: "vault.approval_requested", outcome: "allowed", requesterKind: "member", requesterId: actor.id,
+            subjectKind: "vault_approval", subjectId: approvalId,
+            metadata: {
+              item_count: rows.length, approver_count: approvers.length, delivery: tuple.delivery,
+              agent_id: tuple.agentId ?? null, delegation_id: tuple.delegationId ?? null, project_id: tuple.projectId,
+            },
+          },
+          // Push is the whole point: the card has five minutes to reach a person
+          // who is not looking at the app. Approvals are the one thing in the
+          // product that notify regardless of Do Not Disturb.
+          outbox: approvers.map((memberId) => ({
+            id: `vault_approval.${approvalId}.${memberId}`,
+            kind: "vault_approval_requested",
+            dedupeKey: `vault_approval:${approvalId}:${memberId}`,
+            payload: {
+              approvalId, memberId, expiresAt, delivery: tuple.delivery, reason: tuple.reason,
+              credentialNames: rows.map((row) => row.name), highRisk: rows.some((row) => row.high_risk === 1),
+              requesterHandle: actor.handle, agentHandle: agent?.handle ?? null, urgent: true,
+            },
+          })),
+          dueWork: [{ id: VAULT_APPROVAL_EXPIRY_WORK_ID, kind: "vault_approval_expiry", dueAt: expiresAt }],
+        } satisfies MutationEffects,
+      };
+    });
+    for (const memberId of approvers) {
+      this.broadcastToMember(memberId, {
+        type: "vault", kind: "approval_requested", approvalId,
+        payload: { expiresAt, credentialNames: rows.map((row) => row.name) },
+      });
+    }
+    return {
+      approvalId: outcome.result.approvalId,
+      expiresAt: outcome.result.expiresAt,
+      credentialIds: rows.map((row) => row.id),
+      credentialNames: rows.map((row) => row.name),
+      approverMemberIds: approvers,
+      hint: approvalPendingHint(rows.map((row) => row.name), outcome.result.expiresAt),
+    };
+  }
+
+  /**
+   * The approvals this member is being asked about, plus the ones they are
+   * waiting on. Metadata only: an approval has never held ciphertext or a key.
+   */
+  listVaultApprovals(input: { actor: Actor; now: number }): { approvals: readonly VaultApprovalCard[] } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const rows = this.ctx.storage.sql.exec<VaultApprovalRow>(
+      `SELECT a.* FROM vault_approvals a
+       WHERE a.status = 'pending' AND a.expires_at > ?
+         AND (a.requester_member_id = ? OR EXISTS (
+           SELECT 1 FROM vault_approval_approvers p WHERE p.approval_id = a.id AND p.member_id = ?))
+       ORDER BY a.created_at`,
+      input.now, actor.id, actor.id,
+    ).toArray();
+    return { approvals: rows.map((row) => this.vaultApprovalCard(row, actor.id)) };
+  }
+
+  /**
+   * Answer a card. The first terminal answer wins.
+   *
+   * Allowing is a step-up: the approver's verified gesture is bound to this
+   * approval and this exact ordered set of decisions, so it cannot be replayed
+   * onto another card or onto the same card after a credential changed.
+   * Denying takes no step-up at all — a protective action must never be the
+   * harder one.
+   */
+  async decideVaultApproval(input: {
+    actor: Actor;
+    approvalId: string;
+    decisions: readonly ApprovalDecisionInput[];
+    stepUp?: { verified: boolean; digest: string };
+    now: number;
+  }): Promise<VaultApprovalDecisionResult> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const approval = this.readVaultApproval(input.approvalId);
+    if (approval === null) throw new Error("that approval does not exist");
+    if (!this.vaultApprovalApprovers(approval.id).includes(actor.id)) {
+      // Reported as missing rather than forbidden, the same as a room somebody
+      // cannot see: whether a credential they do not own is being requested is
+      // not their business.
+      throw new Error("that approval does not exist");
+    }
+
+    const items = this.readVaultApprovalItems(approval.id);
+    const digest = canonicalApprovalDigest({
+      approvalId: approval.id,
+      items: items.map((item) => ({
+        credentialId: item.credential_id, name: item.name, version: item.credential_version, policyEpoch: item.policy_epoch,
+      })),
+      decisions: input.decisions,
+    });
+    const allowing = input.decisions.some((decision) => decision.outcome === "allowed");
+    if (allowing) {
+      if (input.stepUp === undefined || !input.stepUp.verified) {
+        throw new Error("allowing a credential needs a verified approval gesture");
+      }
+      if (input.stepUp.digest !== digest) {
+        throw new Error("that approval gesture authorises a different decision");
+      }
+    }
+
+    if (isApprovalExpired({ status: approval.status, expiresAt: approval.expires_at }, input.now)) {
+      await this.expireVaultApprovals(input.now);
+      return { status: "expired", accepted: false, reason: "that request timed out before it was answered", decisions: [] };
+    }
+    const transition = decideApprovalTransition(
+      approval.status,
+      allowing && input.decisions.every((decision) => decision.outcome === "allowed") ? "allowed" : allowing ? "allowed" : "denied",
+    );
+    if (!transition.ok) {
+      const answered = this.readVaultApproval(approval.id);
+      return {
+        status: answered?.status ?? approval.status, accepted: false, reason: transition.reason,
+        ...(answered?.decided_by_member_id ? { decidedByMemberId: answered.decided_by_member_id } : {}),
+        decisions: [],
+      };
+    }
+
+    const outcome = await this.commitMutation({ scope: "vault.approval.decide", now: input.now }, () => {
+      // One conditional write is what makes first-answer-wins true: a second
+      // approver's transaction finds nothing left in `pending` to update. The
+      // claim is confirmed by reading the row back rather than by counting
+      // written rows, because a write that touches an indexed column writes the
+      // index entries too and the count is not the number of rows matched.
+      this.ctx.storage.sql.exec(
+        `UPDATE vault_approvals SET status = ?, decided_at = ?, decided_by_member_id = ?, decision_digest = ?
+         WHERE id = ? AND status = 'pending'`,
+        transition.status, input.now, actor.id, digest, approval.id,
+      );
+      const claimed = this.ctx.storage.sql.exec<{ status: ApprovalStatus; decided_by_member_id: string | null }>(
+        "SELECT status, decided_by_member_id FROM vault_approvals WHERE id = ?", approval.id,
+      ).one();
+      if (claimed.status !== transition.status || claimed.decided_by_member_id !== actor.id) {
+        throw new Error("that request was already answered");
+      }
+
+      const applied: { credentialId: string; name: string; outcome: ApprovalOutcome; window: ApprovalWindow; grantId?: string }[] = [];
+      for (const decision of input.decisions) {
+        const item = items.find((candidate) => candidate.credential_id === decision.credentialId)!;
+        let grantId: string | undefined;
+        if (decision.outcome === "allowed") {
+          const row = this.readVaultCredential(item.credential_id);
+          // A credential that changed after the card was written is a different
+          // credential than the one the approver read. It needs a new request,
+          // not a grant issued against a version nobody agreed to.
+          if (row === null || row.version !== item.credential_version || row.policy_epoch !== item.policy_epoch) {
+            throw new Error("that credential changed after the request was made");
+          }
+          if (row.frozen_at !== null) throw new Error("that credential was switched off after the request was made");
+          grantId = this.insertVaultGrant({
+            row,
+            memberId: approval.requester_member_id,
+            deviceId: approval.device_id,
+            projectId: approval.project_id,
+            delivery: approval.delivery,
+            ...(approval.agent_id === null ? {} : { agentId: approval.agent_id }),
+            ...(approval.delegation_id === null ? {} : { delegationId: approval.delegation_id }),
+            originChannelId: approval.origin_channel_id,
+            originMessageId: approval.origin_message_id,
+            expiresAt: approvalGrantExpiry(decision.window, this.vaultPolicy(row), input.now),
+            approverMemberId: actor.id,
+            now: input.now,
+          });
+        }
+        this.ctx.storage.sql.exec(
+          "UPDATE vault_approval_items SET outcome = ?, grant_window = ?, grant_id = ? WHERE approval_id = ? AND credential_id = ?",
+          decision.outcome, decision.window, grantId ?? null, approval.id, decision.credentialId,
+        );
+        applied.push({ credentialId: decision.credentialId, name: item.name, outcome: decision.outcome, window: decision.window, ...(grantId === undefined ? {} : { grantId }) });
+      }
+
+      // The answer goes back into the same conversation, on every approver's
+      // copy, so a second owner sees who answered rather than an open card.
+      const answer = approvalAnswerMarkdown({
+        approverHandle: actor.handle,
+        decisions: applied.map((item) => ({ name: item.name, outcome: item.outcome, window: item.window })),
+      });
+      this.postVaultApprovalAnswer(approval.id, answer, input.now);
+
+      return {
+        result: { status: transition.status as VaultApprovalDecisionResult["status"], accepted: true, decisions: applied },
+        effects: {
+          audit: {
+            eventType: "vault.approval_decided", outcome: "allowed", requesterKind: "member", requesterId: actor.id,
+            subjectKind: "vault_approval", subjectId: approval.id,
+            metadata: {
+              status: transition.status, allowed: applied.filter((item) => item.outcome === "allowed").length,
+              denied: applied.filter((item) => item.outcome === "denied").length,
+              requester_member_id: approval.requester_member_id, digest,
+            },
+          },
+          outbox: [{
+            id: `vault_approval_decided.${approval.id}`,
+            kind: "vault_approval_decided",
+            dedupeKey: `vault_approval_decided:${approval.id}`,
+            payload: { approvalId: approval.id, status: transition.status, decidedByMemberId: actor.id },
+          }],
+        } satisfies MutationEffects,
+      };
+    });
+
+    for (const memberId of [...this.vaultApprovalApprovers(approval.id), approval.requester_member_id]) {
+      this.broadcastToMember(memberId, {
+        type: "vault", kind: "approval_decided", approvalId: approval.id,
+        payload: { status: outcome.result.status, decidedByMemberId: actor.id },
+      });
+    }
+    return { ...outcome.result, decidedByMemberId: actor.id };
+  }
+
+  /**
+   * Time out every card nobody answered.
+   *
+   * A timeout is a denial. It is written as one, announced as one, and reported
+   * to the agent as one, because an approval that simply goes quiet is how a
+   * person learns to ignore the next card.
+   */
+  async expireVaultApprovals(now: number): Promise<{ expired: number }> {
+    const due = this.ctx.storage.sql.exec<VaultApprovalRow>(
+      "SELECT * FROM vault_approvals WHERE status = 'pending' AND expires_at <= ? ORDER BY expires_at LIMIT 64", now,
+    ).toArray();
+    if (due.length === 0) {
+      await this.armVaultApprovalExpiry(now);
+      return { expired: 0 };
+    }
+
+    for (const approval of due) {
+      const names = this.readVaultApprovalItems(approval.id).map((item) => item.name);
+      await this.commitMutation({ scope: "vault.approval.expire", now }, () => {
+        this.ctx.storage.sql.exec(
+          "UPDATE vault_approvals SET status = 'expired', decided_at = ? WHERE id = ? AND status = 'pending'",
+          now, approval.id,
+        );
+        const claimed = this.ctx.storage.sql.exec<{ status: ApprovalStatus }>(
+          "SELECT status FROM vault_approvals WHERE id = ?", approval.id,
+        ).one();
+        if (claimed.status !== "expired") return { result: { expired: false } };
+        this.ctx.storage.sql.exec(
+          "UPDATE vault_approval_items SET outcome = 'denied' WHERE approval_id = ? AND outcome IS NULL",
+          approval.id,
+        );
+        this.postVaultApprovalAnswer(approval.id, approvalExpiredMarkdown(names), now);
+        return {
+          result: { expired: true },
+          effects: {
+            audit: {
+              eventType: "vault.approval_expired", outcome: "denied", requesterKind: "system",
+              subjectKind: "vault_approval", subjectId: approval.id,
+              metadata: { item_count: names.length, requester_member_id: approval.requester_member_id },
+            },
+            outbox: [{
+              id: `vault_approval_expired.${approval.id}`,
+              kind: "vault_approval_expired",
+              dedupeKey: `vault_approval_expired:${approval.id}`,
+              payload: { approvalId: approval.id, status: "expired", hint: approvalTimeoutHint(names) },
+            }],
+          } satisfies MutationEffects,
+        };
+      });
+      this.broadcastToMember(approval.requester_member_id, {
+        type: "vault", kind: "approval_expired", approvalId: approval.id,
+        payload: { hint: approvalTimeoutHint(names) },
+      });
+    }
+    await this.armVaultApprovalExpiry(now);
+    return { expired: due.length };
+  }
+
+  /* -- the three kill-switch scopes ------------------------------------- */
+
+  /**
+   * Switch one credential off for everybody.
+   *
+   * No step-up: a protective action has to be the easy one. It outranks every
+   * policy, revokes every live grant, and ends any card still waiting on it,
+   * because an approval answered after the switch was thrown would hand out
+   * exactly what the switch was thrown to stop.
+   */
+  async setVaultCredentialFreeze(input: {
+    actor: Actor;
+    credentialId: string;
+    frozen: boolean;
+    now: number;
+  }): Promise<{ frozen: boolean; revokedGrants: number; expiredApprovals: number }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const row = this.readVaultCredential(input.credentialId);
+    if (row === null || !this.vaultCanDiscover(row.id, actor.id)) throw new Error("vault credential not found");
+    if ((row.frozen_at !== null) === input.frozen) {
+      return { frozen: input.frozen, revokedGrants: 0, expiredApprovals: 0 };
+    }
+
+    const outcome = await this.commitMutation({ scope: "vault.credential.freeze", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_credentials SET frozen_at = ?, frozen_by_member_id = ?, updated_at = ? WHERE id = ?",
+        input.frozen ? input.now : null, input.frozen ? actor.id : null, input.now, row.id,
+      );
+      let revokedGrants = 0;
+      let expiredApprovals = 0;
+      if (input.frozen) {
+        revokedGrants = this.countLiveVaultGrants("credential_id = ?", row.id);
+        this.revokeVaultGrants("credential_switched_off", input.now, "credential_id = ?", row.id);
+        expiredApprovals = this.cancelPendingApprovals(
+          input.now,
+          "id IN (SELECT approval_id FROM vault_approval_items WHERE credential_id = ?)",
+          row.id,
+        );
+      }
+      this.announceVaultKillSwitch(
+        { kind: "credential", name: row.name }, input.frozen, actor, revokedGrants, input.now,
+      );
+      return {
+        result: { frozen: input.frozen, revokedGrants, expiredApprovals },
+        effects: this.vaultEffects("vault.credential_switch", row.id, actor, {
+          off: input.frozen, revoked_grants: revokedGrants, expired_approvals: expiredApprovals,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /**
+   * Cut one agent off from the vault without silencing it.
+   *
+   * Pausing an agent stops it doing anything at all, which is a bigger hammer
+   * than "stop this one using credentials" and is often not what the person
+   * reaching for the switch means. Keeping the two separate means neither has
+   * to be abused to get the other.
+   */
+  async setAgentVaultAccess(input: {
+    actor: Actor;
+    agentId: string;
+    enabled: boolean;
+    now: number;
+  }): Promise<{ enabled: boolean; revokedGrants: number; expiredApprovals: number }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const agent = readAgent(this.ctx.storage, input.agentId);
+    if (agent === null) throw new Error("agent not found");
+    // Turning access back on is the only direction that needs authority, and it
+    // is the owner's or an admin's. Anyone in the workspace may switch an agent
+    // off: that is the point of a kill switch.
+    if (input.enabled && actor.role !== "owner" && actor.role !== "admin") {
+      this.requireOwnedAgent(agent.id, actor.id);
+    }
+    if ((agent.vaultAccessOffAt === null) === input.enabled) {
+      return { enabled: input.enabled, revokedGrants: 0, expiredApprovals: 0 };
+    }
+
+    const outcome = await this.commitMutation({ scope: "vault.agent.switch", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE agents SET vault_access_off_at = ?, vault_access_off_by_member_id = ?, updated_at = ? WHERE id = ?",
+        input.enabled ? null : input.now, input.enabled ? null : actor.id, input.now, agent.id,
+      );
+      let revokedGrants = 0;
+      let expiredApprovals = 0;
+      if (!input.enabled) {
+        revokedGrants = this.countLiveVaultGrants("agent_id = ?", agent.id);
+        this.revokeVaultGrants("agent_vault_access_off", input.now, "agent_id = ?", agent.id);
+        expiredApprovals = this.cancelPendingApprovals(input.now, "agent_id = ?", agent.id);
+      }
+      this.announceVaultKillSwitch(
+        { kind: "agent", handle: agent.handle }, !input.enabled, actor, revokedGrants, input.now,
+      );
+      return {
+        result: { enabled: input.enabled, revokedGrants, expiredApprovals },
+        effects: this.vaultEffects("vault.agent_switch", agent.id, actor, {
+          off: !input.enabled, revoked_grants: revokedGrants, expired_approvals: expiredApprovals,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /* -- approval helpers -------------------------------------------------- */
+
+  private vaultApproverMemberIds(credentialId: string): readonly string[] {
+    const managers = this.ctx.storage.sql.exec<{ subject_id: string }>(
+      "SELECT subject_id FROM vault_credential_acl WHERE credential_id = ? AND verb = 'manage' AND subject_type = 'member'",
+      credentialId,
+    ).toArray().map((row) => row.subject_id);
+    return this.resolveActiveMemberIds(managers);
+  }
+
+  private vaultRecentUsage(credentialId: string, now: number): { count: number; lastUsedAt: number | null } {
+    const row = this.ctx.storage.sql.exec<{ count: number; last_used_at: number | null }>(
+      "SELECT COUNT(*) AS count, MAX(used_at) AS last_used_at FROM vault_usage_events WHERE credential_id = ? AND used_at > ?",
+      credentialId, now - DAY_MS,
+    ).one();
+    return { count: row.count, lastUsedAt: row.last_used_at };
+  }
+
+  private readVaultApproval(approvalId: string): VaultApprovalRow | null {
+    return this.ctx.storage.sql.exec<VaultApprovalRow>("SELECT * FROM vault_approvals WHERE id = ?", approvalId).toArray()[0] ?? null;
+  }
+
+  private readVaultApprovalItems(approvalId: string): readonly VaultApprovalItemRow[] {
+    return this.ctx.storage.sql.exec<VaultApprovalItemRow>(
+      `SELECT i.approval_id, i.credential_id, i.credential_version, i.policy_epoch, i.outcome, i.grant_window, i.grant_id,
+              COALESCE(c.name, i.credential_id) AS name, COALESCE(c.description, '') AS description,
+              COALESCE(c.high_risk, 0) AS high_risk, c.grant_ttl_ms AS grant_ttl_ms
+       FROM vault_approval_items i LEFT JOIN vault_credentials c ON c.id = i.credential_id
+       WHERE i.approval_id = ? ORDER BY i.credential_id`,
+      approvalId,
+    ).toArray();
+  }
+
+  private vaultApprovalApprovers(approvalId: string): readonly string[] {
+    return this.ctx.storage.sql.exec<{ member_id: string }>(
+      "SELECT member_id FROM vault_approval_approvers WHERE approval_id = ? ORDER BY member_id", approvalId,
+    ).toArray().map((row) => row.member_id);
+  }
+
+  private vaultApprovalCard(row: VaultApprovalRow, viewerId: string): VaultApprovalCard {
+    const items = this.readVaultApprovalItems(row.id);
+    const requester = this.ctx.storage.sql.exec<{ handle: string }>("SELECT handle FROM members WHERE id = ?", row.requester_member_id).toArray()[0];
+    const agent = row.agent_id === null ? null : readAgent(this.ctx.storage, row.agent_id);
+    return {
+      approvalId: row.id,
+      status: row.status,
+      requesterMemberId: row.requester_member_id,
+      requesterHandle: requester?.handle ?? row.requester_member_id,
+      agentHandle: agent?.handle ?? null,
+      deviceId: row.device_id,
+      projectId: row.project_id,
+      delivery: row.delivery,
+      reason: row.reason,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      viewerMayDecide: this.vaultApprovalApprovers(row.id).includes(viewerId),
+      items: items.map((item) => ({
+        credentialId: item.credential_id,
+        name: item.name,
+        description: item.description,
+        highRisk: item.high_risk === 1,
+        version: item.credential_version,
+        policyEpoch: item.policy_epoch,
+        windows: availableApprovalWindows(item.grant_ttl_ms === null ? {} : { grantTtlMs: item.grant_ttl_ms }),
+      })),
+    };
+  }
+
+  /** Cancel every pending card matching a predicate, as part of the caller's transaction. */
+  private cancelPendingApprovals(now: number, predicate: string, ...values: (string | number)[]): number {
+    const affected = this.ctx.storage.sql.exec<{ id: string }>(
+      `SELECT id FROM vault_approvals WHERE status = 'pending' AND ${predicate}`, ...values,
+    ).toArray();
+    for (const approval of affected) {
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_approvals SET status = 'expired', decided_at = ? WHERE id = ? AND status = 'pending'", now, approval.id,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_approval_items SET outcome = 'denied' WHERE approval_id = ? AND outcome IS NULL", approval.id,
+      );
+      const names = this.readVaultApprovalItems(approval.id).map((item) => item.name);
+      this.postVaultApprovalAnswer(approval.id, approvalExpiredMarkdown(names), now);
+    }
+    return affected.length;
+  }
+
+  private countLiveVaultGrants(predicate: string, ...values: (string | number)[]): number {
+    return this.ctx.storage.sql.exec<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM vault_grants WHERE revoked_at IS NULL AND ${predicate}`, ...values,
+    ).one().count;
+  }
+
+  private async armVaultApprovalExpiry(now: number): Promise<void> {
+    const next = this.ctx.storage.sql.exec<{ due: number | null }>(
+      "SELECT MIN(expires_at) AS due FROM vault_approvals WHERE status = 'pending'",
+    ).one().due;
+    if (next === null) return;
+    this.ctx.storage.transactionSync(() =>
+      scheduleDueWork(this.ctx.storage, [{ id: VAULT_APPROVAL_EXPIRY_WORK_ID, kind: "vault_approval_expiry", dueAt: next }], now),
+    );
+    await this.armAlarm();
+  }
+
+  /* -- the vault's own voice --------------------------------------------- */
+
+  /**
+   * The reserved `a.vault` identity, created on first use.
+   *
+   * It has no owners on purpose: nobody administers it, nobody can rename it
+   * into something that impersonates a person, and the last-owner guard has
+   * nothing to protect. It exists so an approval can arrive as a message from
+   * somebody rather than as a system notice from nowhere.
+   */
+  private vaultAgent(now: number): AgentRow {
+    const existing = readAgentByHandle(this.ctx.storage, VAULT_AGENT_HANDLE);
+    if (existing !== null) return existing;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO agents(id, handle, display_name, description, status, created_by_member_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'active', NULL, ?, ?)`,
+      crypto.randomUUID(), VAULT_AGENT_HANDLE, VAULT_AGENT_HANDLE,
+      "Delivers credential approvals and announces the kill switch.", now, now,
+    );
+    return readAgentByHandle(this.ctx.storage, VAULT_AGENT_HANDLE)!;
+  }
+
+  /**
+   * The conversation between one member and the vault, created on first use.
+   *
+   * It is an ordinary direct message with one human in it, so every rule that
+   * already governs a DM — visibility, unread, read state, live delivery,
+   * history — governs this too. Its key lives in a namespace of its own, so it
+   * can never collide with a conversation between people.
+   */
+  private vaultDirectMessage(memberId: string, agent: AgentRow, now: number): ChannelRow {
+    const key = vaultDirectMessageKey(memberId);
+    const existing = readChannelByDirectMessageKey(this.ctx.storage, key);
+    if (existing !== null) return existing;
+    const channelId = crypto.randomUUID();
+    insertChannel(this.ctx.storage, {
+      id: channelId, kind: "dm", slug: null, name: agent.handle, topic: null,
+      dmKey: key, createdByMemberId: memberId, now,
+    });
+    addChannelMembers(this.ctx.storage, channelId, [memberId], now);
+    return readChannel(this.ctx.storage, channelId)!;
+  }
+
+  private postVaultMessage(
+    memberId: string,
+    body: string,
+    threadRootId: string | null,
+    now: number,
+  ): { channelId: string; messageId: string } {
+    const agent = this.vaultAgent(now);
+    const channel = this.vaultDirectMessage(memberId, agent, now);
+    const messageId = crypto.randomUUID();
+    const channelSequence = nextChannelSequence(this.ctx.storage, channel.id);
+    insertMessage(this.ctx.storage, {
+      id: messageId, channelId: channel.id, threadRootId,
+      authorKind: "agent", authorId: agent.id, authorDisplaySnapshot: agent.handle,
+      bodyMarkdown: body, channelSequence, now,
+    });
+    this.broadcastChannelEvent(channel, channelSequence, "message.created", {
+      messageId, channelId: channel.id, threadRootId, authorKind: "agent", authorId: agent.id,
+      authorDisplaySnapshot: agent.handle, bodyMarkdown: body, createdAt: now,
+    });
+    return { channelId: channel.id, messageId };
+  }
+
+  /** Write the answer into every copy of the card, as a reply to that copy. */
+  private postVaultApprovalAnswer(approvalId: string, body: string, now: number): void {
+    const copies = this.ctx.storage.sql.exec<{ member_id: string; card_message_id: string | null }>(
+      "SELECT member_id, card_message_id FROM vault_approval_approvers WHERE approval_id = ?", approvalId,
+    ).toArray();
+    for (const copy of copies) this.postVaultMessage(copy.member_id, body, copy.card_message_id, now);
+  }
+
+  private announceVaultKillSwitch(
+    scope: KillSwitchScope,
+    off: boolean,
+    actor: ActiveMember,
+    revokedGrants: number,
+    now: number,
+  ): void {
+    const body = killSwitchAnnouncement({ scope, off, actorHandle: actor.handle, revokedGrants });
+    // Everyone who could be surprised by the change hears about it: a switch
+    // that flips silently produces an hour of mysterious agent failures.
+    for (const member of this.ctx.storage.sql.exec<{ id: string }>(
+      "SELECT id FROM members WHERE status = 'active'",
+    ).toArray()) {
+      this.postVaultMessage(member.id, body, null, now);
+    }
+  }
+
   /* -- agent helpers ---------------------------------------------------- */
 
   private readVaultCredential(id: string): VaultCredentialRow | null {
@@ -4471,6 +5312,39 @@ export class Workspace extends DurableObject<CloudflareEnv> {
 
   private vaultEnvelope(row: VaultCredentialRow): VaultCiphertextEnvelope {
     return { cipherSuite: row.cipher_suite, aadVersion: row.aad_version, version: row.version, keyEpoch: row.key_epoch, iv: row.iv, ciphertext: row.ciphertext };
+  }
+
+  /**
+   * Write one grant row. Shared by the direct issue path and by an approval
+   * being answered, so a grant means the same thing however it came to exist —
+   * including that a grant with no expiry is spent by a single use.
+   */
+  private insertVaultGrant(input: {
+    row: VaultCredentialRow;
+    memberId: string;
+    deviceId: string;
+    projectId: string;
+    delivery: VaultDelivery;
+    agentId?: string;
+    delegationId?: string;
+    originChannelId: string;
+    originMessageId: string;
+    expiresAt?: number;
+    approverMemberId: string;
+    now: number;
+  }): string {
+    const grantId = crypto.randomUUID();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO vault_grants(id, credential_id, credential_version, policy_epoch, access_epoch, member_id, device_id,
+        project_id, agent_id, delegation_id, delivery, origin_channel_id, expires_at, remaining_uses,
+        origin_message_id, approved_by_member_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      grantId, input.row.id, input.row.version, input.row.policy_epoch, this.vaultSettings().access_epoch,
+      input.memberId, input.deviceId, input.projectId, input.agentId ?? null, input.delegationId ?? null,
+      input.delivery, input.originChannelId, input.expiresAt ?? null, input.expiresAt === undefined ? 1 : null,
+      input.originMessageId, input.approverMemberId, input.now,
+    );
+    return grantId;
   }
 
   private readVaultMemberKey(memberId: string): VaultMemberKey | null {
@@ -4568,9 +5442,15 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       "SELECT COUNT(*) AS count, MIN(used_at) AS first_used_at FROM vault_usage_events WHERE credential_id = ? AND used_at > ?", row.id, windowStart,
     ).one();
     let delegationInput: Parameters<typeof decideVaultAuthorization>[0]["delegation"];
+    // The switch answers only for an agent that exists. An agent that does not
+    // is still refused, one step later and for the accurate reason: it has no
+    // live delegation. Reporting it as "switched off" would send whoever is
+    // debugging to a control nobody touched.
+    let agentVaultAccessOff = false;
     if (input.agentId !== undefined) {
       const delegation = input.delegationId === undefined ? null : this.readAgentDelegation(input.delegationId);
       const agent = readAgent(this.ctx.storage, input.agentId);
+      agentVaultAccessOff = agent !== null && agent.vaultAccessOffAt !== null;
       delegationInput = {
         active: delegation !== null && delegation.revokedAt === null && input.now < delegation.expiresAt && agent?.status === "active",
         ownerIsMember: delegation?.ownerMemberId === actor.id && delegation.ownerAuthorizationEpoch === input.actor.authorizationEpoch,
@@ -4594,11 +5474,14 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       member: { id: actor.id, active: true, authorizationEpochCurrent: true, groupIds },
       device: input.device,
       origin: { verified: originVerified, channelId: input.origin.channelId, memberCanAccess },
-      credential: { active: true, mode: policy.mode, use: this.vaultScope(row.id, "use"), reveal: this.vaultScope(row.id, "reveal"),
+      credential: { active: true, frozen: row.frozen_at !== null, mode: policy.mode, use: this.vaultScope(row.id, "use"), reveal: this.vaultScope(row.id, "reveal"),
         allowedDeliveries: policy.allowedDeliveries, projectAllowed: policy.projectIds.length === 0 || policy.projectIds.includes(input.projectId),
         ...(policy.availableUntil === undefined ? {} : { availableUntil: policy.availableUntil }),
         rateAvailable: policy.maxUsesPerHour === undefined || usage.count < policy.maxUsesPerHour },
-      request: { delivery: input.delivery, ...(input.agentId === undefined ? {} : { agentId: input.agentId }) },
+      request: {
+        delivery: input.delivery,
+        ...(input.agentId === undefined ? {} : { agentId: input.agentId, agentVaultAccessOff }),
+      },
       ...(delegationInput === undefined ? {} : { delegation: delegationInput }), grantMatchesExactly: grant !== null,
     });
     return { decision, row, grantId: grant?.id ?? null, ...(usage.first_used_at === null ? {} : { retryAfter: usage.first_used_at + 60 * 60 * 1_000 }) };
@@ -6155,6 +7038,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     let retention: RetentionSweepReport | null = null;
     let anchor: AuditAnchor | null = null;
     let scheduledSends = { sent: 0, failed: 0 };
+    let approvals = { expired: 0 };
 
     for (const item of claimed) {
       try {
@@ -6190,6 +7074,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
               sent: scheduledSends.sent + report.sent,
               failed: scheduledSends.failed + report.failed,
             };
+            break;
+          }
+          case "vault_approval_expiry": {
+            const report = await this.expireVaultApprovals(now);
+            approvals = { expired: approvals.expired + report.expired };
             break;
           }
           case "audit_anchor":
@@ -6234,6 +7123,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       retention,
       anchor,
       scheduledSends,
+      approvals,
       alarmAt: await this.armAlarm(),
     };
   }
