@@ -11,6 +11,7 @@ import {
 } from "@/app/(app)/c/[channel]/draft-actions";
 import { sendSnippetAction } from "@/app/(app)/c/[channel]/snippet-actions";
 import { browserCsrfToken } from "@/src/shell/browser-csrf";
+import { useHydrated } from "./use-hydrated";
 
 /**
  * The composer, and the regressions it exists to keep fixed.
@@ -74,6 +75,7 @@ export function Composer({
   // successful save — which advances the revision — from triggering the next.
   const syncedBody = useRef(initialDraft?.bodyMarkdown ?? "");
   const router = useRouter();
+  const hydrated = useHydrated();
 
   // The server's draft is the one that followed this person here. A local draft
   // is only preferred when the server has none, which is the offline case.
@@ -255,6 +257,11 @@ export function Composer({
         ref={input}
         rows={snippetMode ? 8 : 2}
         value={body}
+        // Until React has hydrated, this input's value is not connected to
+        // anything: typing into it puts characters in the DOM that the first
+        // render then wipes, because a controlled input is reconciled against
+        // state that never saw them. Read-only says so instead of losing them.
+        readOnly={!hydrated}
         placeholder={snippetMode ? "Paste the snippet here" : `Message #${channelLabel}`}
         onChange={(event) => update(event.target.value)}
         onKeyDown={(event) => {

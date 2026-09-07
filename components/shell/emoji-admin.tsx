@@ -50,11 +50,21 @@ export function EmojiAdmin({
         >
           <label>
             <span>Name</span>
-            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="shipit" />
+            <input
+              value={name}
+              readOnly={!hydrated}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="shipit"
+            />
           </label>
           <label>
             <span>Stands for</span>
-            <input value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="🚀" />
+            <input
+              value={alias}
+              readOnly={!hydrated}
+              onChange={(event) => setAlias(event.target.value)}
+              placeholder="🚀"
+            />
           </label>
           <button type="submit" className="primary" disabled={pending || !hydrated}>
             Name it

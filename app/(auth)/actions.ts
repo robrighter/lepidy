@@ -22,6 +22,22 @@ function formText(form: FormData, field: string, max: number): string {
 }
 
 /**
+ * Where to land after signing in.
+ *
+ * Only a path on this site is honoured, and only one that cannot be read as an
+ * address somewhere else: a protocol-relative `//host` or a backslash form
+ * would send somebody off the site with our sign-in page as the referrer. A
+ * value that does not qualify is ignored rather than reported, because it is
+ * either a mistake or an attempt.
+ */
+function safeNextPath(form: FormData): string {
+  const value = form.get("next");
+  if (typeof value !== "string" || value.length === 0 || value.length > 1024) return "/";
+  if (!value.startsWith("/") || value.startsWith("//") || value.startsWith("/\\")) return "/";
+  return value;
+}
+
+/**
  * Sign in with a password.
  *
  * The failure message never distinguishes an unknown address from a wrong
@@ -55,7 +71,7 @@ export async function signInWithPassword(
     platform: "web",
   });
   await setSessionCookies(session);
-  redirect("/");
+  redirect(safeNextPath(form));
 }
 
 /**

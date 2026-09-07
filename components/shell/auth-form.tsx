@@ -23,6 +23,7 @@ export function AuthForm({
   footer,
   footerHref,
   footerLabel,
+  next,
 }: {
   action: (previous: AuthResult | null, form: FormData) => Promise<AuthResult>;
   title: string;
@@ -32,6 +33,8 @@ export function AuthForm({
   footer: string;
   footerHref: string;
   footerLabel: string;
+  /** Where to land afterwards. The action decides whether it is safe to use. */
+  next?: string;
 }) {
   const [state, formAction, pending] = useActionState(action, null);
 
@@ -40,6 +43,7 @@ export function AuthForm({
       <h1>{title}</h1>
       <p className="auth-intro">{intro}</p>
       <form action={formAction} className="auth-form">
+        {next ? <input type="hidden" name="next" value={next} /> : null}
         {fields.map((field) => (
           <label key={field.name}>
             <span>{field.label}</span>

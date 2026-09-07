@@ -534,6 +534,58 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
        BEGIN SELECT RAISE(ABORT, 'an agent must keep at least one owner'); END`,
     ],
   },
+  {
+    version: 15,
+    name: "MCP OAuth codes and connections",
+    statements: [
+      // The object learns its own slug so it can refuse an audience that names
+      // somebody else. Without it the tenant would be trusting the caller's
+      // word about which workspace a token is for, which is exactly the
+      // property the audience check exists to establish.
+      `ALTER TABLE workspace_config ADD COLUMN workspace_slug TEXT`,
+      // Authorization codes live in the tenant, not the control plane, because
+      // a code names a member of this workspace and nothing outside it needs to
+      // read one. They are kept after they are spent so a replay is answered
+      // from a row that says "already used" rather than from silence.
+      `CREATE TABLE oauth_codes (
+        code_hash TEXT PRIMARY KEY CHECK (length(code_hash) = 64),
+        client_id TEXT NOT NULL,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        redirect_uri TEXT NOT NULL,
+        code_challenge TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        consumed_at INTEGER,
+        CHECK (expires_at > created_at)
+      ) STRICT`,
+      `CREATE INDEX oauth_codes_expiry_idx ON oauth_codes(expires_at)`,
+      // One row per connection, not per token: the token pair is the
+      // connection's current state, so rotating it is an update and there is no
+      // history of live credentials to leak. The previous refresh hash is kept
+      // for exactly one generation, which is what makes a replay detectable.
+      `CREATE TABLE oauth_connections (
+        id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        client_name TEXT,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        resource TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        access_token_hash TEXT NOT NULL UNIQUE CHECK (length(access_token_hash) = 64),
+        refresh_token_hash TEXT NOT NULL UNIQUE CHECK (length(refresh_token_hash) = 64),
+        previous_refresh_token_hash TEXT,
+        access_expires_at INTEGER NOT NULL,
+        rotation_count INTEGER NOT NULL DEFAULT 0 CHECK (rotation_count >= 0),
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER,
+        revoked_at INTEGER,
+        revoked_reason TEXT
+      ) STRICT`,
+      `CREATE INDEX oauth_connections_member_idx ON oauth_connections(member_id, revoked_at, created_at)`,
+      `CREATE INDEX oauth_connections_refresh_idx ON oauth_connections(previous_refresh_token_hash)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

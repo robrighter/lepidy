@@ -319,7 +319,13 @@ export class OnboardingService {
     ]);
 
     const workspace = this.workspaces.get(doId);
-    await workspace.initializeWorkspace({ storageMode, hostEpoch: 0, routingEpoch: 1, now });
+    await workspace.initializeWorkspace({
+      storageMode,
+      hostEpoch: 0,
+      routingEpoch: 1,
+      workspaceSlug: slug,
+      now,
+    });
     await workspace.applyMembership(member);
     await this.db.batch([
       this.db.prepare("UPDATE memberships SET status = 'active', updated_at = ? WHERE member_id = ?").bind(now, memberId),

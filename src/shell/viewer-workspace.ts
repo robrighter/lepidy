@@ -10,6 +10,8 @@ export type ViewerWorkspace = {
   stub: DurableObjectStub<Workspace>;
   actor: Actor;
   workspaceId: string;
+  /** What routes an MCP token to this tenant, so a page can show its address. */
+  workspaceSlug: string;
 };
 
 export type ActionFailure = { ok: false; reason: string };
@@ -58,6 +60,7 @@ export async function viewerWorkspace(
       authorizationEpoch: resolved.row.authorization_epoch,
     },
     workspaceId: resolved.row.id,
+    workspaceSlug: resolved.row.slug,
   };
 }
 

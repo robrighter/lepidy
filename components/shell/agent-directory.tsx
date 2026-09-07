@@ -44,13 +44,19 @@ export function AgentDirectory({ agents }: { agents: readonly AgentSummary[] }) 
       >
         <label>
           <span>Handle</span>
-          <input value={handle} onChange={(event) => setHandle(event.target.value)} placeholder="releasebot" />
+          <input
+            value={handle}
+            readOnly={!hydrated}
+            onChange={(event) => setHandle(event.target.value)}
+            placeholder="releasebot"
+          />
           <em>Agents always live in the a. namespace.</em>
         </label>
         <label>
           <span>What it does</span>
           <input
             value={description}
+            readOnly={!hydrated}
             onChange={(event) => setDescription(event.target.value)}
             placeholder="Watches deploys."
           />

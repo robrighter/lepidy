@@ -25,6 +25,9 @@ export default async function ProfilePage() {
           <li>
             <a href="/emoji">Custom emoji<span className="tag">admin</span></a>
           </li>
+          <li>
+            <a href="/connections">MCP connections<span className="tag">yours</span></a>
+          </li>
         </ul>
       </section>
 

@@ -1531,3 +1531,318 @@ export function listAgentQueue(
       authorDisplaySnapshot: row.author_display_snapshot,
     }));
 }
+
+/* -------------------------------------------------------------------------- */
+/* MCP OAuth codes and connections                                             */
+/* -------------------------------------------------------------------------- */
+
+export type OauthCodeRow = {
+  clientId: string;
+  memberId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  resource: string;
+  scope: string;
+  expiresAt: number;
+  consumedAt: number | null;
+};
+
+export function insertOauthCode(
+  storage: DurableObjectStorage,
+  input: {
+    codeHash: string;
+    clientId: string;
+    memberId: string;
+    redirectUri: string;
+    codeChallenge: string;
+    resource: string;
+    scope: string;
+    now: number;
+    expiresAt: number;
+  },
+): void {
+  storage.sql.exec(
+    `INSERT INTO oauth_codes(
+       code_hash, client_id, member_id, redirect_uri, code_challenge, resource, scope,
+       created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    input.codeHash,
+    input.clientId,
+    input.memberId,
+    input.redirectUri,
+    input.codeChallenge,
+    input.resource,
+    input.scope,
+    input.now,
+    input.expiresAt,
+  );
+}
+
+export function readOauthCode(storage: DurableObjectStorage, codeHash: string): OauthCodeRow | null {
+  const row = storage.sql
+    .exec<{
+      client_id: string;
+      member_id: string;
+      redirect_uri: string;
+      code_challenge: string;
+      resource: string;
+      scope: string;
+      expires_at: number;
+      consumed_at: number | null;
+    }>(
+      `SELECT client_id, member_id, redirect_uri, code_challenge, resource, scope,
+              expires_at, consumed_at
+       FROM oauth_codes WHERE code_hash = ?`,
+      codeHash,
+    )
+    .toArray()[0];
+  if (row === undefined) return null;
+  return {
+    clientId: row.client_id,
+    memberId: row.member_id,
+    redirectUri: row.redirect_uri,
+    codeChallenge: row.code_challenge,
+    resource: row.resource,
+    scope: row.scope,
+    expiresAt: row.expires_at,
+    consumedAt: row.consumed_at,
+  };
+}
+
+/**
+ * Spend a code with one conditional UPDATE.
+ *
+ * Two clients redeeming the same code race here rather than in the caller, and
+ * exactly one of them writes a row. Checking first and updating afterwards
+ * would leave the window that makes double-spend possible.
+ */
+export function consumeOauthCode(
+  storage: DurableObjectStorage,
+  codeHash: string,
+  now: number,
+): boolean {
+  return (
+    storage.sql.exec(
+      `UPDATE oauth_codes SET consumed_at = ?
+       WHERE code_hash = ? AND consumed_at IS NULL AND expires_at > ?`,
+      now,
+      codeHash,
+      now,
+    ).rowsWritten > 0
+  );
+}
+
+/** Expired codes are swept rather than kept; a spent one is kept until it expires. */
+export function deleteExpiredOauthCodes(storage: DurableObjectStorage, now: number): number {
+  return storage.sql.exec("DELETE FROM oauth_codes WHERE expires_at <= ?", now).rowsWritten;
+}
+
+export type OauthConnectionRow = {
+  id: string;
+  clientId: string;
+  clientName: string | null;
+  memberId: string;
+  resource: string;
+  scope: string;
+  refreshTokenHash: string;
+  previousRefreshTokenHash: string | null;
+  accessExpiresAt: number;
+  rotationCount: number;
+  createdAt: number;
+  lastUsedAt: number | null;
+  revokedAt: number | null;
+  revokedReason: string | null;
+};
+
+const CONNECTION_COLUMNS = `id, client_id, client_name, member_id, resource, scope,
+  refresh_token_hash, previous_refresh_token_hash, access_expires_at, rotation_count,
+  created_at, last_used_at, revoked_at, revoked_reason`;
+
+type ConnectionSqlRow = {
+  id: string;
+  client_id: string;
+  client_name: string | null;
+  member_id: string;
+  resource: string;
+  scope: string;
+  refresh_token_hash: string;
+  previous_refresh_token_hash: string | null;
+  access_expires_at: number;
+  rotation_count: number;
+  created_at: number;
+  last_used_at: number | null;
+  revoked_at: number | null;
+  revoked_reason: string | null;
+};
+
+function toConnection(row: ConnectionSqlRow): OauthConnectionRow {
+  return {
+    id: row.id,
+    clientId: row.client_id,
+    clientName: row.client_name,
+    memberId: row.member_id,
+    resource: row.resource,
+    scope: row.scope,
+    refreshTokenHash: row.refresh_token_hash,
+    previousRefreshTokenHash: row.previous_refresh_token_hash,
+    accessExpiresAt: row.access_expires_at,
+    rotationCount: row.rotation_count,
+    createdAt: row.created_at,
+    lastUsedAt: row.last_used_at,
+    revokedAt: row.revoked_at,
+    revokedReason: row.revoked_reason,
+  };
+}
+
+export function insertOauthConnection(
+  storage: DurableObjectStorage,
+  input: {
+    id: string;
+    clientId: string;
+    clientName: string | null;
+    memberId: string;
+    resource: string;
+    scope: string;
+    accessTokenHash: string;
+    refreshTokenHash: string;
+    accessExpiresAt: number;
+    now: number;
+  },
+): void {
+  storage.sql.exec(
+    `INSERT INTO oauth_connections(
+       id, client_id, client_name, member_id, resource, scope,
+       access_token_hash, refresh_token_hash, access_expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    input.id,
+    input.clientId,
+    input.clientName,
+    input.memberId,
+    input.resource,
+    input.scope,
+    input.accessTokenHash,
+    input.refreshTokenHash,
+    input.accessExpiresAt,
+    input.now,
+  );
+}
+
+/**
+ * Find the connection a refresh token belongs to, whether it is the current one
+ * or the generation before it. Looking up both is what makes a replay
+ * detectable at all: a rotated token that matched nothing would be
+ * indistinguishable from a token that never existed.
+ */
+export function readConnectionByRefreshHash(
+  storage: DurableObjectStorage,
+  refreshTokenHash: string,
+): OauthConnectionRow | null {
+  const row = storage.sql
+    .exec<ConnectionSqlRow>(
+      `SELECT ${CONNECTION_COLUMNS} FROM oauth_connections
+       WHERE refresh_token_hash = ? OR previous_refresh_token_hash = ?`,
+      refreshTokenHash,
+      refreshTokenHash,
+    )
+    .toArray()[0];
+  return row === undefined ? null : toConnection(row);
+}
+
+export function readConnectionByAccessHash(
+  storage: DurableObjectStorage,
+  accessTokenHash: string,
+): OauthConnectionRow | null {
+  const row = storage.sql
+    .exec<ConnectionSqlRow>(
+      `SELECT ${CONNECTION_COLUMNS} FROM oauth_connections WHERE access_token_hash = ?`,
+      accessTokenHash,
+    )
+    .toArray()[0];
+  return row === undefined ? null : toConnection(row);
+}
+
+export function readOauthConnection(
+  storage: DurableObjectStorage,
+  connectionId: string,
+): OauthConnectionRow | null {
+  const row = storage.sql
+    .exec<ConnectionSqlRow>(
+      `SELECT ${CONNECTION_COLUMNS} FROM oauth_connections WHERE id = ?`,
+      connectionId,
+    )
+    .toArray()[0];
+  return row === undefined ? null : toConnection(row);
+}
+
+/**
+ * Rotate a live connection's pair in place.
+ *
+ * The presented refresh token is invalidated by the same statement that issues
+ * its replacement, and the generation it replaces is remembered for exactly one
+ * step so a replay of it can be recognised.
+ */
+export function rotateOauthConnection(
+  storage: DurableObjectStorage,
+  input: {
+    connectionId: string;
+    accessTokenHash: string;
+    refreshTokenHash: string;
+    previousRefreshTokenHash: string;
+    accessExpiresAt: number;
+    now: number;
+  },
+): boolean {
+  return (
+    storage.sql.exec(
+      `UPDATE oauth_connections
+       SET access_token_hash = ?, refresh_token_hash = ?, previous_refresh_token_hash = ?,
+           access_expires_at = ?, rotation_count = rotation_count + 1, last_used_at = ?
+       WHERE id = ? AND revoked_at IS NULL`,
+      input.accessTokenHash,
+      input.refreshTokenHash,
+      input.previousRefreshTokenHash,
+      input.accessExpiresAt,
+      input.now,
+      input.connectionId,
+    ).rowsWritten > 0
+  );
+}
+
+export function revokeOauthConnectionRow(
+  storage: DurableObjectStorage,
+  connectionId: string,
+  reason: string,
+  now: number,
+): boolean {
+  return (
+    storage.sql.exec(
+      `UPDATE oauth_connections SET revoked_at = ?, revoked_reason = ?
+       WHERE id = ? AND revoked_at IS NULL`,
+      now,
+      reason,
+      connectionId,
+    ).rowsWritten > 0
+  );
+}
+
+export function touchOauthConnection(
+  storage: DurableObjectStorage,
+  connectionId: string,
+  now: number,
+): void {
+  storage.sql.exec("UPDATE oauth_connections SET last_used_at = ? WHERE id = ?", now, connectionId);
+}
+
+export function listOauthConnectionsForMember(
+  storage: DurableObjectStorage,
+  memberId: string,
+): OauthConnectionRow[] {
+  return storage.sql
+    .exec<ConnectionSqlRow>(
+      `SELECT ${CONNECTION_COLUMNS} FROM oauth_connections
+       WHERE member_id = ? AND revoked_at IS NULL ORDER BY created_at DESC`,
+      memberId,
+    )
+    .toArray()
+    .map(toConnection);
+}

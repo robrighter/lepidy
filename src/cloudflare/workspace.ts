@@ -43,6 +43,21 @@ import {
 } from "../domain/due-work";
 import { parseIdempotencyKey } from "../domain/idempotency-key";
 import {
+  ACCESS_TOKEN_TTL_MS,
+  AUTHORIZATION_CODE_TTL_MS,
+  checkCodeExchange,
+  checkPresentedToken,
+  decideRefresh,
+  formatToken,
+  hashSecret,
+  parseToken,
+  parseTokenOfKind,
+  randomSecret,
+  verifyCodeVerifier,
+  workspaceSlugFromResource,
+  type SupportedScope,
+} from "../domain/mcp-oauth";
+import {
   directMessageIdentity,
   parseChannelName,
   parseChannelSlug,
@@ -132,6 +147,18 @@ import {
   settleScheduledMessage,
   updateScheduledMessage,
   writeDraft,
+  consumeOauthCode,
+  deleteExpiredOauthCodes,
+  insertOauthCode,
+  insertOauthConnection,
+  listOauthConnectionsForMember,
+  readConnectionByAccessHash,
+  readConnectionByRefreshHash,
+  readOauthCode,
+  readOauthConnection,
+  revokeOauthConnectionRow,
+  rotateOauthConnection,
+  touchOauthConnection,
   listVisibleChannels,
   nextChannelSequence,
   pinMessage,
@@ -316,6 +343,57 @@ export type DraftSaveResult =
   /** Another device moved the draft on; this is what is actually stored. */
   | { status: "conflict"; draft: DraftRow };
 
+/**
+ * OAuth protocol answers are values, not exceptions.
+ *
+ * An OAuth endpoint has to reply with a specific error code in a JSON body, so
+ * the object decides the code once and the route reports it. Turning an
+ * exception's message back into a code at the route would be a second place
+ * where the refusal is decided, and the two would eventually disagree.
+ */
+export type OauthCodeResult =
+  | { ok: true; code: string }
+  | { ok: false; error: string; description: string };
+
+export type OauthGrant = {
+  connectionId: string;
+  accessToken: string;
+  refreshToken: string;
+  expiresInSeconds: number;
+  scope: string;
+};
+
+export type OauthGrantResult =
+  | { ok: true; grant: OauthGrant }
+  | { ok: false; error: string; description: string };
+
+/** Who a verified access token acts as. Derived from the token and nowhere else. */
+export type OauthPrincipal = {
+  connectionId: string;
+  memberId: string;
+  handle: string;
+  displayName: string;
+  role: MemberProjection["role"];
+  authorizationEpoch: number;
+  scope: string;
+  clientId: string;
+  clientName: string | null;
+};
+
+export type OauthPrincipalResult =
+  | { ok: true; principal: OauthPrincipal }
+  | { ok: false; error: "invalid_token" | "insufficient_scope"; description: string };
+
+export type OauthConnectionSummary = {
+  id: string;
+  clientId: string;
+  clientName: string | null;
+  scope: string;
+  createdAt: number;
+  lastUsedAt: number | null;
+  rotationCount: number;
+};
+
 /** One multiplexed deadline covers every pending scheduled send. */
 export const SCHEDULED_SEND_WORK_ID = "system:scheduled_send";
 const SCHEDULED_SEND_BATCH = 25;
@@ -403,6 +481,13 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     storageMode: WorkspaceStorageMode;
     hostEpoch: number;
     routingEpoch: number;
+    /**
+     * The workspace's own slug, so the object can later refuse an OAuth
+     * audience naming somebody else. It is written once and never changed:
+     * the slug is what routes, and a workspace that could rename itself could
+     * take over another workspace's tokens.
+     */
+    workspaceSlug?: string;
     now: number;
   }): void {
     const schema = readWorkspaceSchema(this.ctx.storage);
@@ -417,15 +502,18 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         throw new Error("workspace storage mode requires a routed migration");
       }
       this.ctx.storage.sql.exec(
-        `INSERT INTO workspace_config(singleton, storage_mode, host_epoch, routing_epoch, initialized_at, updated_at)
-         VALUES (1, ?, ?, ?, ?, ?)
+        `INSERT INTO workspace_config(
+           singleton, storage_mode, host_epoch, routing_epoch, workspace_slug, initialized_at, updated_at)
+         VALUES (1, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(singleton) DO UPDATE SET
            host_epoch = excluded.host_epoch,
            routing_epoch = excluded.routing_epoch,
+           workspace_slug = COALESCE(workspace_config.workspace_slug, excluded.workspace_slug),
            updated_at = excluded.updated_at`,
         input.storageMode,
         input.hostEpoch,
         input.routingEpoch,
+        input.workspaceSlug ?? null,
         input.now,
         input.now,
       );
@@ -3195,6 +3283,479 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           : [],
     }));
     return { channels };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* MCP OAuth authorization and connections (A02)                       */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * The tenant is the authorization server's storage for everything that names
+   * one of its people: codes and connections. Only the client registry lives in
+   * the control plane, because a client registers before a workspace is known.
+   *
+   * Protocol failures are returned rather than thrown. An OAuth endpoint has to
+   * answer with a specific error code in a JSON body, and turning an exception
+   * message back into a code at the route would be a second place where the
+   * refusal is decided.
+   */
+  async beginOauthAuthorization(input: {
+    actor: Actor;
+    workspaceSlug: string;
+    clientId: string;
+    clientName: string | null;
+    redirectUri: string;
+    codeChallenge: string;
+    scope: string;
+    resource: string;
+    now: number;
+  }): Promise<OauthCodeResult> {
+    const actor = this.authorizeActor(input.actor);
+    const slug = this.requireWorkspaceSlug(input.workspaceSlug);
+    if (workspaceSlugFromResource(input.resource) !== slug) {
+      return {
+        ok: false,
+        error: "invalid_target",
+        description: "resource does not name this workspace",
+      };
+    }
+
+    const code = formatToken("code", slug, randomSecret());
+    const codeHash = await hashSecret(code);
+    const expiresAt = input.now + AUTHORIZATION_CODE_TTL_MS;
+
+    const outcome = await this.commitMutation(
+      { scope: "oauth.authorize", now: input.now },
+      () => {
+        // Codes are swept on the way past rather than by their own alarm: the
+        // only time an expired code matters is when a new one is written.
+        deleteExpiredOauthCodes(this.ctx.storage, input.now);
+        insertOauthCode(this.ctx.storage, {
+          codeHash,
+          clientId: input.clientId,
+          memberId: actor.id,
+          redirectUri: input.redirectUri,
+          codeChallenge: input.codeChallenge,
+          resource: input.resource,
+          scope: input.scope,
+          now: input.now,
+          expiresAt,
+        });
+        return {
+          result: { code },
+          effects: {
+            audit: {
+              eventType: "oauth.authorized",
+              outcome: "allowed" as const,
+              requesterKind: "member" as const,
+              requesterId: actor.id,
+              subjectKind: "oauth_client",
+              subjectId: input.clientId,
+              // The code never reaches the audit; what is worth keeping is who
+              // agreed to what, not the credential it produced.
+              metadata: { scope: input.scope, client_name: input.clientName ?? "" },
+            },
+          } satisfies MutationEffects,
+        };
+      },
+    );
+    return { ok: true, code: outcome.result.code };
+  }
+
+  async exchangeOauthCode(input: {
+    workspaceSlug: string;
+    code: string;
+    clientId: string;
+    clientName: string | null;
+    redirectUri: unknown;
+    codeVerifier: unknown;
+    resource?: unknown;
+    now: number;
+  }): Promise<OauthGrantResult> {
+    const slug = this.requireWorkspaceSlug(input.workspaceSlug);
+    const parsed = parseTokenOfKind(input.code, "code");
+    // A code that names another workspace is refused here rather than looked
+    // up, so one tenant never probes another's storage even by absence.
+    if (parsed === null || parsed.workspaceSlug !== slug) {
+      return { ok: false, error: "invalid_grant", description: "unknown or already used code" };
+    }
+
+    const codeHash = await hashSecret(input.code);
+    const stored = readOauthCode(this.ctx.storage, codeHash);
+    const check = checkCodeExchange({
+      stored:
+        stored === null
+          ? null
+          : {
+              clientId: stored.clientId,
+              redirectUri: stored.redirectUri,
+              codeChallenge: stored.codeChallenge,
+              resource: stored.resource,
+              expiresAt: stored.expiresAt,
+              consumedAt: stored.consumedAt,
+            },
+      clientId: input.clientId,
+      redirectUri: input.redirectUri,
+      resource: input.resource,
+      now: input.now,
+    });
+    if (!check.ok) return { ok: false, error: check.error, description: check.description };
+    if (stored === null) {
+      return { ok: false, error: "invalid_grant", description: "unknown or already used code" };
+    }
+    if (!(await verifyCodeVerifier(input.codeVerifier, stored.codeChallenge))) {
+      return { ok: false, error: "invalid_grant", description: "the PKCE verifier does not match" };
+    }
+
+    // Consent and redemption are separate moments. Somebody suspended in
+    // between does not get a connection out of a code they were still entitled
+    // to when they clicked.
+    if (!this.memberIsActive(stored.memberId)) {
+      return { ok: false, error: "invalid_grant", description: "this person is no longer a member" };
+    }
+
+    const accessToken = formatToken("at", slug, randomSecret());
+    const refreshToken = formatToken("rt", slug, randomSecret());
+    const accessTokenHash = await hashSecret(accessToken);
+    const refreshTokenHash = await hashSecret(refreshToken);
+    const connectionId = crypto.randomUUID();
+    const accessExpiresAt = input.now + ACCESS_TOKEN_TTL_MS;
+
+    const outcome = await this.commitMutation<{ spent: boolean }>({ scope: "oauth.exchange", now: input.now }, () => {
+      // One conditional UPDATE decides the race: two clients redeeming the same
+      // code cannot both win, because only one of them writes a row.
+      if (!consumeOauthCode(this.ctx.storage, codeHash, input.now)) {
+        return { result: { spent: false } };
+      }
+      insertOauthConnection(this.ctx.storage, {
+        id: connectionId,
+        clientId: stored.clientId,
+        clientName: input.clientName,
+        memberId: stored.memberId,
+        resource: stored.resource,
+        scope: stored.scope,
+        accessTokenHash,
+        refreshTokenHash,
+        accessExpiresAt,
+        now: input.now,
+      });
+      return {
+        result: { spent: true },
+        effects: {
+          audit: {
+            eventType: "oauth.connected",
+            outcome: "allowed" as const,
+            requesterKind: "member" as const,
+            requesterId: stored.memberId,
+            subjectKind: "oauth_connection",
+            subjectId: connectionId,
+            metadata: { client_id: stored.clientId, scope: stored.scope },
+          },
+        } satisfies MutationEffects,
+      };
+    });
+    if (!outcome.result.spent) {
+      return { ok: false, error: "invalid_grant", description: "unknown or already used code" };
+    }
+
+    return {
+      ok: true,
+      grant: {
+        connectionId,
+        accessToken,
+        refreshToken,
+        expiresInSeconds: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+        scope: stored.scope,
+      },
+    };
+  }
+
+  async refreshOauthTokens(input: {
+    workspaceSlug: string;
+    refreshToken: string;
+    clientId: string;
+    now: number;
+  }): Promise<OauthGrantResult> {
+    const slug = this.requireWorkspaceSlug(input.workspaceSlug);
+    const parsed = parseTokenOfKind(input.refreshToken, "rt");
+    if (parsed === null || parsed.workspaceSlug !== slug) {
+      return { ok: false, error: "invalid_grant", description: "unknown refresh token" };
+    }
+
+    const presentedHash = await hashSecret(input.refreshToken);
+    const connection = readConnectionByRefreshHash(this.ctx.storage, presentedHash);
+    const decision = decideRefresh({
+      connection:
+        connection === null
+          ? null
+          : {
+              refreshTokenHash: connection.refreshTokenHash,
+              previousRefreshTokenHash: connection.previousRefreshTokenHash,
+              clientId: connection.clientId,
+              revokedAt: connection.revokedAt,
+            },
+      presentedHash,
+      clientId: input.clientId,
+    });
+
+    if (decision.kind === "replay" && connection !== null) {
+      // The rotated token came back. A lost response and a stolen token look
+      // the same from here, so the connection dies and the person reconnects.
+      await this.commitMutation({ scope: "oauth.replay", now: input.now }, () => {
+        revokeOauthConnectionRow(this.ctx.storage, connection.id, "refresh_token_replayed", input.now);
+        return {
+          result: undefined,
+          effects: {
+            audit: {
+              eventType: "oauth.revoked",
+              outcome: "denied" as const,
+              requesterKind: "system" as const,
+              requesterId: null,
+              subjectKind: "oauth_connection",
+              subjectId: connection.id,
+              metadata: { reason: "refresh_token_replayed", client_id: connection.clientId },
+            },
+          } satisfies MutationEffects,
+        };
+      });
+      return { ok: false, error: "invalid_grant", description: decision.description };
+    }
+    if (decision.kind !== "rotate" || connection === null) {
+      const refusal = decision.kind === "refuse" ? decision : null;
+      return {
+        ok: false,
+        error: refusal?.error ?? "invalid_grant",
+        description: refusal?.description ?? "unknown refresh token",
+      };
+    }
+
+    if (!this.memberIsActive(connection.memberId)) {
+      return { ok: false, error: "invalid_grant", description: "this person is no longer a member" };
+    }
+
+    const accessToken = formatToken("at", slug, randomSecret());
+    const refreshToken = formatToken("rt", slug, randomSecret());
+    const rotated = rotateOauthConnection(this.ctx.storage, {
+      connectionId: connection.id,
+      accessTokenHash: await hashSecret(accessToken),
+      refreshTokenHash: await hashSecret(refreshToken),
+      previousRefreshTokenHash: presentedHash,
+      accessExpiresAt: input.now + ACCESS_TOKEN_TTL_MS,
+      now: input.now,
+    });
+    if (!rotated) {
+      return { ok: false, error: "invalid_grant", description: "unknown refresh token" };
+    }
+
+    return {
+      ok: true,
+      grant: {
+        connectionId: connection.id,
+        accessToken,
+        refreshToken,
+        expiresInSeconds: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+        scope: connection.scope,
+      },
+    };
+  }
+
+  /**
+   * The resource server's whole authority decision.
+   *
+   * Membership is re-checked live on every call, so removing somebody from the
+   * workspace cuts their connection off at its next request. There is nothing
+   * to revoke and no cache to wait out.
+   */
+  async authenticateOauthToken(input: {
+    accessToken: string;
+    audience: string;
+    now: number;
+    requiredScope?: SupportedScope;
+  }): Promise<OauthPrincipalResult> {
+    const slug = this.workspaceSlug();
+    const parsed = parseTokenOfKind(input.accessToken, "at");
+    if (slug === null || parsed === null || parsed.workspaceSlug !== slug) {
+      return { ok: false, error: "invalid_token", description: "unknown token" };
+    }
+
+    const connection = readConnectionByAccessHash(this.ctx.storage, await hashSecret(input.accessToken));
+    const verdict = checkPresentedToken({
+      token:
+        connection === null
+          ? null
+          : {
+              connectionId: connection.id,
+              resource: connection.resource,
+              accessExpiresAt: connection.accessExpiresAt,
+              revokedAt: connection.revokedAt,
+              scope: connection.scope,
+            },
+      audience: input.audience,
+      now: input.now,
+      requiredScope: input.requiredScope,
+    });
+    if (!verdict.ok) return { ok: false, error: verdict.error, description: verdict.description };
+    if (connection === null) {
+      return { ok: false, error: "invalid_token", description: "unknown token" };
+    }
+
+    const member = this.ctx.storage.sql
+      .exec<{ id: string; handle: string; display_name: string; role: MemberProjection["role"]; status: string; authorization_epoch: number }>(
+        "SELECT id, handle, display_name, role, status, authorization_epoch FROM members WHERE id = ?",
+        connection.memberId,
+      )
+      .toArray()[0];
+    if (member === undefined || member.status !== "active") {
+      return {
+        ok: false,
+        error: "invalid_token",
+        description: "this person is no longer a member of the workspace",
+      };
+    }
+
+    touchOauthConnection(this.ctx.storage, connection.id, input.now);
+    return {
+      ok: true,
+      principal: {
+        connectionId: connection.id,
+        memberId: member.id,
+        handle: member.handle,
+        displayName: member.display_name,
+        role: member.role,
+        authorizationEpoch: member.authorization_epoch,
+        scope: connection.scope,
+        clientId: connection.clientId,
+        clientName: connection.clientName,
+      },
+    };
+  }
+
+  /**
+   * RFC 7009. Presenting either half of a connection's pair revokes the
+   * connection, and the answer is the same whether anything was revoked or not:
+   * the endpoint is unauthenticated, so it must not report whether a token
+   * existed.
+   */
+  async revokeOauthToken(input: { token: string; now: number }): Promise<{ revoked: boolean }> {
+    const slug = this.workspaceSlug();
+    const parsed = parseToken(input.token);
+    if (slug === null || parsed === null || parsed.workspaceSlug !== slug || parsed.kind === "code") {
+      return { revoked: false };
+    }
+    const hash = await hashSecret(input.token);
+    const connection =
+      parsed.kind === "rt"
+        ? readConnectionByRefreshHash(this.ctx.storage, hash)
+        : readConnectionByAccessHash(this.ctx.storage, hash);
+    if (connection === null || connection.revokedAt !== null) return { revoked: false };
+
+    await this.commitMutation({ scope: "oauth.revoke", now: input.now }, () => {
+      revokeOauthConnectionRow(this.ctx.storage, connection.id, "token_revoked", input.now);
+      return {
+        result: undefined,
+        effects: {
+          audit: {
+            eventType: "oauth.revoked",
+            outcome: "allowed" as const,
+            requesterKind: "member" as const,
+            requesterId: connection.memberId,
+            subjectKind: "oauth_connection",
+            subjectId: connection.id,
+            metadata: { reason: "token_revoked", client_id: connection.clientId },
+          },
+        } satisfies MutationEffects,
+      };
+    });
+    return { revoked: true };
+  }
+
+  listOauthConnections(input: { actor: Actor }): { connections: readonly OauthConnectionSummary[] } {
+    const actor = this.authorizeActor(input.actor);
+    // A connection acts as one person, so it is theirs to see and theirs to
+    // end. Nobody else's is listed here, not even an admin's view.
+    return {
+      connections: listOauthConnectionsForMember(this.ctx.storage, actor.id).map((row) => ({
+        id: row.id,
+        clientId: row.clientId,
+        clientName: row.clientName,
+        scope: row.scope,
+        createdAt: row.createdAt,
+        lastUsedAt: row.lastUsedAt,
+        rotationCount: row.rotationCount,
+      })),
+    };
+  }
+
+  async revokeOauthConnection(input: {
+    actor: Actor;
+    connectionId: string;
+    now: number;
+  }): Promise<{ revoked: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const connection = readOauthConnection(this.ctx.storage, input.connectionId);
+    // Somebody else's connection is reported as missing, the same answer a
+    // connection that never existed gets.
+    if (connection === null || connection.memberId !== actor.id) {
+      throw new Error("connection not found");
+    }
+    if (connection.revokedAt !== null) return { revoked: false };
+
+    await this.commitMutation({ scope: "oauth.revoke", now: input.now }, () => {
+      revokeOauthConnectionRow(this.ctx.storage, connection.id, "disconnected_by_owner", input.now);
+      return {
+        result: undefined,
+        effects: {
+          audit: {
+            eventType: "oauth.revoked",
+            outcome: "allowed" as const,
+            requesterKind: "member" as const,
+            requesterId: actor.id,
+            subjectKind: "oauth_connection",
+            subjectId: connection.id,
+            metadata: { reason: "disconnected_by_owner", client_id: connection.clientId },
+          },
+        } satisfies MutationEffects,
+      };
+    });
+    return { revoked: true };
+  }
+
+  private workspaceSlug(): string | null {
+    return (
+      this.ctx.storage.sql
+        .exec<{ workspace_slug: string | null }>(
+          "SELECT workspace_slug FROM workspace_config WHERE singleton = 1",
+        )
+        .toArray()[0]?.workspace_slug ?? null
+    );
+  }
+
+  /**
+   * Learn the workspace's slug once, then hold the caller to it.
+   *
+   * A workspace provisioned before this column existed has none yet, so the
+   * first OAuth request teaches it. After that the slug is what routes every
+   * token, and a caller naming a different one is refused rather than believed.
+   */
+  private requireWorkspaceSlug(claimed: string): string {
+    const known = this.workspaceSlug();
+    if (known === null) {
+      this.ctx.storage.sql.exec(
+        "UPDATE workspace_config SET workspace_slug = ? WHERE singleton = 1 AND workspace_slug IS NULL",
+        claimed,
+      );
+      return claimed;
+    }
+    if (known !== claimed) throw new Error("workspace slug does not match this workspace");
+    return known;
+  }
+
+  private memberIsActive(memberId: string): boolean {
+    return (
+      this.ctx.storage.sql
+        .exec<{ status: string }>("SELECT status FROM members WHERE id = ?", memberId)
+        .toArray()[0]?.status === "active"
+    );
   }
 
   /* -- authorization helpers ------------------------------------------- */

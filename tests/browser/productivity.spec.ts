@@ -150,18 +150,25 @@ test("AGENT-INT-015 creates an agent and shows the ceiling its owners cannot cha
 test.describe("without hydration", () => {
   test.use({ javaScriptEnabled: false });
 
-  test("FORM-INT-001 offers no submit button until the page can honour it", async ({ page }) => {
+  test("FORM-INT-001 says it is not ready rather than losing what somebody does", async ({
+    page,
+  }) => {
     await page.goto("/agents");
+    // A form with no enabled submit button has no implicit submission either,
+    // so pressing Enter in a field cannot navigate away with the work lost.
     await expect(page.getByRole("button", { name: "Create agent" })).toBeDisabled();
-
-    // Nothing is lost, because there is nothing to submit: a form with no
-    // enabled submit button has no implicit submission either.
-    await page.getByLabel("Handle").fill("releasebot");
-    await page.getByLabel("Handle").press("Enter");
-    await expect(page).toHaveURL(/\/agents$/);
-    await expect(page.getByLabel("Handle")).toHaveValue("releasebot");
+    // And a controlled input is connected to nothing until React hydrates:
+    // characters typed into it are wiped by the first render, because it is
+    // reconciled against state that never saw them.
+    await expect(page.getByLabel("Handle")).not.toBeEditable();
+    await expect(page.getByLabel("What it does")).not.toBeEditable();
 
     await page.goto("/emoji");
     await expect(page.getByRole("button", { name: "Name it" })).toBeDisabled();
+    await expect(page.getByLabel("Name")).not.toBeEditable();
+    await expect(page.getByLabel("Stands for")).not.toBeEditable();
+
+    await page.goto("/c/general");
+    await expect(page.getByRole("textbox", { name: /Message #general/ })).not.toBeEditable();
   });
 });
