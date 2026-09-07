@@ -57,8 +57,19 @@ import {
   randomSecret,
   verifyCodeVerifier,
   workspaceSlugFromResource,
+  type McpToolName,
   type SupportedScope,
 } from "../domain/mcp-oauth";
+import {
+  SESSION_HARD_TTL_MS,
+  delegationAllowsChannel,
+  normalizeBoundedIds,
+  normalizeSessionCapabilities,
+  sessionAllowsTool,
+  sessionTokenExpiresAt,
+  validDelegationExpiry,
+  type SessionCapability,
+} from "../domain/agent-session";
 import {
   directMessageIdentity,
   parseChannelName,
@@ -119,6 +130,7 @@ import {
   insertChannel,
   insertMessage,
   insertMcpMessageAttribution,
+  insertAgentSessionMessageAttribution,
   isChannelMember,
   listChannelHistory,
   listThreadHistory,
@@ -390,12 +402,83 @@ export type OauthPrincipalResult =
   | { ok: true; principal: OauthPrincipal }
   | { ok: false; error: "invalid_token" | "insufficient_scope"; description: string };
 
+export type AgentSessionPrincipal = {
+  credentialKind: "session";
+  sessionId: string;
+  delegationId: string;
+  agentId: string;
+  agentHandle: string;
+  memberId: string;
+  handle: string;
+  displayName: string;
+  role: MemberProjection["role"];
+  authorizationEpoch: number;
+  capabilities: readonly SessionCapability[];
+  channelIds: readonly string[] | null;
+  deviceId: string;
+  runnerEpoch: number;
+  presetRevision: number;
+  clientId: string;
+  clientName: string;
+};
+
+export type McpPrincipal = (OauthPrincipal & { credentialKind: "oauth" }) | AgentSessionPrincipal;
+
+export type McpPrincipalResult =
+  | { ok: true; principal: McpPrincipal }
+  | { ok: false; error: "invalid_token" | "insufficient_scope"; description: string };
+
+export type AgentDelegation = {
+  id: string;
+  agentId: string;
+  ownerMemberId: string;
+  ownerAuthorizationEpoch: number;
+  channelIds: readonly string[] | null;
+  credentialIds: readonly string[];
+  deliveryModes: readonly string[];
+  projectIds: readonly string[];
+  spendCapDailyCents: number | null;
+  spendCapMonthlyCents: number | null;
+  rateLimitPerHour: number | null;
+  createdAt: number;
+  expiresAt: number;
+  revokedAt: number | null;
+};
+
+export type AgentSessionGrant = {
+  sessionId: string;
+  delegationId: string;
+  agentId: string;
+  token: string;
+  tokenExpiresAt: number;
+  hardExpiresAt: number;
+  capabilities: readonly SessionCapability[];
+};
+
+type AgentSessionRow = {
+  id: string;
+  delegationId: string;
+  agentId: string;
+  ownerMemberId: string;
+  deviceId: string;
+  runnerEpoch: number;
+  presetRevision: number;
+  capabilities: readonly SessionCapability[];
+  tokenHash: string;
+  tokenExpiresAt: number;
+  hardExpiresAt: number;
+  revokedAt: number | null;
+};
+
 export type McpAttribution = {
-  connectionId: string;
+  connectionId: string | null;
+  sessionId: string | null;
+  delegationId: string | null;
   memberId: string;
   memberHandle: string;
   clientId: string;
   clientName: string | null;
+  deviceId: string | null;
 };
 
 export type AgentLease = {
@@ -416,13 +499,18 @@ export type AgentLeaseResult =
 
 export type AgentLeaseProof = {
   actor: Actor;
-  connectionId: string;
+  connectionId?: string | null;
+  sessionToken?: string | null;
   agent: string;
   itemId: string;
   sessionId: string;
   leaseGeneration: number;
   leaseToken: string;
 };
+
+type AgentToolCredential =
+  | { kind: "oauth"; connectionId: string; sessionId: null; delegationId: null; deviceId: null; channelIds: null }
+  | { kind: "session"; connectionId: null; sessionId: string; delegationId: string; deviceId: string; channelIds: readonly string[] | null };
 
 export type OauthConnectionSummary = {
   id: string;
@@ -574,8 +662,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       if (replay) return { result: { applied: false, version: replay.version } };
 
       const existing = this.ctx.storage.sql
-        .exec<{ control_version: number }>(
-          "SELECT control_version FROM members WHERE id = ?",
+        .exec<{ authorization_epoch: number; control_version: number; status: MemberProjection["status"] }>(
+          "SELECT authorization_epoch, control_version, status FROM members WHERE id = ?",
           member.memberId,
         )
         .toArray()[0];
@@ -607,6 +695,17 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         member.now,
         member.now,
       );
+      if (
+        existing !== undefined
+        && (member.authorizationEpoch !== existing.authorization_epoch || member.status !== "active")
+      ) {
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_sessions SET revoked_at = ?, revoked_reason = 'owner_authority_changed'
+           WHERE owner_member_id = ? AND revoked_at IS NULL`,
+          member.now,
+          member.memberId,
+        );
+      }
       this.ctx.storage.sql.exec(
         `INSERT INTO applied_control_operations(operation_id, kind, aggregate_id, version, applied_at)
          VALUES (?, 'membership_upsert', ?, ?, ?)`,
@@ -2989,6 +3088,22 @@ export class Workspace extends DurableObject<CloudflareEnv> {
 
     const outcome = await this.commitMutation({ scope: "agent.remove_owner", now: input.now }, () => {
       this.ctx.storage.sql.exec(
+        `UPDATE agent_sessions SET revoked_at = ?, revoked_reason = 'owner_removed'
+         WHERE delegation_id IN (
+           SELECT id FROM agent_delegations WHERE agent_id = ? AND owner_member_id = ?
+         ) AND revoked_at IS NULL`,
+        input.now,
+        agent.id,
+        input.memberId,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE agent_delegations SET revoked_at = ?, revoked_reason = 'owner_removed'
+         WHERE agent_id = ? AND owner_member_id = ? AND revoked_at IS NULL`,
+        input.now,
+        agent.id,
+        input.memberId,
+      );
+      this.ctx.storage.sql.exec(
         "DELETE FROM agent_owners WHERE agent_id = ? AND member_id = ?",
         agent.id,
         input.memberId,
@@ -3088,9 +3203,295 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         input.now,
         agent.id,
       );
+      if (input.status !== "active") {
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_sessions SET revoked_at = ?, revoked_reason = 'agent_status_changed'
+           WHERE agent_id = ? AND revoked_at IS NULL`,
+          input.now,
+          agent.id,
+        );
+      }
       return {
         result: { status: input.status },
         effects: this.agentEffects("agent.status_set", agent, actor, { agent_status: input.status }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Delegations and scoped runner sessions (A04)                        */
+  /* ------------------------------------------------------------------ */
+
+  async createAgentDelegation(input: {
+    actor: Actor;
+    agent: string;
+    channelIds?: readonly string[] | null;
+    credentialIds?: readonly string[];
+    deliveryModes?: readonly string[];
+    projectIds?: readonly string[];
+    spendCapDailyCents?: number | null;
+    spendCapMonthlyCents?: number | null;
+    rateLimitPerHour?: number | null;
+    expiresAt: number;
+    now: number;
+  }): Promise<AgentDelegation> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgentArgument(input.agent, actor.id);
+    if (agent.status !== "active") throw new Error("agent is not active");
+    if (!validDelegationExpiry(input.now, input.expiresAt)) throw new Error("delegation expiry is invalid");
+
+    const channelIds = normalizeBoundedIds(input.channelIds, { nullable: true });
+    if (channelIds !== null) {
+      for (const channelId of channelIds) {
+        this.requireVisibleChannel(channelId, actor.id);
+        if (!agentMayPostIn({ agentStatus: agent.status, scope: this.agentScope(agent), channelId })) {
+          throw new Error("delegation channel is outside the agent scope");
+        }
+      }
+    }
+    const credentialIds = normalizeBoundedIds(input.credentialIds, { nullable: false }) as readonly string[];
+    const projectIds = normalizeBoundedIds(input.projectIds, { nullable: false }) as readonly string[];
+    const deliveryModes = normalizeBoundedIds(input.deliveryModes, { nullable: false, maximum: 8 }) as readonly string[];
+    if (deliveryModes.some((mode) => !["inject", "file", "device_proxy"].includes(mode))) {
+      throw new Error("delegation delivery mode is invalid");
+    }
+    for (const value of [input.spendCapDailyCents, input.spendCapMonthlyCents]) {
+      if (value !== undefined && value !== null && (!Number.isSafeInteger(value) || value < 0)) {
+        throw new Error("delegation spend cap is invalid");
+      }
+    }
+    if (
+      input.rateLimitPerHour !== undefined &&
+      input.rateLimitPerHour !== null &&
+      (!Number.isSafeInteger(input.rateLimitPerHour) || input.rateLimitPerHour <= 0)
+    ) {
+      throw new Error("delegation rate limit is invalid");
+    }
+
+    const id = crypto.randomUUID();
+    const delegation: AgentDelegation = {
+      id,
+      agentId: agent.id,
+      ownerMemberId: actor.id,
+      ownerAuthorizationEpoch: input.actor.authorizationEpoch,
+      channelIds,
+      credentialIds,
+      deliveryModes,
+      projectIds,
+      spendCapDailyCents: input.spendCapDailyCents ?? null,
+      spendCapMonthlyCents: input.spendCapMonthlyCents ?? null,
+      rateLimitPerHour: input.rateLimitPerHour ?? null,
+      createdAt: input.now,
+      expiresAt: input.expiresAt,
+      revokedAt: null,
+    };
+    await this.commitMutation({ scope: "agent.delegation.create", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO agent_delegations(
+           id, agent_id, owner_member_id, owner_authorization_epoch, channel_ids_json,
+           credential_ids_json, delivery_modes_json, project_ids_json,
+           spend_cap_daily_cents, spend_cap_monthly_cents, rate_limit_per_hour,
+           created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id,
+        agent.id,
+        actor.id,
+        input.actor.authorizationEpoch,
+        channelIds === null ? null : JSON.stringify(channelIds),
+        JSON.stringify(credentialIds),
+        JSON.stringify(deliveryModes),
+        JSON.stringify(projectIds),
+        delegation.spendCapDailyCents,
+        delegation.spendCapMonthlyCents,
+        delegation.rateLimitPerHour,
+        input.now,
+        input.expiresAt,
+      );
+      return {
+        result: undefined,
+        effects: this.agentEffects("agent.delegation_created", agent, actor, {
+          delegation_id: id,
+          expires_at: input.expiresAt,
+          channel_count: channelIds?.length ?? -1,
+          project_count: projectIds.length,
+        }),
+      };
+    });
+    return delegation;
+  }
+
+  async revokeAgentDelegation(input: {
+    actor: Actor;
+    delegationId: string;
+    reason?: string | null;
+    now: number;
+  }): Promise<{ revoked: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const delegation = this.readAgentDelegation(input.delegationId);
+    if (delegation === null) throw new Error("delegation not found");
+    const agent = this.requireOwnedAgent(delegation.agentId, actor.id);
+    const reason = (input.reason ?? "owner_revoked").slice(0, 200);
+    const outcome = await this.commitMutation({ scope: "agent.delegation.revoke", now: input.now }, () => {
+      const changed = this.ctx.storage.sql.exec(
+        `UPDATE agent_delegations SET revoked_at = ?, revoked_reason = ?
+         WHERE id = ? AND revoked_at IS NULL`,
+        input.now,
+        reason,
+        delegation.id,
+      );
+      if (changed.rowsWritten > 0) {
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_sessions SET revoked_at = ?, revoked_reason = 'delegation_revoked'
+           WHERE delegation_id = ? AND revoked_at IS NULL`,
+          input.now,
+          delegation.id,
+        );
+      }
+      return {
+        result: { revoked: changed.rowsWritten > 0 },
+        effects: changed.rowsWritten > 0
+          ? this.agentEffects("agent.delegation_revoked", agent, actor, { delegation_id: delegation.id, reason })
+          : undefined,
+      };
+    });
+    return outcome.result;
+  }
+
+  async startAgentSession(input: {
+    actor: Actor;
+    delegationId: string;
+    deviceId: string;
+    runnerEpoch: number;
+    presetRevision: number;
+    capabilities: readonly string[];
+    now: number;
+  }): Promise<AgentSessionGrant> {
+    const actor = this.authorizeActor(input.actor);
+    const delegation = this.requireLiveDelegation(input.delegationId, input.now);
+    if (delegation.ownerMemberId !== actor.id) throw new Error("delegation not found");
+    const agent = this.requireOwnedAgent(delegation.agentId, actor.id);
+    if (agent.status !== "active") throw new Error("agent is not active");
+    if (input.deviceId.length === 0 || input.deviceId.length > 200) throw new Error("runner device is invalid");
+    if (!Number.isSafeInteger(input.runnerEpoch) || input.runnerEpoch < 0) throw new Error("runner epoch is invalid");
+    if (!Number.isSafeInteger(input.presetRevision) || input.presetRevision < 0) throw new Error("preset revision is invalid");
+    const capabilities = normalizeSessionCapabilities(input.capabilities);
+    const storedSlug = this.workspaceSlug();
+    if (storedSlug === null) throw new Error("workspace is not initialized");
+    const token = formatToken("st", storedSlug, randomSecret());
+    const tokenHash = await hashSecret(token);
+    // Everything below is re-read after the hashing yield so owner and
+    // delegation authority cannot go stale before the transaction commits.
+    const liveActor = this.authorizeActor(input.actor);
+    const liveDelegation = this.requireLiveDelegation(input.delegationId, input.now);
+    if (liveDelegation.ownerMemberId !== liveActor.id) throw new Error("delegation not found");
+    const liveAgent = this.requireOwnedAgent(liveDelegation.agentId, liveActor.id);
+    if (liveAgent.status !== "active") throw new Error("agent is not active");
+    const hardExpiresAt = Math.min(input.now + SESSION_HARD_TTL_MS, liveDelegation.expiresAt);
+    const tokenExpiresAt = sessionTokenExpiresAt({ now: input.now, sessionHardExpiresAt: hardExpiresAt, delegationExpiresAt: liveDelegation.expiresAt });
+    const sessionId = crypto.randomUUID();
+
+    await this.commitMutation({ scope: "agent.session.start", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        `UPDATE agent_sessions SET revoked_at = ?, revoked_reason = 'replaced'
+         WHERE agent_id = ? AND revoked_at IS NULL`,
+        input.now,
+        liveAgent.id,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO agent_sessions(
+           id, delegation_id, agent_id, owner_member_id, device_id, runner_epoch,
+           preset_revision, capabilities_json, token_hash, token_expires_at,
+           hard_expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sessionId,
+        liveDelegation.id,
+        liveAgent.id,
+        liveActor.id,
+        input.deviceId,
+        input.runnerEpoch,
+        input.presetRevision,
+        JSON.stringify(capabilities),
+        tokenHash,
+        tokenExpiresAt,
+        hardExpiresAt,
+        input.now,
+      );
+      return {
+        result: undefined,
+        effects: this.agentEffects("agent.session_started", liveAgent, liveActor, {
+          session_id: sessionId,
+          delegation_id: liveDelegation.id,
+          device_id: input.deviceId,
+          runner_epoch: input.runnerEpoch,
+          preset_revision: input.presetRevision,
+          capability_count: capabilities.length,
+          hard_expires_at: hardExpiresAt,
+        }),
+      };
+    });
+    return { sessionId, delegationId: liveDelegation.id, agentId: liveAgent.id, token, tokenExpiresAt, hardExpiresAt, capabilities };
+  }
+
+  async rotateAgentSessionToken(input: {
+    sessionId: string;
+    currentToken: string;
+    agentId: string;
+    ownerMemberId: string;
+    delegationId: string;
+    deviceId: string;
+    runnerEpoch: number;
+    presetRevision: number;
+    now: number;
+  }): Promise<AgentSessionGrant> {
+    const currentHash = await hashSecret(input.currentToken);
+    const session = this.requireLiveAgentSessionById(input.sessionId, input.now);
+    this.requireExactAgentSessionTuple(session, input, currentHash);
+    const delegation = this.requireLiveDelegation(session.delegationId, input.now);
+    this.requireLiveSessionOwner(session, delegation);
+    const storedSlug = this.workspaceSlug();
+    if (storedSlug === null) throw new Error("workspace is not initialized");
+    const token = formatToken("st", storedSlug, randomSecret());
+    const tokenHash = await hashSecret(token);
+    // Re-read after the second hashing yield, then rotate with a CAS on the old hash.
+    const fresh = this.requireLiveAgentSessionById(input.sessionId, input.now);
+    this.requireExactAgentSessionTuple(fresh, input, currentHash);
+    const freshDelegation = this.requireLiveDelegation(fresh.delegationId, input.now);
+    this.requireLiveSessionOwner(fresh, freshDelegation);
+    const tokenExpiresAt = sessionTokenExpiresAt({ now: input.now, sessionHardExpiresAt: fresh.hardExpiresAt, delegationExpiresAt: freshDelegation.expiresAt });
+    const changed = this.ctx.storage.sql.exec(
+      `UPDATE agent_sessions SET token_hash = ?, token_expires_at = ?, rotation_count = rotation_count + 1
+       WHERE id = ? AND revoked_at IS NULL`,
+      tokenHash,
+      tokenExpiresAt,
+      fresh.id,
+    );
+    if (changed.rowsWritten === 0) throw new Error("stale session token");
+    return { sessionId: fresh.id, delegationId: fresh.delegationId, agentId: fresh.agentId, token, tokenExpiresAt, hardExpiresAt: fresh.hardExpiresAt, capabilities: fresh.capabilities };
+  }
+
+  async stopAgentSession(input: { actor: Actor; sessionId: string; reason?: string | null; now: number }): Promise<{ stopped: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const session = this.readAgentSession(input.sessionId);
+    if (session === null) throw new Error("session not found");
+    const agent = this.requireOwnedAgent(session.agentId, actor.id);
+    const reason = (input.reason ?? "owner_stopped").slice(0, 200);
+    const outcome = await this.commitMutation({ scope: "agent.session.stop", now: input.now }, () => {
+      const changed = this.ctx.storage.sql.exec(
+        `UPDATE agent_sessions SET revoked_at = ?, revoked_reason = ? WHERE id = ? AND revoked_at IS NULL`,
+        input.now,
+        reason,
+        session.id,
+      );
+      return {
+        result: { stopped: changed.rowsWritten > 0 },
+        effects: changed.rowsWritten > 0
+          ? this.agentEffects("agent.session_stopped", agent, actor, {
+              session_id: session.id,
+              delegation_id: session.delegationId,
+              reason,
+            })
+          : undefined,
       };
     });
     return outcome.result;
@@ -3182,6 +3583,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     order?: "oldest" | "newest";
     cursor?: AgentQueueCursor | null;
     peek?: boolean;
+    allowedChannelIds?: readonly string[] | null;
     now: number;
   }): { agent: AgentRow; items: readonly QueueItemRow[]; nextCursor: AgentQueueCursor | null; depth: number } {
     const actor = this.authorizeActor(input.actor);
@@ -3194,6 +3596,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       unreadOnly: input.unreadOnly !== false,
       order: input.order ?? "newest",
       cursor: input.cursor ?? null,
+      allowedChannelIds: input.allowedChannelIds ?? null,
     });
     if (input.peek !== true && page.items.length > 0) {
       this.ctx.storage.transactionSync(() => {
@@ -3202,7 +3605,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         }
       });
     }
-    return { agent, ...page, depth: visibleAgentQueueDepth(this.ctx.storage, agent.id, actor.id) };
+    return {
+      agent,
+      ...page,
+      depth: visibleAgentQueueDepth(this.ctx.storage, agent.id, actor.id, input.allowedChannelIds ?? null),
+    };
   }
 
   setAgentQueueDisplayState(input: {
@@ -3210,10 +3617,17 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     agent: string;
     itemId: string;
     read: boolean;
+    allowedChannelIds?: readonly string[] | null;
     now: number;
   }): { changed: boolean } {
     const actor = this.authorizeActor(input.actor);
     const agent = this.requireOwnedAgentArgument(input.agent, actor.id);
+    if (input.allowedChannelIds !== undefined && input.allowedChannelIds !== null) {
+      const row = this.ctx.storage.sql
+        .exec<{ channel_id: string }>("SELECT channel_id FROM agent_queue WHERE id = ? AND agent_id = ?", input.itemId, agent.id)
+        .toArray()[0];
+      if (row === undefined || !input.allowedChannelIds.includes(row.channel_id)) throw new Error("queue item not found");
+    }
     const changed = this.ctx.storage.transactionSync(() =>
       setAgentQueueReadState(this.ctx.storage, {
         agentId: agent.id,
@@ -3232,7 +3646,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
    */
   async claimAgentWork(input: {
     actor: Actor;
-    connectionId: string;
+    connectionId?: string | null;
+    sessionToken?: string | null;
     agent: string;
     claimId: string;
     leaseToken: string;
@@ -3244,11 +3659,24 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     if (input.sessionId.length < 1 || input.sessionId.length > 200) throw new Error("invalid session id");
     if (input.leaseToken.length < 32 || input.leaseToken.length > 512) throw new Error("invalid lease token");
     const leaseTokenHash = await hashSecret(input.leaseToken);
-    const actor = this.authorizeActor(input.actor);
+    let actor = this.authorizeActor(input.actor);
     this.requireCloudContentAuthority();
-    const agent = this.requireOwnedAgentArgument(input.agent, actor.id);
+    let agent = this.requireOwnedAgentArgument(input.agent, actor.id);
     if (agent.status !== "active") throw new Error("agent is not active");
-    this.requireLiveMcpConnection(input.connectionId, actor.id);
+    const credential = await this.authorizeAgentToolCredential({
+      actor: input.actor,
+      agentId: agent.id,
+      connectionId: input.connectionId,
+      sessionToken: input.sessionToken,
+      toolName: "agent_next",
+      now: input.now,
+    });
+    actor = this.authorizeActor(input.actor);
+    agent = this.requireOwnedAgentArgument(input.agent, actor.id);
+    if (agent.status !== "active") throw new Error("agent is not active");
+    if (credential.kind === "session" && input.sessionId !== credential.sessionId) {
+      throw new Error("runner session id does not match the session token");
+    }
 
     return this.ctx.storage.transactionSync(() => {
       this.expireAgentClaims(agent.id, input.now);
@@ -3273,10 +3701,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                   q.lease_expires_at, q.attempt_count, q.lease_token_hash
            FROM agent_queue q JOIN messages m ON m.id = q.message_id
            WHERE q.agent_id = ? AND q.claim_id = ? AND q.execution_state = 'claimed'
-             AND q.lease_connection_id = ? AND q.lease_session_id = ?`,
+             AND q.lease_connection_id IS ? AND q.lease_agent_session_id IS ?
+             AND q.lease_session_id = ?`,
           agent.id,
           input.claimId,
-          input.connectionId,
+          credential.connectionId,
+          credential.sessionId,
           input.sessionId,
         )
         .toArray()[0];
@@ -3313,12 +3743,15 @@ export class Workspace extends DurableObject<CloudflareEnv> {
            JOIN channels c ON c.id = q.channel_id
            WHERE q.agent_id = ? AND q.execution_state = 'pending' AND q.not_before <= ?
              AND m.deleted_at IS NULL
+             AND (? IS NULL OR q.channel_id IN (SELECT value FROM json_each(?)))
              AND (c.kind = 'public' OR EXISTS (
                SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_id = ?
              ))
            ORDER BY q.enqueued_at, q.id LIMIT 1`,
           agent.id,
           input.now,
+          credential.channelIds === null ? null : JSON.stringify(credential.channelIds),
+          credential.channelIds === null ? null : JSON.stringify(credential.channelIds),
           actor.id,
         )
         .toArray()[0];
@@ -3329,14 +3762,15 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       const leaseExpiresAt = input.now + 60_000;
       const claimed = this.ctx.storage.sql.exec(
         `UPDATE agent_queue SET execution_state = 'claimed', attempt_count = ?,
-           lease_generation = ?, lease_connection_id = ?, lease_session_id = ?,
+           lease_generation = ?, lease_connection_id = ?, lease_agent_session_id = ?, lease_session_id = ?,
            lease_token_hash = ?, lease_expires_at = ?, execution_started_at = NULL,
            claim_id = ?, completion_id = NULL, completion_digest = NULL,
            completion_result_json = NULL, completed_at = NULL
          WHERE id = ? AND agent_id = ? AND execution_state = 'pending'`,
         attemptCount,
         leaseGeneration,
-        input.connectionId,
+        credential.connectionId,
+        credential.sessionId,
         input.sessionId,
         leaseTokenHash,
         leaseExpiresAt,
@@ -3357,7 +3791,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           subjectId: row.id,
           metadata: {
             agent_id: agent.id,
-            connection_id: input.connectionId,
+            connection_id: credential.connectionId,
+            agent_session_id: credential.sessionId,
+            delegation_id: credential.delegationId,
             session_id: input.sessionId,
             lease_generation: leaseGeneration,
             attempt_count: attemptCount,
@@ -3379,17 +3815,19 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }
 
   async renewAgentLease(input: AgentLeaseProof & { now: number }): Promise<{ leaseExpiresAt: number }> {
-    const proof = await this.authorizeAgentLease(input);
+    const proof = await this.authorizeAgentLease(input, "agent_renew");
     const leaseExpiresAt = input.now + 60_000;
     const changed = this.ctx.storage.sql.exec(
       `UPDATE agent_queue SET lease_expires_at = ?
        WHERE id = ? AND agent_id = ? AND execution_state = 'claimed'
-         AND lease_connection_id = ? AND lease_session_id = ? AND lease_generation = ?
+         AND lease_connection_id IS ? AND lease_agent_session_id IS ?
+         AND lease_session_id = ? AND lease_generation = ?
          AND lease_token_hash = ? AND lease_expires_at > ?`,
       leaseExpiresAt,
       input.itemId,
       proof.agent.id,
-      input.connectionId,
+      proof.credential.connectionId,
+      proof.credential.sessionId,
       input.sessionId,
       input.leaseGeneration,
       proof.leaseTokenHash,
@@ -3400,16 +3838,18 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }
 
   async markAgentExecutionStarted(input: AgentLeaseProof & { now: number }): Promise<{ startedAt: number }> {
-    const proof = await this.authorizeAgentLease(input);
+    const proof = await this.authorizeAgentLease(input, "agent_start");
     const changed = this.ctx.storage.sql.exec(
       `UPDATE agent_queue SET execution_started_at = COALESCE(execution_started_at, ?)
        WHERE id = ? AND agent_id = ? AND execution_state = 'claimed'
-         AND lease_connection_id = ? AND lease_session_id = ? AND lease_generation = ?
+         AND lease_connection_id IS ? AND lease_agent_session_id IS ?
+         AND lease_session_id = ? AND lease_generation = ?
          AND lease_token_hash = ? AND lease_expires_at > ?`,
       input.now,
       input.itemId,
       proof.agent.id,
-      input.connectionId,
+      proof.credential.connectionId,
+      proof.credential.sessionId,
       input.sessionId,
       input.leaseGeneration,
       proof.leaseTokenHash,
@@ -3436,7 +3876,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     }
     const resultJson = JSON.stringify(input.result ?? {});
     if (resultJson.length > 16_000) throw new Error("completion result is too large");
-    const proof = await this.authorizeAgentLease(input, true);
+    const proof = await this.authorizeAgentLease(input, "agent_complete", true);
     return this.ctx.storage.transactionSync(() => {
       const existing = this.ctx.storage.sql
         .exec<{ completion_id: string | null; completion_digest: string | null; completed_at: number | null }>(
@@ -3455,7 +3895,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         `UPDATE agent_queue SET execution_state = 'completed', completion_id = ?, completion_digest = ?,
            completion_result_json = ?, completed_at = ?, lease_expires_at = NULL
          WHERE id = ? AND agent_id = ? AND execution_state = 'claimed'
-           AND lease_connection_id = ? AND lease_session_id = ? AND lease_generation = ?
+           AND lease_connection_id IS ? AND lease_agent_session_id IS ?
+           AND lease_session_id = ? AND lease_generation = ?
            AND lease_token_hash = ? AND lease_expires_at > ?`,
         input.completionId,
         input.outputDigest,
@@ -3463,7 +3904,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         input.now,
         input.itemId,
         proof.agent.id,
-        input.connectionId,
+        proof.credential.connectionId,
+        proof.credential.sessionId,
         input.sessionId,
         input.leaseGeneration,
         proof.leaseTokenHash,
@@ -3482,7 +3924,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           subjectId: input.itemId,
           metadata: {
             agent_id: proof.agent.id,
-            connection_id: input.connectionId,
+            connection_id: proof.credential.connectionId,
+            agent_session_id: proof.credential.sessionId,
+            delegation_id: proof.credential.delegationId,
             session_id: input.sessionId,
             lease_generation: input.leaseGeneration,
             completion_id: input.completionId,
@@ -3509,7 +3953,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
 
   async postMcpAgentMessage(input: {
     actor: Actor;
-    connectionId: string;
+    connectionId?: string | null;
+    sessionToken?: string | null;
     agent: string;
     idempotencyKey: string;
     channelId: string;
@@ -3575,6 +4020,208 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     }
   }
 
+  private async authorizeAgentToolCredential(input: {
+    actor: Actor;
+    agentId: string;
+    connectionId?: string | null;
+    sessionToken?: string | null;
+    toolName: McpToolName;
+    now: number;
+  }): Promise<AgentToolCredential> {
+    if (input.sessionToken) {
+      const authenticated = await this.authenticateMcpToken({
+        token: input.sessionToken,
+        audience: "",
+        now: input.now,
+        toolName: input.toolName,
+      });
+      if (!authenticated.ok || authenticated.principal.credentialKind !== "session") {
+        throw new Error(authenticated.ok ? "session token required" : authenticated.description);
+      }
+      const principal = authenticated.principal;
+      if (
+        principal.agentId !== input.agentId ||
+        principal.memberId !== input.actor.memberId ||
+        principal.authorizationEpoch !== input.actor.authorizationEpoch
+      ) {
+        throw new Error("session token does not match this agent or owner");
+      }
+      return {
+        kind: "session",
+        connectionId: null,
+        sessionId: principal.sessionId,
+        delegationId: principal.delegationId,
+        deviceId: principal.deviceId,
+        channelIds: principal.channelIds,
+      };
+    }
+    if (!input.connectionId) throw new Error("MCP credential is required");
+    this.requireLiveMcpConnection(input.connectionId, input.actor.memberId);
+    return { kind: "oauth", connectionId: input.connectionId, sessionId: null, delegationId: null, deviceId: null, channelIds: null };
+  }
+
+  private readAgentDelegation(id: string): AgentDelegation | null {
+    const row = this.ctx.storage.sql
+      .exec<{
+        id: string;
+        agent_id: string;
+        owner_member_id: string;
+        owner_authorization_epoch: number;
+        channel_ids_json: string | null;
+        credential_ids_json: string;
+        delivery_modes_json: string;
+        project_ids_json: string;
+        spend_cap_daily_cents: number | null;
+        spend_cap_monthly_cents: number | null;
+        rate_limit_per_hour: number | null;
+        created_at: number;
+        expires_at: number;
+        revoked_at: number | null;
+      }>(
+        `SELECT id, agent_id, owner_member_id, owner_authorization_epoch,
+                channel_ids_json, credential_ids_json, delivery_modes_json, project_ids_json,
+                spend_cap_daily_cents, spend_cap_monthly_cents, rate_limit_per_hour,
+                created_at, expires_at, revoked_at
+         FROM agent_delegations WHERE id = ?`,
+        id,
+      )
+      .toArray()[0];
+    if (row === undefined) return null;
+    return {
+      id: row.id,
+      agentId: row.agent_id,
+      ownerMemberId: row.owner_member_id,
+      ownerAuthorizationEpoch: row.owner_authorization_epoch,
+      channelIds: row.channel_ids_json === null ? null : (JSON.parse(row.channel_ids_json) as string[]),
+      credentialIds: JSON.parse(row.credential_ids_json) as string[],
+      deliveryModes: JSON.parse(row.delivery_modes_json) as string[],
+      projectIds: JSON.parse(row.project_ids_json) as string[],
+      spendCapDailyCents: row.spend_cap_daily_cents,
+      spendCapMonthlyCents: row.spend_cap_monthly_cents,
+      rateLimitPerHour: row.rate_limit_per_hour,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      revokedAt: row.revoked_at,
+    };
+  }
+
+  private requireLiveDelegation(id: string, now: number): AgentDelegation {
+    const delegation = this.readAgentDelegation(id);
+    if (delegation === null || delegation.revokedAt !== null || delegation.expiresAt <= now) {
+      throw new Error("delegation is not active");
+    }
+    const owner = this.ctx.storage.sql
+      .exec<{ status: string; authorization_epoch: number }>(
+        "SELECT status, authorization_epoch FROM members WHERE id = ?",
+        delegation.ownerMemberId,
+      )
+      .toArray()[0];
+    if (
+      owner === undefined ||
+      owner.status !== "active" ||
+      owner.authorization_epoch !== delegation.ownerAuthorizationEpoch ||
+      !agentOwnerIds(this.ctx.storage, delegation.agentId).includes(delegation.ownerMemberId)
+    ) {
+      throw new Error("delegation authority is no longer current");
+    }
+    return delegation;
+  }
+
+  private readAgentSession(id: string): AgentSessionRow | null {
+    const row = this.ctx.storage.sql
+      .exec<{
+        id: string;
+        delegation_id: string;
+        agent_id: string;
+        owner_member_id: string;
+        device_id: string;
+        runner_epoch: number;
+        preset_revision: number;
+        capabilities_json: string;
+        token_hash: string;
+        token_expires_at: number;
+        hard_expires_at: number;
+        revoked_at: number | null;
+      }>(
+        `SELECT id, delegation_id, agent_id, owner_member_id, device_id, runner_epoch,
+                preset_revision, capabilities_json, token_hash, token_expires_at,
+                hard_expires_at, revoked_at
+         FROM agent_sessions WHERE id = ?`,
+        id,
+      )
+      .toArray()[0];
+    return row === undefined
+      ? null
+      : {
+          id: row.id,
+          delegationId: row.delegation_id,
+          agentId: row.agent_id,
+          ownerMemberId: row.owner_member_id,
+          deviceId: row.device_id,
+          runnerEpoch: row.runner_epoch,
+          presetRevision: row.preset_revision,
+          capabilities: JSON.parse(row.capabilities_json) as SessionCapability[],
+          tokenHash: row.token_hash,
+          tokenExpiresAt: row.token_expires_at,
+          hardExpiresAt: row.hard_expires_at,
+          revokedAt: row.revoked_at,
+        };
+  }
+
+  private requireLiveAgentSessionById(id: string, now: number): AgentSessionRow {
+    const session = this.readAgentSession(id);
+    if (
+      session === null ||
+      session.revokedAt !== null ||
+      session.tokenExpiresAt <= now ||
+      session.hardExpiresAt <= now
+    ) {
+      throw new Error("session token is not active");
+    }
+    return session;
+  }
+
+  private requireLiveSessionOwner(session: AgentSessionRow, delegation: AgentDelegation): ActiveMember {
+    if (
+      session.delegationId !== delegation.id ||
+      session.agentId !== delegation.agentId ||
+      session.ownerMemberId !== delegation.ownerMemberId
+    ) {
+      throw new Error("session binding is invalid");
+    }
+    const agent = this.requireOwnedAgent(session.agentId, session.ownerMemberId);
+    if (agent.status !== "active") throw new Error("agent is not active");
+    return this.authorizeActor({
+      memberId: session.ownerMemberId,
+      authorizationEpoch: delegation.ownerAuthorizationEpoch,
+    });
+  }
+
+  private requireExactAgentSessionTuple(
+    session: AgentSessionRow,
+    input: {
+      agentId: string;
+      ownerMemberId: string;
+      delegationId: string;
+      deviceId: string;
+      runnerEpoch: number;
+      presetRevision: number;
+    },
+    tokenHash: string,
+  ): void {
+    if (
+      session.agentId !== input.agentId ||
+      session.ownerMemberId !== input.ownerMemberId ||
+      session.delegationId !== input.delegationId ||
+      session.deviceId !== input.deviceId ||
+      session.runnerEpoch !== input.runnerEpoch ||
+      session.presetRevision !== input.presetRevision ||
+      !constantTimeEquals(session.tokenHash, tokenHash)
+    ) {
+      throw new Error("session token binding does not match");
+    }
+  }
+
   private expireAgentClaims(agentId: string, now: number): void {
     const expired = this.ctx.storage.sql
       .exec<{ id: string; attempt_count: number; execution_started_at: number | null }>(
@@ -3602,7 +4249,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         const retryAt = now + (backoff[Math.min(item.attempt_count - 1, backoff.length - 1)] ?? 600_000);
         this.ctx.storage.sql.exec(
           `UPDATE agent_queue SET execution_state = 'pending', not_before = ?,
-             lease_connection_id = NULL, lease_session_id = NULL, lease_token_hash = NULL,
+             lease_connection_id = NULL, lease_agent_session_id = NULL,
+             lease_session_id = NULL, lease_token_hash = NULL,
              lease_expires_at = NULL, execution_started_at = NULL, claim_id = NULL
            WHERE id = ? AND execution_state = 'claimed'`,
           retryAt,
@@ -3662,23 +4310,38 @@ export class Workspace extends DurableObject<CloudflareEnv> {
 
   private async authorizeAgentLease(
     input: AgentLeaseProof & { now: number },
+    toolName: "agent_start" | "agent_renew" | "agent_complete",
     allowCompleted = false,
-  ): Promise<{ agent: AgentRow; leaseTokenHash: string }> {
+  ): Promise<{ agent: AgentRow; leaseTokenHash: string; credential: AgentToolCredential }> {
     const leaseTokenHash = await hashSecret(input.leaseToken);
     const actor = this.authorizeActor(input.actor);
-    const agent = this.requireOwnedAgentArgument(input.agent, actor.id);
+    let agent = this.requireOwnedAgentArgument(input.agent, actor.id);
     if (agent.status !== "active") throw new Error("agent is not active");
-    this.requireLiveMcpConnection(input.connectionId, actor.id);
+    const credential = await this.authorizeAgentToolCredential({
+      actor: input.actor,
+      agentId: agent.id,
+      connectionId: input.connectionId,
+      sessionToken: input.sessionToken,
+      toolName,
+      now: input.now,
+    });
+    this.authorizeActor(input.actor);
+    agent = this.requireOwnedAgentArgument(input.agent, actor.id);
+    if (agent.status !== "active") throw new Error("agent is not active");
+    if (credential.kind === "session" && input.sessionId !== credential.sessionId) {
+      throw new Error("runner session id does not match the session token");
+    }
     const row = this.ctx.storage.sql
       .exec<{
         execution_state: string;
         lease_connection_id: string | null;
+        lease_agent_session_id: string | null;
         lease_session_id: string | null;
         lease_generation: number;
         lease_token_hash: string | null;
         lease_expires_at: number | null;
       }>(
-        `SELECT execution_state, lease_connection_id, lease_session_id, lease_generation,
+        `SELECT execution_state, lease_connection_id, lease_agent_session_id, lease_session_id, lease_generation,
                 lease_token_hash, lease_expires_at
          FROM agent_queue WHERE id = ? AND agent_id = ?`,
         input.itemId,
@@ -3689,7 +4352,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       throw new Error("stale agent lease");
     }
     if (
-      row.lease_connection_id !== input.connectionId ||
+      row.lease_connection_id !== credential.connectionId ||
+      row.lease_agent_session_id !== credential.sessionId ||
       row.lease_session_id !== input.sessionId ||
       row.lease_generation !== input.leaseGeneration ||
       row.lease_token_hash === null ||
@@ -3698,12 +4362,13 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     ) {
       throw new Error("stale agent lease");
     }
-    return { agent, leaseTokenHash };
+    return { agent, leaseTokenHash, credential };
   }
 
   private async sendAttributedMcpMessage(input: {
     actor: Actor;
-    connectionId: string;
+    connectionId?: string | null;
+    sessionToken?: string | null;
     agentArgument: string | null;
     idempotencyKey: string;
     channelId: string;
@@ -3718,13 +4383,38 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     // membership, owner, connection and scope decision below is therefore made
     // after the last await and cannot go stale before the transaction commits.
     const bodyDigest = await hashSecret(body);
-    const actor = this.authorizeActor(input.actor);
-    const connection = readOauthConnection(this.ctx.storage, input.connectionId);
-    if (connection === null || connection.revokedAt !== null || connection.memberId !== actor.id) {
-      throw new Error("MCP connection is no longer active");
-    }
-    const agent = input.agentArgument === null ? null : this.requireOwnedAgentArgument(input.agentArgument, actor.id);
+    let actor = this.authorizeActor(input.actor);
+    let agent = input.agentArgument === null ? null : this.requireOwnedAgentArgument(input.agentArgument, actor.id);
     if (agent !== null && agent.status !== "active") throw new Error("agent is not active");
+    const credential = agent === null
+      ? await this.authorizeAgentToolCredential({
+          actor: input.actor,
+          agentId: "",
+          connectionId: input.connectionId,
+          toolName: "post_message",
+          now: input.now,
+        })
+      : await this.authorizeAgentToolCredential({
+          actor: input.actor,
+          agentId: agent.id,
+          connectionId: input.connectionId,
+          sessionToken: input.sessionToken,
+          toolName: "agent_post",
+          now: input.now,
+        });
+    actor = this.authorizeActor(input.actor);
+    agent = input.agentArgument === null ? null : this.requireOwnedAgentArgument(input.agentArgument, actor.id);
+    if (agent !== null && agent.status !== "active") throw new Error("agent is not active");
+    const connection = credential.kind === "oauth"
+      ? readOauthConnection(this.ctx.storage, credential.connectionId)
+      : null;
+    if (credential.kind === "oauth" && connection === null) throw new Error("MCP connection is no longer active");
+    if (credential.kind === "session") {
+      const delegation = this.requireLiveDelegation(credential.delegationId, input.now);
+      if (!delegationAllowsChannel(delegation.channelIds, input.channelId)) {
+        throw new Error("delegation does not include this room");
+      }
+    }
     const channel = this.requireChannelParticipant(input.channelId, actor.id);
     if (channel.archivedAt !== null) throw new Error("this room is archived");
     if (
@@ -3751,7 +4441,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         now: input.now,
       },
       () => {
-        this.consumeMcpWrite(input.connectionId, agent?.id ?? "", input.now);
+        if (credential.kind === "oauth") {
+          this.consumeMcpWrite(credential.connectionId, agent?.id ?? "", input.now);
+        } else {
+          this.consumeAgentSessionWrite(credential.sessionId, agent!.id, input.now);
+        }
         const messageId = crypto.randomUUID();
         const channelSequence = nextChannelSequence(this.ctx.storage, channel.id);
         const mentions = resolveMentionTargets(this.ctx.storage, parseMentions(body));
@@ -3782,15 +4476,30 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           isHistorical: false,
           now: input.now,
         });
-        insertMcpMessageAttribution(this.ctx.storage, {
-          messageId,
-          connectionId: connection.id,
-          operatingMemberId: actor.id,
-          agentId: agent?.id ?? null,
-          clientId: connection.clientId,
-          clientName: connection.clientName,
-          createdAt: input.now,
-        });
+        if (credential.kind === "oauth" && connection !== null) {
+          insertMcpMessageAttribution(this.ctx.storage, {
+            messageId,
+            connectionId: connection.id,
+            sessionId: null,
+            delegationId: null,
+            operatingMemberId: actor.id,
+            agentId: agent?.id ?? null,
+            clientId: connection.clientId,
+            clientName: connection.clientName,
+            deviceId: null,
+            createdAt: input.now,
+          });
+        } else if (credential.kind === "session") {
+          insertAgentSessionMessageAttribution(this.ctx.storage, {
+            messageId,
+            sessionId: credential.sessionId,
+            delegationId: credential.delegationId,
+            operatingMemberId: actor.id,
+            agentId: agent!.id,
+            deviceId: credential.deviceId,
+            createdAt: input.now,
+          });
+        }
         return {
           result: {
             messageId,
@@ -3811,8 +4520,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
               metadata: {
                 channel_id: channel.id,
                 in_thread: threadRootId !== null,
-                connection_id: connection.id,
-                client_id: connection.clientId,
+                connection_id: credential.connectionId,
+                agent_session_id: credential.sessionId,
+                delegation_id: credential.delegationId,
+                client_id: connection?.clientId ?? `runner:${credential.deviceId}`,
                 operating_agent_id: agent?.id ?? null,
                 agent_work_enqueued: enqueued,
               },
@@ -3877,6 +4588,33 @@ export class Workspace extends DurableObject<CloudflareEnv> {
        ON CONFLICT(connection_id, agent_id) DO UPDATE SET
          window_started_at = excluded.window_started_at, write_count = excluded.write_count`,
       connectionId,
+      agentId,
+      next.windowStartedAt,
+      next.writeCount,
+    );
+  }
+
+  private consumeAgentSessionWrite(sessionId: string, agentId: string, now: number): void {
+    const current = this.ctx.storage.sql
+      .exec<{ window_started_at: number; write_count: number }>(
+        `SELECT window_started_at, write_count FROM agent_session_write_limits
+         WHERE session_id = ? AND agent_id = ?`,
+        sessionId,
+        agentId,
+      )
+      .toArray()[0];
+    const next = nextMcpWriteWindow({
+      now,
+      windowStartedAt: current?.window_started_at ?? null,
+      writeCount: current?.write_count ?? 0,
+    });
+    if (!next.allowed) throw new Error(`rate limited; retry after ${next.retryAfterMs} ms`);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO agent_session_write_limits(session_id, agent_id, window_started_at, write_count)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(session_id, agent_id) DO UPDATE SET
+         window_started_at = excluded.window_started_at, write_count = excluded.write_count`,
+      sessionId,
       agentId,
       next.windowStartedAt,
       next.writeCount,
@@ -4378,6 +5116,78 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         scope: connection.scope,
         clientId: connection.clientId,
         clientName: connection.clientName,
+      },
+    };
+  }
+
+  /** Authenticate either an attended OAuth connection or an unattended session. */
+  async authenticateMcpToken(input: {
+    token: string;
+    audience: string;
+    now: number;
+    toolName?: McpToolName;
+    requiredScope?: SupportedScope;
+  }): Promise<McpPrincipalResult> {
+    const parsed = parseToken(input.token);
+    if (parsed?.kind === "at") {
+      const authenticated = await this.authenticateOauthToken({
+        accessToken: input.token,
+        audience: input.audience,
+        now: input.now,
+        requiredScope: input.requiredScope,
+      });
+      return authenticated.ok
+        ? { ok: true, principal: { ...authenticated.principal, credentialKind: "oauth" } }
+        : authenticated;
+    }
+    const slug = this.workspaceSlug();
+    if (slug === null || parsed?.kind !== "st" || parsed.workspaceSlug !== slug) {
+      return { ok: false, error: "invalid_token", description: "unknown token" };
+    }
+    const tokenHash = await hashSecret(input.token);
+    const stored = this.ctx.storage.sql
+      .exec<{ id: string }>("SELECT id FROM agent_sessions WHERE token_hash = ?", tokenHash)
+      .toArray()[0];
+    if (stored === undefined) return { ok: false, error: "invalid_token", description: "unknown token" };
+    let session: AgentSessionRow;
+    let delegation: AgentDelegation;
+    let owner: ActiveMember;
+    try {
+      session = this.requireLiveAgentSessionById(stored.id, input.now);
+      delegation = this.requireLiveDelegation(session.delegationId, input.now);
+      owner = this.requireLiveSessionOwner(session, delegation);
+    } catch {
+      return { ok: false, error: "invalid_token", description: "session authority is no longer current" };
+    }
+    if (!constantTimeEquals(session.tokenHash, tokenHash)) {
+      return { ok: false, error: "invalid_token", description: "unknown token" };
+    }
+    if (input.toolName !== undefined && !sessionAllowsTool(session.capabilities, input.toolName)) {
+      return { ok: false, error: "insufficient_scope", description: `session cannot call ${input.toolName}` };
+    }
+    const agent = readAgent(this.ctx.storage, session.agentId);
+    if (agent === null) return { ok: false, error: "invalid_token", description: "session agent no longer exists" };
+    this.ctx.storage.sql.exec("UPDATE agent_sessions SET last_used_at = ? WHERE id = ?", input.now, session.id);
+    return {
+      ok: true,
+      principal: {
+        credentialKind: "session",
+        sessionId: session.id,
+        delegationId: delegation.id,
+        agentId: agent.id,
+        agentHandle: agent.handle,
+        memberId: owner.id,
+        handle: owner.handle,
+        displayName: owner.displayName,
+        role: owner.role,
+        authorizationEpoch: delegation.ownerAuthorizationEpoch,
+        capabilities: session.capabilities,
+        channelIds: delegation.channelIds,
+        deviceId: session.deviceId,
+        runnerEpoch: session.runnerEpoch,
+        presetRevision: session.presetRevision,
+        clientId: `runner:${session.deviceId}`,
+        clientName: "Lepidy runner",
       },
     };
   }

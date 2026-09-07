@@ -632,6 +632,74 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       ) STRICT`,
     ],
   },
+  {
+    version: 17,
+    name: "Delegations and scoped agent sessions",
+    statements: [
+      `CREATE TABLE agent_delegations (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        owner_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        owner_authorization_epoch INTEGER NOT NULL,
+        channel_ids_json TEXT CHECK (channel_ids_json IS NULL OR json_valid(channel_ids_json)),
+        credential_ids_json TEXT NOT NULL CHECK (json_valid(credential_ids_json)),
+        delivery_modes_json TEXT NOT NULL CHECK (json_valid(delivery_modes_json)),
+        project_ids_json TEXT NOT NULL CHECK (json_valid(project_ids_json)),
+        spend_cap_daily_cents INTEGER CHECK (spend_cap_daily_cents IS NULL OR spend_cap_daily_cents >= 0),
+        spend_cap_monthly_cents INTEGER CHECK (spend_cap_monthly_cents IS NULL OR spend_cap_monthly_cents >= 0),
+        rate_limit_per_hour INTEGER CHECK (rate_limit_per_hour IS NULL OR rate_limit_per_hour > 0),
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL CHECK (expires_at > created_at),
+        revoked_at INTEGER,
+        revoked_reason TEXT
+      ) STRICT`,
+      `CREATE INDEX agent_delegations_live_idx
+         ON agent_delegations(agent_id, owner_member_id, expires_at, revoked_at)`,
+      `CREATE TABLE agent_sessions (
+        id TEXT PRIMARY KEY,
+        delegation_id TEXT NOT NULL REFERENCES agent_delegations(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        owner_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL,
+        runner_epoch INTEGER NOT NULL CHECK (runner_epoch >= 0),
+        preset_revision INTEGER NOT NULL CHECK (preset_revision >= 0),
+        capabilities_json TEXT NOT NULL CHECK (json_valid(capabilities_json)),
+        token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
+        token_expires_at INTEGER NOT NULL,
+        hard_expires_at INTEGER NOT NULL,
+        rotation_count INTEGER NOT NULL DEFAULT 0 CHECK (rotation_count >= 0),
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER,
+        revoked_at INTEGER,
+        revoked_reason TEXT,
+        CHECK (token_expires_at <= hard_expires_at),
+        CHECK (hard_expires_at > created_at)
+      ) STRICT`,
+      `CREATE UNIQUE INDEX agent_sessions_one_live_agent_idx
+         ON agent_sessions(agent_id) WHERE revoked_at IS NULL`,
+      `CREATE INDEX agent_sessions_delegation_idx ON agent_sessions(delegation_id, revoked_at)`,
+      // A session lease is mutually exclusive with A03's attended OAuth lease.
+      // SQLite cannot add the cross-column CHECK to the historical table, so
+      // every writer enforces the XOR and integration tests inspect the row.
+      `ALTER TABLE agent_queue ADD COLUMN lease_agent_session_id TEXT REFERENCES agent_sessions(id) ON DELETE SET NULL`,
+      `CREATE TABLE agent_session_message_attribution (
+        message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE RESTRICT,
+        delegation_id TEXT NOT NULL REFERENCES agent_delegations(id) ON DELETE RESTRICT,
+        operating_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+        device_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE TABLE agent_session_write_limits (
+        session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        window_started_at INTEGER NOT NULL,
+        write_count INTEGER NOT NULL CHECK (write_count >= 0),
+        PRIMARY KEY (session_id, agent_id)
+      ) STRICT`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

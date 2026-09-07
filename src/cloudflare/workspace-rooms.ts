@@ -60,11 +60,14 @@ export type MessageRow = {
 };
 
 export type McpMessageAttribution = {
-  connectionId: string;
+  connectionId: string | null;
+  sessionId: string | null;
+  delegationId: string | null;
   operatingMemberId: string;
   agentId: string | null;
   clientId: string;
   clientName: string | null;
+  deviceId: string | null;
 };
 
 export type MessageForwardSource = {
@@ -1486,16 +1489,21 @@ export function visibleAgentQueueDepth(
   storage: DurableObjectStorage,
   agentId: string,
   memberId: string,
+  allowedChannelIds: readonly string[] | null = null,
 ): number {
+  const allowedJson = allowedChannelIds === null ? null : JSON.stringify(allowedChannelIds);
   return storage.sql
     .exec<{ depth: number }>(
       `SELECT COUNT(*) AS depth
        FROM agent_queue q JOIN channels c ON c.id = q.channel_id JOIN messages m ON m.id = q.message_id
        WHERE q.agent_id = ? AND q.read_at IS NULL AND m.deleted_at IS NULL
+         AND (? IS NULL OR q.channel_id IN (SELECT value FROM json_each(?)))
          AND (c.kind = 'public' OR EXISTS (
            SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_id = ?
          ))`,
       agentId,
+      allowedJson,
+      allowedJson,
       memberId,
     )
     .one().depth;
@@ -1532,10 +1540,12 @@ export function pageAgentQueue(
     unreadOnly: boolean;
     order: "oldest" | "newest";
     cursor: AgentQueueCursor | null;
+    allowedChannelIds?: readonly string[] | null;
   },
 ): AgentQueuePage {
   const direction = input.order === "oldest" ? "ASC" : "DESC";
   const comparator = input.order === "oldest" ? ">" : "<";
+  const allowedJson = input.allowedChannelIds == null ? null : JSON.stringify(input.allowedChannelIds);
   const rows = storage.sql
     .exec<{
       id: string;
@@ -1555,6 +1565,7 @@ export function pageAgentQueue(
        WHERE q.agent_id = ?
          AND (? = 0 OR q.read_at IS NULL)
          AND m.deleted_at IS NULL
+         AND (? IS NULL OR q.channel_id IN (SELECT value FROM json_each(?)))
          AND (c.kind = 'public' OR EXISTS (
            SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_id = ?
          ))
@@ -1563,6 +1574,8 @@ export function pageAgentQueue(
        LIMIT ?`,
       input.agentId,
       input.unreadOnly ? 1 : 0,
+      allowedJson,
+      allowedJson,
       input.memberId,
       input.cursor?.enqueuedAt ?? null,
       input.cursor?.enqueuedAt ?? 0,
@@ -1623,6 +1636,32 @@ export function insertMcpMessageAttribution(
   );
 }
 
+export function insertAgentSessionMessageAttribution(
+  storage: DurableObjectStorage,
+  input: {
+    messageId: string;
+    sessionId: string;
+    delegationId: string;
+    operatingMemberId: string;
+    agentId: string;
+    deviceId: string;
+    createdAt: number;
+  },
+): void {
+  storage.sql.exec(
+    `INSERT INTO agent_session_message_attribution(
+       message_id, session_id, delegation_id, operating_member_id, agent_id, device_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    input.messageId,
+    input.sessionId,
+    input.delegationId,
+    input.operatingMemberId,
+    input.agentId,
+    input.deviceId,
+    input.createdAt,
+  );
+}
+
 export function readMcpMessageAttributions(
   storage: DurableObjectStorage,
   messageIds: readonly string[],
@@ -1647,10 +1686,38 @@ export function readMcpMessageAttributions(
     .toArray()) {
     result.set(row.message_id, {
       connectionId: row.connection_id,
+      sessionId: null,
+      delegationId: null,
       operatingMemberId: row.operating_member_id,
       agentId: row.agent_id,
       clientId: row.client_id,
       clientName: row.client_name_snapshot,
+      deviceId: null,
+    });
+  }
+  for (const row of storage.sql
+    .exec<{
+      message_id: string;
+      session_id: string;
+      delegation_id: string;
+      operating_member_id: string;
+      agent_id: string;
+      device_id: string;
+    }>(
+      `SELECT message_id, session_id, delegation_id, operating_member_id, agent_id, device_id
+       FROM agent_session_message_attribution WHERE message_id IN (${placeholders})`,
+      ...messageIds,
+    )
+    .toArray()) {
+    result.set(row.message_id, {
+      connectionId: null,
+      sessionId: row.session_id,
+      delegationId: row.delegation_id,
+      operatingMemberId: row.operating_member_id,
+      agentId: row.agent_id,
+      clientId: `runner:${row.device_id}`,
+      clientName: "Lepidy runner",
+      deviceId: row.device_id,
     });
   }
   return result;

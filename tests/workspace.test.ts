@@ -12,7 +12,7 @@ describe("Workspace Durable Object migrations", () => {
 
     await expect(stub.health()).resolves.toEqual({
       ok: true,
-      schemaVersion: 16,
+      schemaVersion: 17,
       status: "ready",
       error: null,
     });
@@ -30,7 +30,7 @@ describe("Workspace Durable Object migrations", () => {
         .toArray()
         .map(({ name }) => name);
 
-      expect(schemaRows).toEqual([{ singleton: 1, version: 16, status: "ready" }]);
+      expect(schemaRows).toEqual([{ singleton: 1, version: 17, status: "ready" }]);
       expect(tables).toEqual(
         expect.arrayContaining([
           "members",
@@ -64,12 +64,16 @@ describe("Workspace Durable Object migrations", () => {
           "oauth_connections",
           "mcp_message_attribution",
           "mcp_write_limits",
+          "agent_delegations",
+          "agent_sessions",
+          "agent_session_message_attribution",
+          "agent_session_write_limits",
         ]),
       );
     });
   });
 
-  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])("MIGRATION-INT-001 upgrades a historical version-%s workspace", async (version) => {
+  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])("MIGRATION-INT-001 upgrades a historical version-%s workspace", async (version) => {
     const stub = env.MIGRATION_FIXTURE.getByName(`historical-v${version}`);
 
     await expect(stub.migrateThrough(version)).resolves.toEqual({
@@ -78,12 +82,12 @@ describe("Workspace Durable Object migrations", () => {
       error: null,
     });
     await expect(stub.migrateCurrent()).resolves.toEqual({
-      version: 16,
+      version: 17,
       status: "ready",
       error: null,
     });
     await expect(stub.migrateCurrent()).resolves.toEqual({
-      version: 16,
+      version: 17,
       status: "ready",
       error: null,
     });
@@ -113,7 +117,7 @@ describe("Workspace Durable Object migrations", () => {
     });
 
     await expect(healthy.migrateCurrent()).resolves.toEqual({
-      version: 16,
+      version: 17,
       status: "ready",
       error: null,
     });

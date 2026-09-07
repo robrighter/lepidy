@@ -1,4 +1,4 @@
-import type { Actor, McpAttribution, OauthPrincipal, Workspace } from "@/src/cloudflare/workspace";
+import type { Actor, McpAttribution, McpPrincipal, Workspace } from "@/src/cloudflare/workspace";
 import {
   MCP_TOOL_DEFINITIONS,
   bearerChallenge,
@@ -13,7 +13,7 @@ import {
 import { oauthEnvironment, requestOrigin, resolveWorkspaceBySlug } from "@/src/shell/oauth-server";
 
 export async function GET(request: Request, context: { params: Promise<{ slug: string }> }) {
-  return handle(request, context, undefined, () =>
+  return handle(request, context, undefined, undefined, () =>
     Response.json({ error: "this endpoint answers JSON-RPC over POST" }, { status: 405 }),
   );
 }
@@ -23,10 +23,10 @@ export async function POST(request: Request, context: { params: Promise<{ slug: 
   try {
     body = await request.json();
   } catch {
-    return handle(request, context, undefined, () => jsonRpcError(null, -32700, "the body is not JSON"));
+    return handle(request, context, undefined, undefined, () => jsonRpcError(null, -32700, "the body is not JSON"));
   }
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    return handle(request, context, undefined, () =>
+    return handle(request, context, undefined, undefined, () =>
       jsonRpcError(null, -32600, "a JSON-RPC request object is required"),
     );
   }
@@ -35,29 +35,33 @@ export async function POST(request: Request, context: { params: Promise<{ slug: 
   const parsedCall = message.method === "tools/call" ? parseMcpToolCall(message.params) : null;
   const requiredScope = parsedCall?.ok ? parsedCall.requiredScope : undefined;
 
-  return handle(request, context, requiredScope, async (principal, workspace) => {
+  return handle(request, context, parsedCall?.ok ? parsedCall.call.name : undefined, requiredScope, async (principal, workspace, bearerToken) => {
     switch (message.method) {
       case "initialize":
         return jsonRpcResult(id, {
           protocolVersion: "2025-06-18",
           capabilities: { tools: {} },
           serverInfo: { name: "lepidy", version: "0.1.0" },
-          instructions:
-            `Connected to Lepidy as @${principal.handle}. Agent tools act only for agents you own; ` +
-            "room reads and writes always use your current membership.",
+          instructions: principal.credentialKind === "session"
+            ? `Running @${principal.agentHandle} under @${principal.handle}'s delegation ${principal.delegationId}. ` +
+              "Every tool is limited to this session's capabilities and delegated rooms."
+            : `Connected to Lepidy as @${principal.handle}. Agent tools act only for agents you own; ` +
+              "room reads and writes always use your current membership.",
         });
       case "notifications/initialized":
         return new Response(null, { status: 202 });
       case "tools/list":
         return jsonRpcResult(id, {
-          tools: MCP_TOOL_DEFINITIONS.map(({ requiredScope: _requiredScope, ...tool }) => tool),
+          tools: MCP_TOOL_DEFINITIONS
+            .filter((tool) => principal.credentialKind === "oauth" || principal.capabilities.includes(tool.name))
+            .map(({ requiredScope: _requiredScope, sessionCapable: _sessionCapable, ...tool }) => tool),
         });
       case "tools/call":
         if (parsedCall === null || !parsedCall.ok) {
           return jsonRpcError(id, -32602, parsedCall?.message ?? "invalid tool call");
         }
         try {
-          const data = await dispatchTool(workspace, principal, parsedCall.call.name, parsedCall.call.arguments);
+          const data = await dispatchTool(workspace, principal, bearerToken, parsedCall.call.name, parsedCall.call.arguments);
           return jsonRpcResult(id, toolResult(data, attribution(principal)));
         } catch (error) {
           return jsonRpcResult(id, toolResult({ error: toolError(error) }, attribution(principal), true));
@@ -72,7 +76,8 @@ type WorkspaceStub = DurableObjectStub<Workspace>;
 
 async function dispatchTool(
   workspace: WorkspaceStub,
-  principal: OauthPrincipal,
+  principal: McpPrincipal,
+  bearerToken: string,
   name: string,
   args: Record<string, unknown>,
 ): Promise<unknown> {
@@ -84,12 +89,20 @@ async function dispatchTool(
         handle: principal.handle,
         name: principal.displayName,
         role: principal.role,
-        connection_id: principal.connectionId,
+        connection_id: principal.credentialKind === "oauth" ? principal.connectionId : null,
+        session_id: principal.credentialKind === "session" ? principal.sessionId : null,
+        delegation_id: principal.credentialKind === "session" ? principal.delegationId : null,
+        agent_id: principal.credentialKind === "session" ? principal.agentId : null,
         client: principal.clientName ?? principal.clientId,
       };
     case "list_channels": {
       const listed = await workspace.browseChannels({ actor });
-      const visible = listed.channels.filter((channel) => channel.isMember);
+      const agent = principal.credentialKind === "session"
+        ? delegatedAgent(await workspace.listAgents({ actor }), principal)
+        : null;
+      const visible = principal.credentialKind === "session" && agent !== null
+        ? listed.channels.filter((channel) => channel.isMember && sessionChannelAllowed(principal, agent, channel.id))
+        : listed.channels.filter((channel) => channel.isMember);
       return {
         channels: visible
           .filter((channel) => channel.kind === "public" || channel.kind === "private")
@@ -108,6 +121,7 @@ async function dispatchTool(
       };
     }
     case "read_channel": {
+      await assertSessionChannel(workspace, principal, actor, args.channel_id as string);
       const page = await workspace.readMcpChannelHistory({
         actor,
         channelId: args.channel_id as string,
@@ -123,12 +137,14 @@ async function dispatchTool(
         cursor: (args.cursor as string | undefined) ?? null,
         limit: args.limit as number | undefined,
       });
+      if (page.messages[0]) await assertSessionChannel(workspace, principal, actor, page.messages[0].channelId);
       return messagePage(page);
     }
     case "post_message": {
+      const connectionId = oauthConnectionId(principal);
       const posted = await workspace.postMcpMessage({
         actor,
-        connectionId: principal.connectionId,
+        connectionId,
         idempotencyKey: args.idempotency_key as string,
         channelId: args.channel_id as string,
         bodyMarkdown: args.content as string,
@@ -140,7 +156,9 @@ async function dispatchTool(
     case "list_agents": {
       const listed = await workspace.listAgents({ actor });
       return {
-        agents: listed.agents.filter((agent) => agent.isOwner).map((agent) => ({
+        agents: listed.agents
+          .filter((agent) => agent.isOwner && (principal.credentialKind === "oauth" || agent.id === principal.agentId))
+          .map((agent) => ({
           id: agent.id,
           handle: `@${agent.handle}`,
           name: agent.displayName,
@@ -153,6 +171,7 @@ async function dispatchTool(
       };
     }
     case "agent_inbox": {
+      assertSessionAgent(principal, args.agent as string);
       const cursorValue = args.cursor;
       const cursor = cursorValue === undefined ? null : parseAgentQueueCursor(cursorValue);
       if (cursorValue !== undefined && cursor === null) throw new Error("invalid queue cursor");
@@ -164,6 +183,7 @@ async function dispatchTool(
         order: (args.order as "oldest" | "newest" | undefined) ?? "newest",
         cursor,
         peek: args.peek === true,
+        allowedChannelIds: principal.credentialKind === "session" ? principal.channelIds : null,
         now: Date.now(),
       });
       const brief = await workspace.readAgentBrief({ actor, agentId: page.agent.id });
@@ -176,9 +196,10 @@ async function dispatchTool(
       };
     }
     case "agent_next": {
+      assertSessionAgent(principal, args.agent as string);
       const claimed = await workspace.claimAgentWork({
         actor,
-        connectionId: principal.connectionId,
+        ...agentCredential(principal, bearerToken),
         agent: args.agent as string,
         claimId: args.claim_id as string,
         leaseToken: args.lease_token as string,
@@ -191,22 +212,25 @@ async function dispatchTool(
         : { item: queueItem(claimed.item), lease: claimed.lease, replayed: claimed.replayed };
     }
     case "agent_start": {
+      assertSessionAgent(principal, args.agent as string);
       const started = await workspace.markAgentExecutionStarted({
-        ...leaseProof(actor, principal.connectionId, args),
+        ...leaseProof(actor, principal, bearerToken, args),
         now: Date.now(),
       });
       return { item_id: args.item_id, started_at: started.startedAt };
     }
     case "agent_renew": {
+      assertSessionAgent(principal, args.agent as string);
       const renewed = await workspace.renewAgentLease({
-        ...leaseProof(actor, principal.connectionId, args),
+        ...leaseProof(actor, principal, bearerToken, args),
         now: Date.now(),
       });
       return { item_id: args.item_id, lease_expires_at: renewed.leaseExpiresAt };
     }
     case "agent_complete": {
+      assertSessionAgent(principal, args.agent as string);
       const completed = await workspace.completeAgentWork({
-        ...leaseProof(actor, principal.connectionId, args),
+        ...leaseProof(actor, principal, bearerToken, args),
         completionId: args.completion_id as string,
         outputDigest: args.output_digest as string,
         result: (args.result as Record<string, unknown> | undefined) ?? null,
@@ -216,19 +240,23 @@ async function dispatchTool(
     }
     case "agent_mark_read":
     case "agent_mark_unread": {
+      assertSessionAgent(principal, args.agent as string);
       const changed = await workspace.setAgentQueueDisplayState({
         actor,
         agent: args.agent as string,
         itemId: args.item_id as string,
         read: name === "agent_mark_read",
+        allowedChannelIds: principal.credentialKind === "session" ? principal.channelIds : null,
         now: Date.now(),
       });
       return { item_id: args.item_id, read: name === "agent_mark_read", changed: changed.changed };
     }
     case "agent_post": {
+      assertSessionAgent(principal, args.agent as string);
+      await assertSessionChannel(workspace, principal, actor, args.channel_id as string);
       const posted = await workspace.postMcpAgentMessage({
         actor,
-        connectionId: principal.connectionId,
+        ...agentCredential(principal, bearerToken),
         agent: args.agent as string,
         idempotencyKey: args.idempotency_key as string,
         channelId: args.channel_id as string,
@@ -239,12 +267,14 @@ async function dispatchTool(
       return postResult(posted);
     }
     case "agent_get_prompt": {
+      assertSessionAgent(principal, args.agent as string);
       const listed = await workspace.listAgents({ actor });
       const agent = resolveOwnedAgent(listed.agents, args.agent as string);
       const brief = await workspace.readAgentBrief({ actor, agentId: agent.id });
       return { agent: { id: agent.id, handle: `@${agent.handle}` }, tiers: brief.tiers, preamble_version: brief.preambleVersion };
     }
     case "agent_set_prompt": {
+      oauthConnectionId(principal);
       const listed = await workspace.listAgents({ actor });
       const agent = resolveOwnedAgent(listed.agents, args.agent as string);
       const updated = await workspace.setAgentBrief({ actor, agentId: agent.id, prompt: args.prompt as string | null, now: Date.now() });
@@ -276,9 +306,12 @@ function messagePage(page: Awaited<ReturnType<WorkspaceStub["readChannelHistory"
       mcp_attribution: message.mcpAttribution
         ? {
             connection_id: message.mcpAttribution.connectionId,
+            session_id: message.mcpAttribution.sessionId,
+            delegation_id: message.mcpAttribution.delegationId,
             operating_member_id: message.mcpAttribution.operatingMemberId,
             agent_id: message.mcpAttribution.agentId,
             client: message.mcpAttribution.clientName ?? message.mcpAttribution.clientId,
+            device_id: message.mcpAttribution.deviceId,
           }
         : null,
     })),
@@ -303,10 +336,10 @@ function postResult(posted: { messageId: string; channelId: string; threadRootId
   return { message_id: posted.messageId, channel_id: posted.channelId, parent_id: posted.threadRootId, replayed: posted.replayed };
 }
 
-function leaseProof(actor: Actor, connectionId: string, args: Record<string, unknown>) {
+function leaseProof(actor: Actor, principal: McpPrincipal, bearerToken: string, args: Record<string, unknown>) {
   return {
     actor,
-    connectionId,
+    ...agentCredential(principal, bearerToken),
     agent: args.agent as string,
     itemId: args.item_id as string,
     sessionId: args.session_id as string,
@@ -315,18 +348,76 @@ function leaseProof(actor: Actor, connectionId: string, args: Record<string, unk
   };
 }
 
-function actorFrom(principal: OauthPrincipal): Actor {
+function actorFrom(principal: McpPrincipal): Actor {
   return { memberId: principal.memberId, authorizationEpoch: principal.authorizationEpoch };
 }
 
-function attribution(principal: OauthPrincipal): McpAttribution {
+function attribution(principal: McpPrincipal): McpAttribution {
   return {
-    connectionId: principal.connectionId,
+    connectionId: principal.credentialKind === "oauth" ? principal.connectionId : null,
+    sessionId: principal.credentialKind === "session" ? principal.sessionId : null,
+    delegationId: principal.credentialKind === "session" ? principal.delegationId : null,
     memberId: principal.memberId,
     memberHandle: principal.handle,
     clientId: principal.clientId,
     clientName: principal.clientName,
+    deviceId: principal.credentialKind === "session" ? principal.deviceId : null,
   };
+}
+
+function oauthConnectionId(principal: McpPrincipal): string {
+  if (principal.credentialKind !== "oauth") throw new Error("this tool is not available to an unattended session");
+  return principal.connectionId;
+}
+
+function agentCredential(principal: McpPrincipal, bearerToken: string) {
+  return principal.credentialKind === "oauth"
+    ? { connectionId: principal.connectionId }
+    : { connectionId: null, sessionToken: bearerToken };
+}
+
+type AgentView = {
+  id: string;
+  handle: string;
+  isOwner: boolean;
+  scopeMode: "any" | "listed";
+  scopeChannelIds: readonly string[];
+};
+
+function delegatedAgent(listed: { agents: readonly AgentView[] }, principal: Extract<McpPrincipal, { credentialKind: "session" }>): AgentView {
+  const agent = listed.agents.find((candidate) => candidate.isOwner && candidate.id === principal.agentId);
+  if (!agent) throw new Error("session agent is no longer owned by this member");
+  return agent;
+}
+
+function sessionChannelAllowed(
+  principal: Extract<McpPrincipal, { credentialKind: "session" }>,
+  agent: AgentView,
+  channelId: string,
+): boolean {
+  return (
+    (principal.channelIds === null || principal.channelIds.includes(channelId)) &&
+    (agent.scopeMode === "any" || agent.scopeChannelIds.includes(channelId))
+  );
+}
+
+async function assertSessionChannel(
+  workspace: WorkspaceStub,
+  principal: McpPrincipal,
+  actor: Actor,
+  channelId: string,
+): Promise<void> {
+  if (principal.credentialKind !== "session") return;
+  const agent = delegatedAgent(await workspace.listAgents({ actor }), principal);
+  if (!sessionChannelAllowed(principal, agent, channelId)) throw new Error("delegation does not include this room");
+}
+
+function assertSessionAgent(principal: McpPrincipal, argument: string): void {
+  if (principal.credentialKind !== "session") return;
+  const normalized = argument.startsWith("@") ? argument.slice(1) : argument;
+  if (normalized !== principal.agentId && normalized !== principal.agentHandle) {
+    throw new Error("session token does not match this agent");
+  }
 }
 
 function toolResult(data: unknown, source: McpAttribution, isError = false) {
@@ -351,8 +442,9 @@ function toolError(error: unknown): string {
 async function handle(
   request: Request,
   context: { params: Promise<{ slug: string }> },
+  toolName: Parameters<WorkspaceStub["authenticateMcpToken"]>[0]["toolName"],
   requiredScope: SupportedScope | undefined,
-  next: (principal: OauthPrincipal, workspace: WorkspaceStub) => Response | Promise<Response>,
+  next: (principal: McpPrincipal, workspace: WorkspaceStub, bearerToken: string) => Response | Promise<Response>,
 ): Promise<Response> {
   const { slug } = await context.params;
   const origin = requestOrigin(request);
@@ -363,14 +455,15 @@ async function handle(
   if (workspace === null) return new Response(null, { status: 404 });
   const presented = bearerFromHeader(request.headers.get("authorization"));
   if (presented === null) return unauthorized(metadataUrl);
-  const verified = await workspace.stub.authenticateOauthToken({
-    accessToken: presented,
+  const verified = await workspace.stub.authenticateMcpToken({
+    token: presented,
     audience: workspaceResourceUri(origin, slug),
     now: Date.now(),
+    toolName,
     requiredScope,
   });
   if (!verified.ok) return unauthorized(metadataUrl, verified.error, verified.description);
-  return next(verified.principal, workspace.stub);
+  return next(verified.principal, workspace.stub, presented);
 }
 
 function unauthorized(metadataUrl: string, error?: "invalid_token" | "insufficient_scope", description?: string): Response {

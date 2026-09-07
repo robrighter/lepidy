@@ -33,7 +33,7 @@ export function randomSecret(bytes = 32): string {
 /** Every value we mint is greppable and says what it is. */
 export const TOKEN_PREFIX = "lpd";
 
-export type TokenKind = "code" | "at" | "rt";
+export type TokenKind = "code" | "at" | "rt" | "st";
 
 /** Access tokens are short; the connection, not the token, is the long-lived thing. */
 export const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
@@ -81,7 +81,7 @@ export function parseToken(value: unknown): ParsedToken | null {
   if (third < 0) return null;
 
   const kind = value.slice(first + 1, second);
-  if (kind !== "code" && kind !== "at" && kind !== "rt") return null;
+  if (kind !== "code" && kind !== "at" && kind !== "rt" && kind !== "st") return null;
 
   const workspaceSlug = value.slice(second + 1, third);
   if (!WORKSPACE_SLUG.test(workspaceSlug)) return null;
@@ -805,6 +805,8 @@ export type McpToolDefinition = {
   description: string;
   inputSchema: Record<string, unknown>;
   requiredScope: SupportedScope;
+  /** Whether an unattended runner session may ever receive this capability. */
+  sessionCapable: boolean;
 };
 
 const objectSchema = (
@@ -827,12 +829,14 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     description: "Return the workspace member and MCP connection this request acts as.",
     inputSchema: objectSchema({}),
     requiredScope: "chat:read",
+    sessionCapable: true,
   },
   {
     name: "list_channels",
     description: "List rooms and conversations the connected member has joined.",
     inputSchema: objectSchema({ include_dms: { type: "boolean" } }),
     requiredScope: "chat:read",
+    sessionCapable: true,
   },
   {
     name: "read_channel",
@@ -842,6 +846,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
       ["channel_id"],
     ),
     requiredScope: "chat:read",
+    sessionCapable: true,
   },
   {
     name: "read_thread",
@@ -851,6 +856,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
       ["message_id"],
     ),
     requiredScope: "chat:read",
+    sessionCapable: true,
   },
   {
     name: "post_message",
@@ -865,12 +871,14 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
       ["channel_id", "content", "idempotency_key"],
     ),
     requiredScope: "chat:write",
+    sessionCapable: false,
   },
   {
     name: "list_agents",
     description: "List only agents the connected member owns, with scope and unread depth.",
     inputSchema: objectSchema({}),
     requiredScope: "agent",
+    sessionCapable: true,
   },
   {
     name: "agent_inbox",
@@ -887,6 +895,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
       ["agent"],
     ),
     requiredScope: "agent",
+    sessionCapable: true,
   },
   {
     name: "agent_next",
@@ -903,18 +912,21 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
       ["agent", "claim_id", "lease_token", "session_id"],
     ),
     requiredScope: "agent",
+    sessionCapable: true,
   },
   {
     name: "agent_start",
     description: "Record execution start under the exact current lease before launching external work.",
     inputSchema: leaseProofSchema(),
     requiredScope: "agent",
+    sessionCapable: true,
   },
   {
     name: "agent_renew",
     description: "Renew the exact current fenced lease for another 60 seconds.",
     inputSchema: leaseProofSchema(),
     requiredScope: "agent",
+    sessionCapable: true,
   },
   {
     name: "agent_complete",
@@ -929,18 +941,21 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
       ["agent", "item_id", "session_id", "lease_generation", "lease_token", "completion_id", "output_digest"],
     ),
     requiredScope: "agent",
+    sessionCapable: true,
   },
   {
     name: "agent_mark_read",
     description: "Mark one item in an owned agent's display inbox read.",
     inputSchema: objectSchema({ agent: string("Agent id or a.handle"), item_id: string("Queue item id") }, ["agent", "item_id"]),
     requiredScope: "agent",
+    sessionCapable: true,
   },
   {
     name: "agent_mark_unread",
     description: "Mark one item in an owned agent's display inbox unread without changing execution state.",
     inputSchema: objectSchema({ agent: string("Agent id or a.handle"), item_id: string("Queue item id") }, ["agent", "item_id"]),
     requiredScope: "agent",
+    sessionCapable: true,
   },
   {
     name: "agent_post",
@@ -956,12 +971,14 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
       ["agent", "channel_id", "content", "idempotency_key"],
     ),
     requiredScope: "agent",
+    sessionCapable: true,
   },
   {
     name: "agent_get_prompt",
     description: "Return the security preamble and standing brief for an owned agent.",
     inputSchema: objectSchema({ agent: string("Agent id or a.handle") }, ["agent"]),
     requiredScope: "agent",
+    sessionCapable: true,
   },
   {
     name: "agent_set_prompt",
@@ -971,6 +988,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
       ["agent", "prompt"],
     ),
     requiredScope: "agent",
+    sessionCapable: false,
   },
 ] as const;
 

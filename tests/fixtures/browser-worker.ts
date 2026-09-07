@@ -39,6 +39,25 @@ export class Workspace extends ProductionWorkspace {
     this.ctx.storage.sql.exec("UPDATE messages SET author_kind = 'agent', author_id = 'fixture-agent', author_display_snapshot = 'a.releasebot' WHERE id = ?", agent.messageId);
     await this.reactToMessage({ actor, messageId: first.messageId, emoji: "👀", now });
   }
+
+  async seedDelegatedSession(actor: { memberId: string; authorizationEpoch: number }) {
+    const now = Date.now();
+    const allowed = await this.createChannel({ actor, idempotencyKey: `browser-session:allowed:${now}`, kind: "public", slug: `delegated-${String(now).slice(-6)}`, now });
+    const outside = await this.createChannel({ actor, idempotencyKey: `browser-session:outside:${now}`, kind: "public", slug: `outside-${String(now).slice(-6)}`, now });
+    const agent = await this.createAgent({ actor, idempotencyKey: `browser-session:agent:${now}`, handle: `runner${String(now).slice(-6)}`, now });
+    const root = await this.sendMessage({ actor, channelId: allowed.channelId, idempotencyKey: `browser-session:root:${now}`, bodyMarkdown: "Delegated session root", now });
+    const delegation = await this.createAgentDelegation({ actor, agent: agent.agentId, channelIds: [allowed.channelId], expiresAt: now + 60 * 60 * 1000, now });
+    const session = await this.startAgentSession({
+      actor,
+      delegationId: delegation.id,
+      deviceId: "browser-runner-device",
+      runnerEpoch: 1,
+      presetRevision: 1,
+      capabilities: ["whoami", "list_channels", "read_channel", "read_thread", "list_agents", "agent_post"],
+      now,
+    });
+    return { token: session.token, sessionId: session.sessionId, delegationId: delegation.id, agentId: agent.agentId, agentHandle: agent.handle, allowedChannelId: allowed.channelId, outsideChannelId: outside.channelId, rootMessageId: root.messageId };
+  }
 }
 
 export default {
@@ -54,12 +73,15 @@ export default {
       }
       return Response.json(counts);
     }
-    if (["/__fixture/seed", "/__fixture/bulk", "/__fixture/workspace-counts"].includes(url.pathname) && request.method === "POST") {
+    if (["/__fixture/seed", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/session-token"].includes(url.pathname) && request.method === "POST") {
       const authorization = new AuthorizationService(env.CONTROL_DB, env.WORKSPACE);
       const resolved = await resolveViewerWorkspace({ db: env.CONTROL_DB, workspaces: env.WORKSPACE, authenticateSession: (token) => authorization.authenticateBrowserSession(token) }, request.headers.get("authorization"));
       if (resolved.status !== "ok") return new Response("Unauthorized", { status: 401 });
       const stub = env.WORKSPACE.get(env.WORKSPACE.idFromString(resolved.row.durable_object_id)) as unknown as DurableObjectStub<Workspace>;
       if (url.pathname.endsWith("workspace-counts")) return Response.json(await stub.browserCounts());
+      if (url.pathname.endsWith("session-token")) {
+        return Response.json(await stub.seedDelegatedSession({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch }));
+      }
       if (url.pathname.endsWith("bulk")) {
         const body = (await request.json()) as { slug: string; count: number };
         return Response.json(

@@ -444,3 +444,97 @@ test("MCP-INT-011 lists and executes scoped chat and agent tools with stable att
   expect(insufficient.status()).toBe(403);
   expect(insufficient.headers()["www-authenticate"]).toContain("insufficient_scope");
 });
+
+test("MCP-INT-012 confines a runner session to its delegation on every tool", async ({ page }) => {
+  const account = freshAccount();
+  await signUp(page, account);
+  const slug = slugFor(account);
+  const sessionCookie = (await page.context().cookies()).find((cookie) => cookie.name === "lepidy_session");
+  expect(sessionCookie).toBeDefined();
+  const seededResponse = await page.request.post(`${BASE}/__fixture/session-token`, {
+    headers: { authorization: sessionCookie!.value },
+  });
+  expect(seededResponse.status()).toBe(200);
+  const seeded = (await seededResponse.json()) as {
+    token: string;
+    sessionId: string;
+    delegationId: string;
+    agentId: string;
+    allowedChannelId: string;
+    outsideChannelId: string;
+    rootMessageId: string;
+  };
+
+  const listedResponse = await page.request.post(`${BASE}/w/${slug}/mcp`, {
+    headers: { authorization: `Bearer ${seeded.token}` },
+    data: { jsonrpc: "2.0", id: 30, method: "tools/list", params: {} },
+  });
+  expect(listedResponse.status()).toBe(200);
+  const listed = (await listedResponse.json()) as { result: { tools: { name: string }[] } };
+  const toolNames = listed.result.tools.map((tool) => tool.name);
+  expect(toolNames).toEqual(expect.arrayContaining(["whoami", "read_channel", "read_thread", "agent_post"]));
+  expect(toolNames).not.toContain("post_message");
+  expect(toolNames).not.toContain("agent_set_prompt");
+
+  const channels = await callTool(page.request, { slug, accessToken: seeded.token, id: 31, name: "list_channels" });
+  const channelBody = (await channels.json()) as {
+    result: { structuredContent: { channels: { id: string }[]; attribution: { sessionId: string; delegationId: string } } };
+  };
+  expect(channelBody.result.structuredContent.channels.map((channel) => channel.id)).toEqual([seeded.allowedChannelId]);
+  expect(channelBody.result.structuredContent.attribution).toMatchObject({
+    sessionId: seeded.sessionId,
+    delegationId: seeded.delegationId,
+  });
+
+  const outside = await callTool(page.request, {
+    slug,
+    accessToken: seeded.token,
+    id: 32,
+    name: "read_channel",
+    arguments: { channel_id: seeded.outsideChannelId },
+  });
+  expect(((await outside.json()) as { result: { isError?: boolean } }).result.isError).toBe(true);
+
+  const posted = await callTool(page.request, {
+    slug,
+    accessToken: seeded.token,
+    id: 33,
+    name: "agent_post",
+    arguments: {
+      agent: seeded.agentId,
+      channel_id: seeded.allowedChannelId,
+      parent_id: seeded.rootMessageId,
+      content: "Bound delegated reply",
+      idempotency_key: "browser:delegated:post:0001",
+    },
+  });
+  expect(((await posted.json()) as { result: { isError?: boolean } }).result.isError).not.toBe(true);
+  const thread = await callTool(page.request, {
+    slug,
+    accessToken: seeded.token,
+    id: 34,
+    name: "read_thread",
+    arguments: { message_id: seeded.rootMessageId },
+  });
+  const threadBody = (await thread.json()) as {
+    result: { structuredContent: { messages: { mcp_attribution: { session_id: string; delegation_id: string; connection_id: null } | null }[] } };
+  };
+  expect(threadBody.result.structuredContent.messages[1].mcp_attribution).toMatchObject({
+    session_id: seeded.sessionId,
+    delegation_id: seeded.delegationId,
+    connection_id: null,
+  });
+
+  const humanPost = await callTool(page.request, {
+    slug,
+    accessToken: seeded.token,
+    id: 35,
+    name: "post_message",
+    arguments: {
+      channel_id: seeded.allowedChannelId,
+      content: "forged human post",
+      idempotency_key: "browser:delegated:human:0001",
+    },
+  });
+  expect(humanPost.status()).toBe(403);
+});
