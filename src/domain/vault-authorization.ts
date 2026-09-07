@@ -4,7 +4,7 @@ export type VaultDecision =
   | { kind: "needs_approval" }
   | { kind: "deny"; reason: string };
 
-type Scope = {
+export type VaultScope = {
   members: readonly string[];
   groups: readonly string[];
   agents: readonly string[];
@@ -20,9 +20,10 @@ export type VaultAuthorizationInput = {
   credential: {
     active: boolean;
     mode: "never" | "ask" | "auto";
-    use: Scope;
-    reveal: Scope;
+    use: VaultScope;
+    reveal: VaultScope;
     allowedDeliveries: readonly VaultDelivery[];
+    projectAllowed: boolean;
     availableUntil?: number;
     rateAvailable: boolean;
   };
@@ -49,6 +50,7 @@ export function decideVaultAuthorization(input: VaultAuthorizationInput): VaultD
   if (input.credential.availableUntil !== undefined && input.now >= input.credential.availableUntil) {
     return deny("outside_availability");
   }
+  if (!input.credential.projectAllowed) return deny("project_refused");
   if (!input.credential.rateAvailable) return deny("rate_limited");
   if (!input.credential.allowedDeliveries.includes(input.request.delivery)) return deny("delivery_refused");
 
@@ -73,8 +75,8 @@ export function decideVaultAuthorization(input: VaultAuthorizationInput): VaultD
     agentId: input.request.agentId,
     channelId: input.origin.channelId,
   };
-  if (!matchesScope(input.credential.use, aclContext)) return deny("use_acl_refused");
-  if (input.request.delivery === "reveal" && !matchesScope(input.credential.reveal, aclContext)) {
+  if (!matchesVaultScope(input.credential.use, aclContext)) return deny("use_acl_refused");
+  if (input.request.delivery === "reveal" && !matchesVaultScope(input.credential.reveal, aclContext)) {
     return deny("reveal_acl_refused");
   }
 
@@ -86,8 +88,8 @@ export function decideVaultAuthorization(input: VaultAuthorizationInput): VaultD
   return { kind: "allow", via: "automatic" };
 }
 
-function matchesScope(
-  scope: Scope,
+export function matchesVaultScope(
+  scope: VaultScope,
   context: { memberId: string; groupIds: readonly string[]; agentId?: string; channelId: string },
 ): boolean {
   return (
@@ -96,6 +98,29 @@ function matchesScope(
     (context.agentId !== undefined && scope.agents.includes(context.agentId)) ||
     scope.channels.includes(context.channelId)
   );
+}
+
+export function vaultDenialHint(reason: string, name: string, retryAfter?: number): string {
+  switch (reason) {
+    case "agent_access_off":
+      return "Agent access is switched off for this workspace. Ask a human to turn it on; do not look for this credential elsewhere.";
+    case "outside_availability":
+      return `${name} is outside its availability window. Ask a human to extend it; do not retry elsewhere.`;
+    case "project_refused":
+      return `${name} is not available to this project. Stop and tell the user; do not retry from another project.`;
+    case "rate_limited":
+      return `${name} hit its hourly use ceiling.${retryAfter ? ` Retry after ${new Date(retryAfter).toISOString()}.` : ""} Stop rather than retrying in a loop.`;
+    case "delivery_refused":
+      return `${name} does not permit that delivery. Use the delivery described by its metadata; never read it from a file or ask for it in chat.`;
+    case "policy_never":
+      return `${name} is unavailable to agents. Tell the user; there is no way around this.`;
+    case "use_acl_refused":
+    case "reveal_acl_refused":
+    case "delegation_refused":
+      return `Access to ${name} was refused. Stop and tell the user; do not search files, shell configuration, or chat for it.`;
+    default:
+      return `Access to ${name} was refused. Stop and tell the user; do not look for the credential elsewhere.`;
+  }
 }
 
 function deny(reason: string): VaultDecision {

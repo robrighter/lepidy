@@ -700,6 +700,118 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       ) STRICT`,
     ],
   },
+  {
+    version: 18,
+    name: "Encrypted credential vault",
+    statements: [
+      `CREATE TABLE vault_settings (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        agent_access_on INTEGER NOT NULL DEFAULT 1 CHECK (agent_access_on IN (0, 1)),
+        access_epoch INTEGER NOT NULL DEFAULT 1 CHECK (access_epoch > 0),
+        updated_by_member_id TEXT REFERENCES members(id) ON DELETE SET NULL,
+        updated_at INTEGER NOT NULL
+      ) STRICT`,
+      `INSERT INTO vault_settings(singleton, agent_access_on, access_epoch, updated_at)
+       VALUES (1, 1, 1, CAST(unixepoch('subsec') * 1000 AS INTEGER))`,
+      `CREATE TABLE vault_credentials (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        description TEXT NOT NULL,
+        env_var TEXT,
+        tags_json TEXT NOT NULL CHECK (json_valid(tags_json)),
+        commands_json TEXT NOT NULL CHECK (json_valid(commands_json)),
+        proxy_hosts_json TEXT NOT NULL CHECK (json_valid(proxy_hosts_json)),
+        cipher_suite TEXT NOT NULL CHECK (cipher_suite = 'AES-256-GCM'),
+        aad_version INTEGER NOT NULL CHECK (aad_version = 1),
+        ciphertext TEXT NOT NULL,
+        iv TEXT NOT NULL,
+        key_epoch INTEGER NOT NULL CHECK (key_epoch > 0),
+        version INTEGER NOT NULL CHECK (version > 0),
+        policy_epoch INTEGER NOT NULL CHECK (policy_epoch > 0),
+        mode TEXT NOT NULL CHECK (mode IN ('ask', 'auto', 'never')),
+        allowed_deliveries_json TEXT NOT NULL CHECK (json_valid(allowed_deliveries_json)),
+        project_ids_json TEXT NOT NULL CHECK (json_valid(project_ids_json)),
+        grant_ttl_ms INTEGER CHECK (grant_ttl_ms IS NULL OR (grant_ttl_ms > 0 AND grant_ttl_ms <= 28800000)),
+        available_until INTEGER,
+        max_uses_per_hour INTEGER CHECK (max_uses_per_hour IS NULL OR max_uses_per_hour > 0),
+        high_risk INTEGER NOT NULL DEFAULT 0 CHECK (high_risk IN (0, 1)),
+        created_by_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        last_accessed_at INTEGER,
+        access_count INTEGER NOT NULL DEFAULT 0 CHECK (access_count >= 0)
+      ) STRICT`,
+      `CREATE TABLE vault_credential_key_wraps (
+        credential_id TEXT NOT NULL REFERENCES vault_credentials(id) ON DELETE CASCADE,
+        credential_version INTEGER NOT NULL CHECK (credential_version > 0),
+        custodian_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        recipient_key_epoch INTEGER NOT NULL CHECK (recipient_key_epoch > 0),
+        wrap_suite TEXT NOT NULL,
+        ephemeral_public_key TEXT NOT NULL,
+        iv TEXT NOT NULL,
+        wrapped_dek TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (credential_id, credential_version, custodian_member_id)
+      ) STRICT`,
+      `CREATE TABLE vault_credential_acl (
+        credential_id TEXT NOT NULL REFERENCES vault_credentials(id) ON DELETE CASCADE,
+        subject_type TEXT NOT NULL CHECK (subject_type IN ('member', 'group', 'agent', 'channel')),
+        subject_id TEXT NOT NULL,
+        verb TEXT NOT NULL CHECK (verb IN ('use', 'reveal', 'manage')),
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (credential_id, subject_type, subject_id, verb)
+      ) STRICT`,
+      `CREATE INDEX vault_credential_acl_subject_idx
+         ON vault_credential_acl(subject_type, subject_id, credential_id)`,
+      `CREATE TABLE vault_grants (
+        id TEXT PRIMARY KEY,
+        credential_id TEXT NOT NULL REFERENCES vault_credentials(id) ON DELETE CASCADE,
+        credential_version INTEGER NOT NULL CHECK (credential_version > 0),
+        policy_epoch INTEGER NOT NULL CHECK (policy_epoch > 0),
+        access_epoch INTEGER NOT NULL CHECK (access_epoch > 0),
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,
+        delegation_id TEXT REFERENCES agent_delegations(id) ON DELETE CASCADE,
+        delivery TEXT NOT NULL CHECK (delivery IN ('inject', 'file', 'device_proxy', 'reveal')),
+        origin_channel_id TEXT REFERENCES channels(id) ON DELETE CASCADE,
+        origin_message_id TEXT REFERENCES messages(id) ON DELETE CASCADE,
+        expires_at INTEGER,
+        remaining_uses INTEGER CHECK (remaining_uses IS NULL OR remaining_uses >= 0),
+        approved_by_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        revoked_at INTEGER,
+        revoked_reason TEXT,
+        CHECK ((agent_id IS NULL AND delegation_id IS NULL) OR (agent_id IS NOT NULL AND delegation_id IS NOT NULL))
+      ) STRICT`,
+      `CREATE INDEX vault_grants_exact_live_idx ON vault_grants(
+         credential_id, credential_version, policy_epoch, access_epoch,
+         member_id, device_id, project_id, agent_id, delegation_id, delivery,
+         origin_channel_id, revoked_at, expires_at
+       )`,
+      `CREATE TABLE vault_usage_events (
+        id TEXT PRIMARY KEY,
+        credential_id TEXT NOT NULL REFERENCES vault_credentials(id) ON DELETE CASCADE,
+        grant_id TEXT REFERENCES vault_grants(id) ON DELETE SET NULL,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+        delegation_id TEXT REFERENCES agent_delegations(id) ON DELETE SET NULL,
+        delivery TEXT NOT NULL CHECK (delivery IN ('inject', 'file', 'device_proxy', 'reveal')),
+        used_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE INDEX vault_usage_events_window_idx
+         ON vault_usage_events(credential_id, used_at)`,
+      `CREATE TABLE vault_credential_deletions (
+        credential_id TEXT PRIMARY KEY,
+        deletion_epoch INTEGER NOT NULL CHECK (deletion_epoch > 0),
+        deleted_by_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
+        deleted_at INTEGER NOT NULL
+      ) STRICT`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

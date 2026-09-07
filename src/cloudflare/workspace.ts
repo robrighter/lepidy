@@ -210,6 +210,27 @@ import {
   type ScheduledMessageRow,
 } from "./workspace-rooms";
 import { verifySoloSnapshot, type SoloContentSnapshot } from "../domain/solo-snapshot";
+import {
+  decideVaultAuthorization,
+  vaultDenialHint,
+  type VaultDecision,
+  type VaultDelivery,
+  type VaultScope,
+} from "../domain/vault-authorization";
+import {
+  validateVaultEnvelope,
+  validateVaultKeyWrap,
+  type VaultCiphertextEnvelope,
+  type VaultKeyWrap,
+} from "../domain/vault-envelope";
+import {
+  normalizeVaultMetadata,
+  normalizeVaultPolicy,
+  validateVaultAcl,
+  type VaultAclEntry,
+  type VaultCredentialMetadata,
+  type VaultPolicy,
+} from "../domain/vault-policy";
 
 export type WorkspaceHealth = {
   ok: boolean;
@@ -312,6 +333,40 @@ export type ActiveMember = {
   handle: string;
   displayName: string;
   role: MemberProjection["role"];
+};
+
+export type VaultCredentialSummary = VaultCredentialMetadata & {
+  id: string;
+  policy: VaultPolicy;
+  version: number;
+  keyEpoch: number;
+  policyEpoch: number;
+  createdAt: number;
+  updatedAt: number;
+  lastAccessedAt?: number;
+  accessCount: number;
+};
+
+export type VaultAccessRequest = {
+  actor: Actor;
+  credentialId: string;
+  device: { id: string; active: boolean; ownedByMember: boolean; signatureVerified: boolean; nonceFresh: boolean };
+  origin: { channelId: string; messageId: string };
+  projectId: string;
+  delivery: VaultDelivery;
+  agentId?: string;
+  delegationId?: string;
+  now: number;
+};
+
+type VaultCredentialRow = {
+  id: string; name: string; description: string; env_var: string | null;
+  tags_json: string; commands_json: string; proxy_hosts_json: string;
+  cipher_suite: "AES-256-GCM"; aad_version: 1; ciphertext: string; iv: string;
+  key_epoch: number; version: number; policy_epoch: number;
+  mode: VaultPolicy["mode"]; allowed_deliveries_json: string; project_ids_json: string;
+  grant_ttl_ms: number | null; available_until: number | null; max_uses_per_hour: number | null;
+  high_risk: number; created_at: number; updated_at: number; last_accessed_at: number | null; access_count: number;
 };
 
 export type CreatedChannel = { channelId: string; kind: ChannelKind; created: boolean };
@@ -702,6 +757,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         this.ctx.storage.sql.exec(
           `UPDATE agent_sessions SET revoked_at = ?, revoked_reason = 'owner_authority_changed'
            WHERE owner_member_id = ? AND revoked_at IS NULL`,
+          member.now,
+          member.memberId,
+        );
+        this.ctx.storage.sql.exec(
+          `UPDATE vault_grants SET revoked_at = ?, revoked_reason = 'member_authority_changed'
+           WHERE member_id = ? AND revoked_at IS NULL`,
           member.now,
           member.memberId,
         );
@@ -3103,6 +3164,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         agent.id,
         input.memberId,
       );
+      this.revokeVaultGrants("agent_owner_removed", input.now, "agent_id = ? AND member_id = ?", agent.id, input.memberId);
       this.ctx.storage.sql.exec(
         "DELETE FROM agent_owners WHERE agent_id = ? AND member_id = ?",
         agent.id,
@@ -3210,6 +3272,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           input.now,
           agent.id,
         );
+        this.revokeVaultGrants("agent_status_changed", input.now, "agent_id = ?", agent.id);
       }
       return {
         result: { status: input.status },
@@ -3347,6 +3410,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           input.now,
           delegation.id,
         );
+        this.revokeVaultGrants("delegation_revoked", input.now, "delegation_id = ?", delegation.id);
       }
       return {
         result: { revoked: changed.rowsWritten > 0 },
@@ -3981,7 +4045,453 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     });
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Encrypted credential vault (V01)                                   */
+  /* ------------------------------------------------------------------ */
+
+  async createVaultCredential(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    credentialId: string;
+    metadata: VaultCredentialMetadata;
+    policy: VaultPolicy;
+    envelope: VaultCiphertextEnvelope;
+    wraps: readonly VaultKeyWrap[];
+    acl: readonly VaultAclEntry[];
+    freshUserVerification: boolean;
+    localVaultUnlocked: boolean;
+    now: number;
+  }): Promise<{ credential: VaultCredentialSummary; created: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    this.requireVaultStepUp(input.freshUserVerification, input.localVaultUnlocked);
+    const metadata = normalizeVaultMetadata(input.metadata);
+    const policy = normalizeVaultPolicy(input.policy, input.now);
+    const envelope = validateVaultEnvelope(input.envelope, { version: 1, keyEpoch: 1 });
+    const wraps = input.wraps.map(validateVaultKeyWrap);
+    const acl = validateVaultAcl(input.acl, wraps);
+    if (!acl.some((entry) => entry.subjectType === "member" && entry.subjectId === actor.id && entry.verb === "manage")) {
+      throw new Error("the creator must remain a managing custodian");
+    }
+    if (this.resolveActiveMemberIds(wraps.map((wrap) => wrap.custodianMemberId)).length !== wraps.length) {
+      throw new Error("every vault custodian must be an active member");
+    }
+
+    const outcome = await this.commitMutation(
+      { scope: "vault.create", idempotencyKey: input.idempotencyKey, requestHash: `${actor.id}|${input.credentialId}|${metadata.name}`, now: input.now },
+      () => {
+        if (this.readVaultCredential(input.credentialId) !== null) throw new Error("vault credential already exists");
+        if (this.ctx.storage.sql.exec<{ present: number }>("SELECT 1 AS present FROM vault_credential_deletions WHERE credential_id = ?", input.credentialId).toArray()[0]) {
+          throw new Error("a deleted vault credential id cannot be reused");
+        }
+        this.insertVaultCredential(input.credentialId, actor.id, metadata, policy, envelope, wraps, acl, input.now);
+        return {
+          result: { credential: this.vaultSummary(this.readVaultCredential(input.credentialId)!), created: true },
+          effects: this.vaultEffects("vault.credential_created", input.credentialId, actor, { version: 1, policy_epoch: 1, custodian_count: wraps.length }),
+        };
+      },
+    );
+    return { ...outcome.result, created: !outcome.replayed };
+  }
+
+  async updateVaultCredential(input: {
+    actor: Actor;
+    credentialId: string;
+    metadata: VaultCredentialMetadata;
+    policy: VaultPolicy;
+    envelope: VaultCiphertextEnvelope;
+    wraps: readonly VaultKeyWrap[];
+    acl: readonly VaultAclEntry[];
+    freshUserVerification: boolean;
+    localVaultUnlocked: boolean;
+    now: number;
+  }): Promise<{ credential: VaultCredentialSummary }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    this.requireVaultManager(input.credentialId, actor.id);
+    this.requireVaultStepUp(input.freshUserVerification, input.localVaultUnlocked);
+    const current = this.requireVaultCredential(input.credentialId);
+    const metadata = normalizeVaultMetadata(input.metadata);
+    const policy = normalizeVaultPolicy(input.policy, input.now);
+    const envelope = validateVaultEnvelope(input.envelope, { version: current.version + 1, keyEpoch: current.key_epoch + 1 });
+    const wraps = input.wraps.map(validateVaultKeyWrap);
+    const acl = validateVaultAcl(input.acl, wraps);
+    if (this.resolveActiveMemberIds(wraps.map((wrap) => wrap.custodianMemberId)).length !== wraps.length) {
+      throw new Error("every vault custodian must be an active member");
+    }
+    const outcome = await this.commitMutation({ scope: "vault.update", now: input.now }, () => {
+      const live = this.requireVaultCredential(input.credentialId);
+      if (live.version !== current.version || live.policy_epoch !== current.policy_epoch) throw new Error("vault credential changed concurrently");
+      this.ctx.storage.sql.exec(
+        `UPDATE vault_credentials SET name = ?, description = ?, env_var = ?, tags_json = ?, commands_json = ?, proxy_hosts_json = ?,
+          cipher_suite = ?, aad_version = ?, ciphertext = ?, iv = ?, key_epoch = ?, version = ?, policy_epoch = ?, mode = ?,
+          allowed_deliveries_json = ?, project_ids_json = ?, grant_ttl_ms = ?, available_until = ?, max_uses_per_hour = ?, high_risk = ?, updated_at = ?
+         WHERE id = ?`,
+        metadata.name, metadata.description, metadata.envVar ?? null, JSON.stringify(metadata.tags), JSON.stringify(metadata.commands), JSON.stringify(metadata.proxyHosts),
+        envelope.cipherSuite, envelope.aadVersion, envelope.ciphertext, envelope.iv, envelope.keyEpoch, envelope.version, live.policy_epoch + 1,
+        policy.mode, JSON.stringify(policy.allowedDeliveries), JSON.stringify(policy.projectIds), policy.grantTtlMs ?? null, policy.availableUntil ?? null,
+        policy.maxUsesPerHour ?? null, policy.highRisk ? 1 : 0, input.now, input.credentialId,
+      );
+      this.ctx.storage.sql.exec("DELETE FROM vault_credential_key_wraps WHERE credential_id = ?", input.credentialId);
+      this.ctx.storage.sql.exec("DELETE FROM vault_credential_acl WHERE credential_id = ?", input.credentialId);
+      this.insertVaultWrapsAndAcl(input.credentialId, envelope.version, wraps, acl, input.now);
+      this.revokeVaultGrants("credential_changed", input.now, "credential_id = ?", input.credentialId);
+      return {
+        result: { credential: this.vaultSummary(this.requireVaultCredential(input.credentialId)) },
+        effects: this.vaultEffects("vault.credential_updated", input.credentialId, actor, { version: envelope.version, policy_epoch: live.policy_epoch + 1, custodian_count: wraps.length }),
+      };
+    });
+    return outcome.result;
+  }
+
+  async deleteVaultCredential(input: { actor: Actor; credentialId: string; freshUserVerification: boolean; localVaultUnlocked: boolean; now: number }): Promise<{ deleted: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const row = this.readVaultCredential(input.credentialId);
+    if (row === null) return { deleted: false };
+    const manager = this.vaultHasAcl(input.credentialId, actor.id, undefined, undefined, "manage");
+    if (!manager && actor.role !== "owner" && actor.role !== "admin") throw new Error("vault credential not found");
+    this.requireVaultStepUp(input.freshUserVerification, input.localVaultUnlocked);
+    const outcome = await this.commitMutation({ scope: "vault.delete", now: input.now }, () => {
+      const deleted = this.ctx.storage.sql.exec("DELETE FROM vault_credentials WHERE id = ?", input.credentialId).rowsWritten > 0;
+      if (!deleted) return { result: { deleted: false } };
+      this.ctx.storage.sql.exec(
+        `INSERT INTO vault_credential_deletions(credential_id, deletion_epoch, deleted_by_member_id, deleted_at)
+         VALUES (?, ?, ?, ?)`, input.credentialId, row.version + 1, actor.id, input.now,
+      );
+      return { result: { deleted: true }, effects: this.vaultEffects("vault.credential_deleted", input.credentialId, actor, { deletion_epoch: row.version + 1 }) };
+    });
+    return outcome.result;
+  }
+
+  listVaultCredentials(input: { actor: Actor; agentId?: string; delegationId?: string; originChannelId?: string; now: number }): { credentials: readonly VaultCredentialSummary[] } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    if (input.originChannelId !== undefined) this.requireVisibleChannel(input.originChannelId, actor.id);
+    let delegation: AgentDelegation | null = null;
+    if (input.agentId !== undefined) {
+      this.requireOwnedAgent(input.agentId, actor.id);
+      if (input.delegationId !== undefined) {
+        delegation = this.requireLiveDelegation(input.delegationId, input.now);
+        if (delegation.agentId !== input.agentId || delegation.ownerMemberId !== actor.id) throw new Error("delegation is not active");
+      }
+    }
+    const rows = this.ctx.storage.sql.exec<VaultCredentialRow>("SELECT * FROM vault_credentials ORDER BY name COLLATE NOCASE, id").toArray();
+    return {
+      credentials: rows
+        .filter((row) => (delegation === null || delegation.credentialIds.includes(row.id)))
+        .filter((row) => this.vaultCanDiscover(row.id, actor.id, input.agentId, input.originChannelId))
+        .map((row) => this.vaultSummary(row)),
+    };
+  }
+
+  getVaultCredentialCiphertext(input: { actor: Actor; credentialId: string; freshUserVerification: boolean; localVaultUnlocked: boolean }): { envelope: VaultCiphertextEnvelope; wraps: readonly VaultKeyWrap[] } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    this.requireVaultManager(input.credentialId, actor.id);
+    this.requireVaultStepUp(input.freshUserVerification, input.localVaultUnlocked);
+    const row = this.requireVaultCredential(input.credentialId);
+    return { envelope: this.vaultEnvelope(row), wraps: this.readVaultWraps(row.id, row.version) };
+  }
+
+  async setVaultAgentAccess(input: { actor: Actor; enabled: boolean; freshUserVerification: boolean; now: number }): Promise<{ enabled: boolean; accessEpoch: number }> {
+    const actor = this.authorizeActor(input.actor);
+    if (actor.role !== "owner" && actor.role !== "admin") throw new Error("only an admin may change vault agent access");
+    if (input.enabled && !input.freshUserVerification) throw new Error("fresh user verification is required");
+    const outcome = await this.commitMutation({ scope: "vault.agent_access", now: input.now }, () => {
+      const current = this.ctx.storage.sql.exec<{ agent_access_on: number; access_epoch: number }>("SELECT agent_access_on, access_epoch FROM vault_settings WHERE singleton = 1").one();
+      if ((current.agent_access_on === 1) === input.enabled) return { result: { enabled: input.enabled, accessEpoch: current.access_epoch } };
+      const accessEpoch = current.access_epoch + 1;
+      this.ctx.storage.sql.exec("UPDATE vault_settings SET agent_access_on = ?, access_epoch = ?, updated_by_member_id = ?, updated_at = ? WHERE singleton = 1", input.enabled ? 1 : 0, accessEpoch, actor.id, input.now);
+      this.revokeVaultGrants("workspace_access_changed", input.now, "1 = 1");
+      return { result: { enabled: input.enabled, accessEpoch }, effects: this.vaultEffects("vault.agent_access_changed", "workspace", actor, { enabled: input.enabled, access_epoch: accessEpoch }) };
+    });
+    return outcome.result;
+  }
+
+  async issueVaultGrant(input: {
+    actor: Actor; credentialId: string; memberId: string; deviceId: string; projectId: string;
+    delivery: VaultDelivery; agentId?: string; delegationId?: string; originChannelId: string; originMessageId: string;
+    expiresAt?: number; approvalVerified: boolean; freshUserVerification: boolean; now: number;
+  }): Promise<{ grantId: string; expiresAt?: number; remainingUses?: number }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    this.requireVaultManager(input.credentialId, actor.id);
+    if (!input.approvalVerified || !input.freshUserVerification) throw new Error("verified approval is required");
+    const row = this.requireVaultCredential(input.credentialId);
+    const policy = this.vaultPolicy(row);
+    if (!policy.allowedDeliveries.includes(input.delivery)) throw new Error("vault delivery is not allowed");
+    if (input.expiresAt !== undefined) {
+      if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= input.now) throw new Error("grant expiry is invalid");
+      if (policy.grantTtlMs === undefined || input.expiresAt > input.now + policy.grantTtlMs) throw new Error("grant exceeds the credential TTL");
+    }
+    if ((input.agentId === undefined) !== (input.delegationId === undefined)) throw new Error("agent grants require an exact delegation");
+    if (input.delegationId !== undefined) {
+      const delegation = this.requireLiveDelegation(input.delegationId, input.now);
+      if (delegation.agentId !== input.agentId || delegation.ownerMemberId !== input.memberId || !delegation.credentialIds.includes(row.id)) {
+        throw new Error("delegation does not permit this credential");
+      }
+    }
+    const target = this.resolveActiveMemberIds([input.memberId]);
+    if (target.length !== 1) throw new Error("grant member is not active");
+    const settings = this.vaultSettings();
+    const grantId = crypto.randomUUID();
+    const remainingUses = input.expiresAt === undefined ? 1 : undefined;
+    const outcome = await this.commitMutation({ scope: "vault.grant.issue", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO vault_grants(id, credential_id, credential_version, policy_epoch, access_epoch, member_id, device_id,
+          project_id, agent_id, delegation_id, delivery, origin_channel_id, expires_at, remaining_uses,
+          origin_message_id, approved_by_member_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        grantId, row.id, row.version, row.policy_epoch, settings.access_epoch, input.memberId, input.deviceId, input.projectId,
+        input.agentId ?? null, input.delegationId ?? null, input.delivery, input.originChannelId, input.expiresAt ?? null,
+        remainingUses ?? null, input.originMessageId, actor.id, input.now,
+      );
+      return {
+        result: { grantId, ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }), ...(remainingUses === undefined ? {} : { remainingUses }) },
+        effects: this.vaultEffects("vault.grant_issued", row.id, actor, { grant_id: grantId, item_version: row.version, policy_epoch: row.policy_epoch, delivery: input.delivery }),
+      };
+    });
+    return outcome.result;
+  }
+
+  async revokeVaultGrant(input: { actor: Actor; credentialId: string; grantId: string; now: number }): Promise<{ revoked: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireVaultManager(input.credentialId, actor.id);
+    const outcome = await this.commitMutation({ scope: "vault.grant.revoke", now: input.now }, () => {
+      const revoked = this.ctx.storage.sql.exec(
+        "UPDATE vault_grants SET revoked_at = ?, revoked_reason = 'manual' WHERE id = ? AND credential_id = ? AND revoked_at IS NULL",
+        input.now, input.grantId, input.credentialId,
+      ).rowsWritten === 1;
+      if (!revoked) return { result: { revoked: false } };
+      return { result: { revoked: true }, effects: this.vaultEffects("vault.grant_revoked", input.credentialId, actor, { grant_id: input.grantId }) };
+    });
+    return outcome.result;
+  }
+
+  async revokeVaultGrantsForDevice(input: { deviceId: string; now: number }): Promise<{ revoked: number }> {
+    const outcome = await this.commitMutation({ scope: "vault.device_revoke", now: input.now }, () => {
+      const count = this.ctx.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM vault_grants WHERE device_id = ? AND revoked_at IS NULL", input.deviceId,
+      ).one().count;
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_grants SET revoked_at = ?, revoked_reason = 'device_revoked' WHERE device_id = ? AND revoked_at IS NULL",
+        input.now, input.deviceId,
+      );
+      return {
+        result: { revoked: count },
+        effects: count === 0 ? undefined : {
+          audit: { eventType: "vault.device_grants_revoked", outcome: "allowed", requesterKind: "system", subjectKind: "device", subjectId: input.deviceId, metadata: { grant_count: count } },
+        },
+      };
+    });
+    return outcome.result;
+  }
+
+  async authorizeVaultUse(input: VaultAccessRequest): Promise<{ decision: VaultDecision; hint?: string }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const initial = this.evaluateVaultAccess(input, actor);
+    if (initial.decision.kind !== "allow") {
+      return initial.decision.kind === "deny"
+        ? { decision: initial.decision, hint: vaultDenialHint(initial.decision.reason, initial.row?.name ?? "credential", initial.retryAfter) }
+        : { decision: initial.decision };
+    }
+    const outcome = await this.commitMutation({ scope: "vault.use", now: input.now }, () => {
+      const checked = this.evaluateVaultAccess(input, actor);
+      if (checked.decision.kind !== "allow" || checked.row === null) throw new Error("vault authorization changed before use");
+      if (checked.grantId !== null) {
+        const consumed = this.ctx.storage.sql.exec(
+          `UPDATE vault_grants SET remaining_uses = CASE WHEN remaining_uses IS NULL THEN NULL ELSE remaining_uses - 1 END
+           WHERE id = ? AND revoked_at IS NULL AND (remaining_uses IS NULL OR remaining_uses > 0)`, checked.grantId,
+        );
+        if (consumed.rowsWritten !== 1) throw new Error("vault grant was already consumed");
+      }
+      const usageId = crypto.randomUUID();
+      this.ctx.storage.sql.exec(
+        `INSERT INTO vault_usage_events(id, credential_id, grant_id, member_id, device_id, project_id, agent_id, delegation_id, delivery, used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        usageId, checked.row.id, checked.grantId, actor.id, input.device.id, input.projectId, input.agentId ?? null, input.delegationId ?? null, input.delivery, input.now,
+      );
+      this.ctx.storage.sql.exec("UPDATE vault_credentials SET last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?", input.now, checked.row.id);
+      return {
+        result: { decision: checked.decision },
+        effects: this.vaultEffects("vault.access_authorized", checked.row.id, actor, { usage_id: usageId, delivery: input.delivery, via: checked.decision.via }),
+      };
+    });
+    return outcome.result;
+  }
+
   /* -- agent helpers ---------------------------------------------------- */
+
+  private readVaultCredential(id: string): VaultCredentialRow | null {
+    return this.ctx.storage.sql.exec<VaultCredentialRow>("SELECT * FROM vault_credentials WHERE id = ?", id).toArray()[0] ?? null;
+  }
+
+  private requireVaultCredential(id: string): VaultCredentialRow {
+    const row = this.readVaultCredential(id);
+    if (row === null) throw new Error("vault credential not found");
+    return row;
+  }
+
+  private vaultPolicy(row: VaultCredentialRow): VaultPolicy {
+    return {
+      mode: row.mode,
+      allowedDeliveries: JSON.parse(row.allowed_deliveries_json) as VaultDelivery[],
+      projectIds: JSON.parse(row.project_ids_json) as string[],
+      ...(row.grant_ttl_ms === null ? {} : { grantTtlMs: row.grant_ttl_ms }),
+      ...(row.available_until === null ? {} : { availableUntil: row.available_until }),
+      ...(row.max_uses_per_hour === null ? {} : { maxUsesPerHour: row.max_uses_per_hour }),
+      highRisk: row.high_risk === 1,
+    };
+  }
+
+  private vaultSummary(row: VaultCredentialRow): VaultCredentialSummary {
+    return {
+      id: row.id, name: row.name, description: row.description,
+      ...(row.env_var === null ? {} : { envVar: row.env_var }),
+      tags: JSON.parse(row.tags_json) as string[], commands: JSON.parse(row.commands_json) as string[], proxyHosts: JSON.parse(row.proxy_hosts_json) as string[],
+      policy: this.vaultPolicy(row), version: row.version, keyEpoch: row.key_epoch, policyEpoch: row.policy_epoch,
+      createdAt: row.created_at, updatedAt: row.updated_at,
+      ...(row.last_accessed_at === null ? {} : { lastAccessedAt: row.last_accessed_at }), accessCount: row.access_count,
+    };
+  }
+
+  private vaultEnvelope(row: VaultCredentialRow): VaultCiphertextEnvelope {
+    return { cipherSuite: row.cipher_suite, aadVersion: row.aad_version, version: row.version, keyEpoch: row.key_epoch, iv: row.iv, ciphertext: row.ciphertext };
+  }
+
+  private readVaultWraps(credentialId: string, version: number): VaultKeyWrap[] {
+    return this.ctx.storage.sql.exec<{
+      custodian_member_id: string; recipient_key_epoch: number; wrap_suite: string; ephemeral_public_key: string; iv: string; wrapped_dek: string;
+    }>(
+      `SELECT custodian_member_id, recipient_key_epoch, wrap_suite, ephemeral_public_key, iv, wrapped_dek
+       FROM vault_credential_key_wraps WHERE credential_id = ? AND credential_version = ? ORDER BY custodian_member_id`, credentialId, version,
+    ).toArray().map((row) => ({ custodianMemberId: row.custodian_member_id, recipientKeyEpoch: row.recipient_key_epoch, wrapSuite: row.wrap_suite, ephemeralPublicKey: row.ephemeral_public_key, iv: row.iv, wrappedDek: row.wrapped_dek }));
+  }
+
+  private insertVaultCredential(id: string, creatorId: string, metadata: VaultCredentialMetadata, policy: VaultPolicy, envelope: VaultCiphertextEnvelope, wraps: readonly VaultKeyWrap[], acl: readonly VaultAclEntry[], now: number): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO vault_credentials(id, name, description, env_var, tags_json, commands_json, proxy_hosts_json,
+       cipher_suite, aad_version, ciphertext, iv, key_epoch, version, policy_epoch, mode, allowed_deliveries_json,
+       project_ids_json, grant_ttl_ms, available_until, max_uses_per_hour, high_risk, created_by_member_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, metadata.name, metadata.description, metadata.envVar ?? null, JSON.stringify(metadata.tags), JSON.stringify(metadata.commands), JSON.stringify(metadata.proxyHosts),
+      envelope.cipherSuite, envelope.aadVersion, envelope.ciphertext, envelope.iv, envelope.keyEpoch, envelope.version, policy.mode,
+      JSON.stringify(policy.allowedDeliveries), JSON.stringify(policy.projectIds), policy.grantTtlMs ?? null, policy.availableUntil ?? null,
+      policy.maxUsesPerHour ?? null, policy.highRisk ? 1 : 0, creatorId, now, now,
+    );
+    this.insertVaultWrapsAndAcl(id, envelope.version, wraps, acl, now);
+  }
+
+  private insertVaultWrapsAndAcl(id: string, version: number, wraps: readonly VaultKeyWrap[], acl: readonly VaultAclEntry[], now: number): void {
+    for (const wrap of wraps) this.ctx.storage.sql.exec(
+      `INSERT INTO vault_credential_key_wraps(credential_id, credential_version, custodian_member_id, recipient_key_epoch, wrap_suite, ephemeral_public_key, iv, wrapped_dek, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, version, wrap.custodianMemberId, wrap.recipientKeyEpoch, wrap.wrapSuite, wrap.ephemeralPublicKey, wrap.iv, wrap.wrappedDek, now,
+    );
+    for (const entry of acl) this.ctx.storage.sql.exec(
+      "INSERT INTO vault_credential_acl(credential_id, subject_type, subject_id, verb, created_at) VALUES (?, ?, ?, ?, ?)",
+      id, entry.subjectType, entry.subjectId, entry.verb, now,
+    );
+  }
+
+  private requireVaultManager(credentialId: string, memberId: string): void {
+    if (!this.vaultHasAcl(credentialId, memberId, undefined, undefined, "manage")) throw new Error("vault credential not found");
+  }
+
+  private requireVaultStepUp(fresh: boolean, unlocked: boolean): void {
+    if (!fresh) throw new Error("fresh user verification is required");
+    if (!unlocked) throw new Error("the local vault must be unlocked");
+  }
+
+  private vaultHasAcl(credentialId: string, memberId: string, agentId: string | undefined, channelId: string | undefined, verb: VaultAclEntry["verb"]): boolean {
+    const groups = this.ctx.storage.sql.exec<{ group_id: string }>("SELECT group_id FROM group_members WHERE member_id = ?", memberId).toArray().map((row) => row.group_id);
+    const entries = this.ctx.storage.sql.exec<{ subject_type: VaultAclEntry["subjectType"]; subject_id: string }>(
+      "SELECT subject_type, subject_id FROM vault_credential_acl WHERE credential_id = ? AND verb = ?", credentialId, verb,
+    ).toArray();
+    return entries.some((entry) =>
+      (entry.subject_type === "member" && entry.subject_id === memberId)
+      || (entry.subject_type === "group" && groups.includes(entry.subject_id))
+      || (entry.subject_type === "agent" && entry.subject_id === agentId)
+      || (entry.subject_type === "channel" && entry.subject_id === channelId));
+  }
+
+  private vaultCanDiscover(credentialId: string, memberId: string, agentId?: string, channelId?: string): boolean {
+    return (["use", "reveal", "manage"] as const).some((verb) => this.vaultHasAcl(credentialId, memberId, agentId, channelId, verb));
+  }
+
+  private vaultScope(credentialId: string, verb: "use" | "reveal"): VaultScope {
+    const scope: { members: string[]; groups: string[]; agents: string[]; channels: string[] } = { members: [], groups: [], agents: [], channels: [] };
+    const plural = { member: "members", group: "groups", agent: "agents", channel: "channels" } as const;
+    for (const row of this.ctx.storage.sql.exec<{ subject_type: keyof typeof plural; subject_id: string }>(
+      "SELECT subject_type, subject_id FROM vault_credential_acl WHERE credential_id = ? AND verb = ?", credentialId, verb,
+    ).toArray()) scope[plural[row.subject_type]].push(row.subject_id);
+    return scope;
+  }
+
+  private vaultSettings(): { enabled: boolean; access_epoch: number } {
+    const row = this.ctx.storage.sql.exec<{ agent_access_on: number; access_epoch: number }>("SELECT agent_access_on, access_epoch FROM vault_settings WHERE singleton = 1").one();
+    return { enabled: row.agent_access_on === 1, access_epoch: row.access_epoch };
+  }
+
+  private evaluateVaultAccess(input: VaultAccessRequest, actor: ActiveMember): { decision: VaultDecision; row: VaultCredentialRow | null; grantId: string | null; retryAfter?: number } {
+    const row = this.readVaultCredential(input.credentialId);
+    if (row === null) return { decision: { kind: "deny", reason: "credential_inactive" }, row: null, grantId: null };
+    const settings = this.vaultSettings();
+    const channel = readChannel(this.ctx.storage, input.origin.channelId);
+    const message = readMessage(this.ctx.storage, input.origin.messageId);
+    const originVerified = channel !== null && message !== null && message.channelId === input.origin.channelId;
+    const memberCanAccess = channel !== null && canSeeChannel(this.channelVisibility(channel, actor.id));
+    const policy = this.vaultPolicy(row);
+    const groupIds = this.ctx.storage.sql.exec<{ group_id: string }>("SELECT group_id FROM group_members WHERE member_id = ?", actor.id).toArray().map((item) => item.group_id);
+    const windowStart = input.now - 60 * 60 * 1_000;
+    const usage = this.ctx.storage.sql.exec<{ count: number; first_used_at: number | null }>(
+      "SELECT COUNT(*) AS count, MIN(used_at) AS first_used_at FROM vault_usage_events WHERE credential_id = ? AND used_at > ?", row.id, windowStart,
+    ).one();
+    let delegationInput: Parameters<typeof decideVaultAuthorization>[0]["delegation"];
+    if (input.agentId !== undefined) {
+      const delegation = input.delegationId === undefined ? null : this.readAgentDelegation(input.delegationId);
+      const agent = readAgent(this.ctx.storage, input.agentId);
+      delegationInput = {
+        active: delegation !== null && delegation.revokedAt === null && input.now < delegation.expiresAt && agent?.status === "active",
+        ownerIsMember: delegation?.ownerMemberId === actor.id && delegation.ownerAuthorizationEpoch === input.actor.authorizationEpoch,
+        agentMatches: delegation?.agentId === input.agentId,
+        channelAllowed: delegation !== null && delegationAllowsChannel(delegation.channelIds, input.origin.channelId),
+        credentialAllowed: delegation?.credentialIds.includes(row.id) ?? false,
+        deliveryAllowed: delegation?.deliveryModes.includes(input.delivery) ?? false,
+        projectAllowed: delegation?.projectIds.includes(input.projectId) ?? false,
+      };
+    }
+    const grant = this.ctx.storage.sql.exec<{ id: string }>(
+      `SELECT id FROM vault_grants WHERE credential_id = ? AND credential_version = ? AND policy_epoch = ? AND access_epoch = ?
+       AND member_id = ? AND device_id = ? AND project_id = ? AND agent_id IS ? AND delegation_id IS ? AND delivery = ?
+       AND origin_channel_id = ? AND origin_message_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+       AND (remaining_uses IS NULL OR remaining_uses > 0) ORDER BY created_at DESC LIMIT 1`,
+      row.id, row.version, row.policy_epoch, settings.access_epoch, actor.id, input.device.id, input.projectId,
+      input.agentId ?? null, input.delegationId ?? null, input.delivery, input.origin.channelId, input.origin.messageId, input.now,
+    ).toArray()[0] ?? null;
+    const decision = decideVaultAuthorization({
+      now: input.now, workspaceAccessOn: input.agentId === undefined || settings.enabled,
+      member: { id: actor.id, active: true, authorizationEpochCurrent: true, groupIds },
+      device: input.device,
+      origin: { verified: originVerified, channelId: input.origin.channelId, memberCanAccess },
+      credential: { active: true, mode: policy.mode, use: this.vaultScope(row.id, "use"), reveal: this.vaultScope(row.id, "reveal"),
+        allowedDeliveries: policy.allowedDeliveries, projectAllowed: policy.projectIds.length === 0 || policy.projectIds.includes(input.projectId),
+        ...(policy.availableUntil === undefined ? {} : { availableUntil: policy.availableUntil }),
+        rateAvailable: policy.maxUsesPerHour === undefined || usage.count < policy.maxUsesPerHour },
+      request: { delivery: input.delivery, ...(input.agentId === undefined ? {} : { agentId: input.agentId }) },
+      ...(delegationInput === undefined ? {} : { delegation: delegationInput }), grantMatchesExactly: grant !== null,
+    });
+    return { decision, row, grantId: grant?.id ?? null, ...(usage.first_used_at === null ? {} : { retryAfter: usage.first_used_at + 60 * 60 * 1_000 }) };
+  }
+
+  private revokeVaultGrants(reason: string, now: number, predicate: string, ...values: (string | number)[]): void {
+    this.ctx.storage.sql.exec(`UPDATE vault_grants SET revoked_at = ?, revoked_reason = ? WHERE revoked_at IS NULL AND ${predicate}`, now, reason, ...values);
+  }
+
+  private vaultEffects(eventType: string, credentialId: string, actor: ActiveMember, metadata: Record<string, string | number | boolean | null>): MutationEffects {
+    return { audit: { eventType, outcome: "allowed", requesterKind: "member", requesterId: actor.id, subjectKind: "vault_item", subjectId: credentialId, metadata } };
+  }
 
   private agentScope(agent: AgentRow): AgentScope {
     return agent.scopeMode === "any"

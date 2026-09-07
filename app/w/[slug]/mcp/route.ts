@@ -280,9 +280,45 @@ async function dispatchTool(
       const updated = await workspace.setAgentBrief({ actor, agentId: agent.id, prompt: args.prompt as string | null, now: Date.now() });
       return { agent: { id: agent.id, handle: `@${agent.handle}` }, prompt: updated.prompt };
     }
+    case "list_credentials": {
+      const listed = await workspace.listVaultCredentials({
+        actor,
+        ...(principal.credentialKind === "session" ? { agentId: principal.agentId, delegationId: principal.delegationId } : {}),
+        ...(args.channel_id === undefined ? {} : { originChannelId: args.channel_id as string }),
+        now: Date.now(),
+      });
+      return { credentials: listed.credentials.map(credentialMetadata) };
+    }
+    case "describe_credential": {
+      const listed = await workspace.listVaultCredentials({
+        actor,
+        ...(principal.credentialKind === "session" ? { agentId: principal.agentId, delegationId: principal.delegationId } : {}),
+        ...(args.channel_id === undefined ? {} : { originChannelId: args.channel_id as string }),
+        now: Date.now(),
+      });
+      const credential = listed.credentials.find((item) => item.id === args.credential_id);
+      if (!credential) throw new Error("vault credential not found");
+      return { credential: credentialMetadata(credential) };
+    }
     default:
       throw new Error("tool is not implemented");
   }
+}
+
+function credentialMetadata(credential: Awaited<ReturnType<WorkspaceStub["listVaultCredentials"]>>["credentials"][number]) {
+  return {
+    id: credential.id,
+    name: credential.name,
+    description: credential.description,
+    env_var: credential.envVar ?? null,
+    tags: credential.tags,
+    commands: credential.commands,
+    proxy_hosts: credential.proxyHosts,
+    policy: credential.policy,
+    version: credential.version,
+    last_accessed_at: credential.lastAccessedAt ?? null,
+    access_count: credential.accessCount,
+  };
 }
 
 function resolveOwnedAgent<T extends { id: string; handle: string; isOwner: boolean }>(agents: readonly T[], argument: string): T {

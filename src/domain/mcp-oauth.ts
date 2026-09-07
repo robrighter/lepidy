@@ -798,7 +798,9 @@ export type McpToolName =
   | "agent_mark_unread"
   | "agent_post"
   | "agent_get_prompt"
-  | "agent_set_prompt";
+  | "agent_set_prompt"
+  | "list_credentials"
+  | "describe_credential";
 
 export type McpToolDefinition = {
   name: McpToolName;
@@ -989,6 +991,20 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     ),
     requiredScope: "agent",
     sessionCapable: false,
+  },
+  {
+    name: "list_credentials",
+    description: "List metadata for credentials available in the current member or delegated-agent context. Values and key wraps are never returned.",
+    inputSchema: objectSchema({ channel_id: string("Optional visible origin room id") }),
+    requiredScope: "vault",
+    sessionCapable: true,
+  },
+  {
+    name: "describe_credential",
+    description: "Describe one available credential's policy and supported use without returning its value, ciphertext, or key wraps.",
+    inputSchema: objectSchema({ credential_id: string("Credential id"), channel_id: string("Optional visible origin room id") }, ["credential_id"]),
+    requiredScope: "vault",
+    sessionCapable: true,
   },
 ] as const;
 

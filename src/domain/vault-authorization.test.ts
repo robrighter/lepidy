@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   decideVaultAuthorization,
+  vaultDenialHint,
   type VaultAuthorizationInput,
 } from "./vault-authorization";
 
@@ -17,6 +18,7 @@ function valid(): VaultAuthorizationInput {
       use: { members: ["member-1"], groups: [], agents: [], channels: [] },
       reveal: { members: ["member-1"], groups: [], agents: [], channels: [] },
       allowedDeliveries: ["inject", "file", "device_proxy", "reveal"],
+      projectAllowed: true,
       rateAvailable: true,
     },
     request: { delivery: "inject" },
@@ -45,6 +47,7 @@ describe("vault authorization contract", () => {
     ["signature", (x: VaultAuthorizationInput) => (x.device.signatureVerified = false), "request_unverified"],
     ["nonce", (x: VaultAuthorizationInput) => (x.device.nonceFresh = false), "request_unverified"],
     ["origin", (x: VaultAuthorizationInput) => (x.origin.verified = false), "origin_unverified"],
+    ["project", (x: VaultAuthorizationInput) => (x.credential.projectAllowed = false), "project_refused"],
     ["rate", (x: VaultAuthorizationInput) => (x.credential.rateAvailable = false), "rate_limited"],
   ])("VAULT-AUTH-002 mandatory %s failure overrides an ACL match", (_name, mutate, reason) => {
     const input = valid();
@@ -85,5 +88,11 @@ describe("vault authorization contract", () => {
     expect(decideVaultAuthorization(input)).toEqual({ kind: "needs_approval" });
     input.grantMatchesExactly = true;
     expect(decideVaultAuthorization(input)).toEqual({ kind: "allow", via: "grant" });
+  });
+
+  it("VAULT-AUTH-006 gives agents instructive denials that forbid circumvention", () => {
+    expect(vaultDenialHint("use_acl_refused", "GITHUB_TOKEN")).toContain("do not search files");
+    expect(vaultDenialHint("rate_limited", "GITHUB_TOKEN", 1_800_000_100_000)).toContain("Stop rather than retrying");
+    expect(vaultDenialHint("project_refused", "GITHUB_TOKEN")).toContain("do not retry from another project");
   });
 });

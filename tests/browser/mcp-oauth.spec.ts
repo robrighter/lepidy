@@ -281,7 +281,7 @@ test("MCP-INT-011 lists and executes scoped chat and agent tools with stable att
       slug,
       clientId,
       state: "state-011",
-      scope: "chat:read chat:write agent",
+      scope: "chat:read chat:write agent vault",
     }),
     clientId,
     slug,
@@ -294,7 +294,7 @@ test("MCP-INT-011 lists and executes scoped chat and agent tools with stable att
   expect(listedResponse.status()).toBe(200);
   const listed = (await listedResponse.json()) as { result: { tools: { name: string }[] } };
   expect(listed.result.tools.map((tool) => tool.name)).toEqual(
-    expect.arrayContaining(["whoami", "read_channel", "post_message", "agent_next", "agent_post"]),
+    expect.arrayContaining(["whoami", "read_channel", "post_message", "agent_next", "agent_post", "list_credentials", "describe_credential"]),
   );
   // D08e: no callable agent surface can manufacture a human vote.
   expect(listed.result.tools.map((tool) => tool.name)).not.toContain("vote");
@@ -443,6 +443,35 @@ test("MCP-INT-011 lists and executes scoped chat and agent tools with stable att
   });
   expect(insufficient.status()).toBe(403);
   expect(insufficient.headers()["www-authenticate"]).toContain("insufficient_scope");
+});
+
+test("MCP-INT-013 discovers vault metadata without returning ciphertext, wraps or plaintext", async ({ page }) => {
+  const account = freshAccount();
+  await signUp(page, account);
+  const slug = slugFor(account);
+  const sessionCookie = (await page.context().cookies()).find((cookie) => cookie.name === "lepidy_session");
+  expect(sessionCookie).toBeDefined();
+  const seeded = await page.request.post(`${BASE}/__fixture/vault`, { headers: { authorization: sessionCookie!.value } });
+  expect(seeded.status()).toBe(200);
+  const credentialId = ((await seeded.json()) as { credentialId: string }).credentialId;
+
+  const clientId = await registerClient(page.request, "Vault Metadata Client");
+  const tokens = await exchange(page.request, {
+    code: await consent(page, { slug, clientId, state: "state-013", scope: "vault" }),
+    clientId,
+    slug,
+  });
+  const listed = await callTool(page.request, { slug, accessToken: tokens.access_token, id: 40, name: "list_credentials" });
+  const described = await callTool(page.request, { slug, accessToken: tokens.access_token, id: 41, name: "describe_credential", arguments: { credential_id: credentialId } });
+  for (const response of [listed, described]) {
+    expect(response.status()).toBe(200);
+    const body = await response.text();
+    expect(body).toContain("BROWSER_TEST_TOKEN");
+    expect(body).not.toContain("browser-vault-plaintext-canary");
+    expect(body).not.toContain("ciphertext");
+    expect(body).not.toContain("wrappedDek");
+    expect(body).not.toContain("wrapped_dek");
+  }
 });
 
 test("MCP-INT-012 confines a runner session to its delegation on every tool", async ({ page }) => {
