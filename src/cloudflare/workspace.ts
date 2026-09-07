@@ -217,8 +217,10 @@ import {
   type VaultDelivery,
   type VaultScope,
 } from "../domain/vault-authorization";
+import { parseRemoteLocalAgentTrigger, type LocalAgentTrigger } from "../domain/local-agent-trigger";
 import {
   VAULT_WRAP_SUITE,
+  assertOpaqueId,
   validateVaultEnvelope,
   validateVaultKeyWrap,
   validateVaultPublicKey,
@@ -572,6 +574,48 @@ export type SocketAttachment = {
   connectedAt: number;
 };
 
+/**
+ * What a hibernated *runner* socket remembers about itself (R01).
+ *
+ * Deliberately a different shape from a member's. A runner is a machine, not a
+ * person: it has no read cursor, no replay, and it must never appear in
+ * presence — an owner's laptop showing as online because a headless daemon
+ * reconnected would be a lie about who is at the keyboard.
+ */
+export type RunnerAttachment = {
+  kind: "runner";
+  deviceId: string;
+  memberId: string;
+  authorizationEpoch: number;
+  /**
+   * The registration this socket belongs to. A runner that reregisters gets a
+   * higher epoch, and the older connection is closed rather than left to race
+   * the new one for the same queue.
+   */
+  runnerEpoch: number;
+  connectedAt: number;
+};
+
+/** The tag a runner socket is found by after hibernation. */
+export function runnerSocketTag(deviceId: string): string {
+  return `runner:${deviceId}`;
+}
+
+/**
+ * What the workspace is allowed to say to a runner.
+ *
+ * `wake` carries the D05a remote trigger and nothing else: a workspace id, an
+ * agent id, a device id, the *name* of a preset the machine already holds, that
+ * preset's revision, and a request id. There is no field for an executable, an
+ * argument, a path, an environment or a permission posture, so there is no
+ * remote launch configuration to smuggle. `stop` carries a reason a person
+ * could read.
+ */
+export type RunnerFrame =
+  | { type: "wake"; trigger: LocalAgentTrigger }
+  | { type: "stop"; agentId: string; reason: string }
+  | { type: "welcome"; deviceId: string; runnerEpoch: number; agentIds: readonly string[] };
+
 export type AgentSummary = {
   id: string;
   handle: string;
@@ -766,10 +810,42 @@ const SCHEDULED_SEND_BATCH = 25;
 /** A year is already further ahead than anybody means; beyond it is a mistake. */
 const MAX_SCHEDULE_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
 
+/**
+ * How many agents one machine may answer for.
+ *
+ * Not a licence limit: a bound on how much one registration can move at once,
+ * so a mistaken or hostile call cannot reassign an entire workspace's agents to
+ * one device in a single request.
+ */
+const MAX_RUNNER_AGENTS = 64;
+
+type RunnerDeviceRow = {
+  device_id: string;
+  member_id: string;
+  runner_epoch: number;
+  preset_revision: number;
+  registered_at: number;
+  last_seen_at: number | null;
+};
+
+/** A wake that has committed and is waiting to be handed to a socket. */
+type StagedRunnerWake = { deviceId: string; agentId: string; presetId: string; requestId: string };
+
 /** Roles that may create rooms. A guest joins what they are invited to. */
 const ROOM_CREATOR_ROLES: ReadonlySet<MemberProjection["role"]> = new Set(["owner", "admin", "member"]);
 
 export class Workspace extends DurableObject<CloudflareEnv> {
+  /**
+   * Wakes that a transaction has written and not yet handed to a socket.
+   *
+   * In memory on purpose, and short-lived: it lives only between the durable
+   * write and the send that follows it. The durable row in `runner_wakes` is
+   * the record; this is just the list of sends owed for the transaction that is
+   * committing. Losing it to an eviction costs nothing, because a runner
+   * collects whatever is undelivered the moment it reconnects.
+   */
+  private readonly stagedRunnerWakes = new Map<string, StagedRunnerWake>();
+
   constructor(ctx: DurableObjectState, env: CloudflareEnv) {
     super(ctx, env);
 
@@ -809,7 +885,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname !== "/_internal/member-socket" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("Not found", { status: 404 });
+    }
+    if (url.pathname === "/_internal/runner-socket") return this.acceptRunnerSocket(request);
+    if (url.pathname !== "/_internal/member-socket") {
       return new Response("Not found", { status: 404 });
     }
     const memberId = request.headers.get("x-lepidy-member-id") ?? "";
@@ -1346,6 +1426,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
    * Nothing here writes storage except an actual read-cursor advance.
    */
   webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {
+    const runner = this.runnerAttachmentOf(socket);
+    if (runner !== null) {
+      this.runnerSocketMessage(socket, runner, typeof message === "string" ? message : null);
+      return;
+    }
     const attachment = this.attachmentOf(socket);
     if (attachment === null) {
       socket.close(4001, "socket has no identity");
@@ -1379,6 +1464,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }
 
   webSocketClose(socket: WebSocket): void {
+    // A runner going away is not a presence change; it is a machine that will
+    // collect its pending wakes when it comes back.
+    if (this.runnerAttachmentOf(socket) !== null) return;
     const attachment = this.attachmentOf(socket);
     if (attachment === null) return;
     if (this.socketsFor(attachment.memberId).length <= 1) {
@@ -1442,8 +1530,18 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   /* -- realtime internals ---------------------------------------------- */
 
   private attachmentOf(socket: WebSocket): SocketAttachment | null {
-    const raw = socket.deserializeAttachment() as SocketAttachment | null;
+    const raw = socket.deserializeAttachment() as (SocketAttachment & { kind?: string }) | null;
+    // A runner carries a member id too, and must not be mistaken for one of
+    // that member's tabs: it would show up in presence, be sent replay frames
+    // and be counted as somebody being online.
+    if (raw !== null && raw.kind === "runner") return null;
     return raw && typeof raw.memberId === "string" ? raw : null;
+  }
+
+  private runnerAttachmentOf(socket: WebSocket): RunnerAttachment | null {
+    const raw = socket.deserializeAttachment() as (RunnerAttachment & { kind?: string }) | null;
+    if (raw === null || raw.kind !== "runner" || typeof raw.deviceId !== "string") return null;
+    return raw;
   }
 
   private socketsFor(memberId: string): WebSocket[] {
@@ -3462,6 +3560,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         effects: this.agentEffects("agent.status_set", agent, actor, { agent_status: input.status }),
       };
     });
+    // A machine that is mid-session finds out, rather than finishing the work
+    // anyway. The durable half of the stop is that the agent's next bounded
+    // call is refused; this is the half that arrives without waiting for one.
+    if (input.status !== "active") this.stopRunnersForAgent(agent.id, `agent_${input.status}`);
     return outcome.result;
   }
 
@@ -3602,6 +3704,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           : undefined,
       };
     });
+    if (outcome.result.revoked) this.stopRunnersForAgent(agent.id, "delegation_revoked");
     return outcome.result;
   }
 
@@ -6585,6 +6688,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         })
       ) {
         enqueued += 1;
+        // The wake commits with the queue row it announces (R01). Delivery
+        // happens after this transaction, and a wake nobody was listening for
+        // stays pending until a runner reconnects and collects it.
+        this.recordRunnerWake(agent.id, input.now);
       }
     }
     return enqueued;
@@ -7296,8 +7403,533 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }
 
   /* ------------------------------------------------------------------ */
+  /* The designated runner (R01)                                         */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Declare which agents this device answers for, and under which local preset.
+   *
+   * One device per agent, deliberately. Two machines both deciding they are the
+   * one that answers is how a single mention gets worked twice, and the queue's
+   * leases would then be the only thing standing between a duplicate and a
+   * duplicated side effect. Registering *moves* an agent to this device and says
+   * so; it never quietly shares one.
+   *
+   * The preset id is an opaque local name and the revision is that preset's own
+   * version. Neither describes anything: the workspace stores what the machine
+   * called its preset so it can name it back, and a name the machine no longer
+   * recognises is refused there rather than here.
+   */
+  async registerRunner(input: {
+    actor: Actor;
+    deviceId: string;
+    runnerEpoch: number;
+    presetRevision: number;
+    agents: readonly { agentId: string; presetId: string }[];
+    now: number;
+  }): Promise<{ deviceId: string; runnerEpoch: number; agentIds: readonly string[]; displacedDeviceIds: readonly string[] }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    assertOpaqueId(input.deviceId, "device id");
+    if (!Number.isSafeInteger(input.runnerEpoch) || input.runnerEpoch < 1) throw new Error("runner epoch is invalid");
+    if (!Number.isSafeInteger(input.presetRevision) || input.presetRevision < 1) {
+      throw new Error("preset revision is invalid");
+    }
+    if (input.agents.length > MAX_RUNNER_AGENTS) throw new Error("that is more agents than one runner may claim");
+
+    // Only agents this member owns. A runner acts for its owner; a device may
+    // not volunteer to answer for somebody else's agent.
+    const seen = new Set<string>();
+    const claims = input.agents
+      .filter((claim) => !seen.has(claim.agentId) && seen.add(claim.agentId) !== undefined)
+      .map((claim) => {
+        assertOpaqueId(claim.presetId, "preset id");
+        return { agent: this.requireOwnedAgent(claim.agentId, actor.id), presetId: claim.presetId };
+      });
+
+    // A device that registers again with an epoch it has already used would let
+    // a stale process reclaim agents a newer one took.
+    const existing = this.readRunnerDevice(input.deviceId);
+    if (existing !== null) {
+      if (existing.member_id !== actor.id) throw new Error("device is registered to another member");
+      if (input.runnerEpoch < existing.runner_epoch) throw new Error("runner epoch has already moved on");
+    }
+
+    const outcome = await this.commitMutation({ scope: "runner.register", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO runner_devices(device_id, member_id, runner_epoch, preset_revision, registered_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(device_id) DO UPDATE SET
+           runner_epoch = excluded.runner_epoch,
+           preset_revision = excluded.preset_revision,
+           last_seen_at = excluded.last_seen_at`,
+        input.deviceId, actor.id, input.runnerEpoch, input.presetRevision, input.now, input.now,
+      );
+
+      const displaced = new Set<string>();
+      for (const claim of claims) {
+        const current = this.ctx.storage.sql
+          .exec<{ device_id: string }>("SELECT device_id FROM runner_agents WHERE agent_id = ?", claim.agent.id)
+          .toArray()[0];
+        if (current !== undefined && current.device_id !== input.deviceId) displaced.add(current.device_id);
+        this.ctx.storage.sql.exec(
+          `INSERT INTO runner_agents(agent_id, device_id, assigned_at, preset_id) VALUES (?, ?, ?, ?)
+           ON CONFLICT(agent_id) DO UPDATE SET
+             device_id = excluded.device_id, assigned_at = excluded.assigned_at, preset_id = excluded.preset_id`,
+          claim.agent.id, input.deviceId, input.now, claim.presetId,
+        );
+        // A wake still addressed to the machine that just lost this agent would
+        // wake a runner that is no longer responsible for it.
+        this.ctx.storage.sql.exec(
+          "DELETE FROM runner_wakes WHERE agent_id = ? AND device_id <> ?", claim.agent.id, input.deviceId,
+        );
+      }
+
+      // Agents this device used to answer for and no longer claims are released
+      // rather than left pointing at a process that has stopped watching them.
+      const released = this.ctx.storage.sql
+        .exec<{ agent_id: string }>("SELECT agent_id FROM runner_agents WHERE device_id = ?", input.deviceId)
+        .toArray()
+        .map((row) => row.agent_id)
+        .filter((agentId) => !claims.some((claim) => claim.agent.id === agentId));
+      for (const agentId of released) {
+        this.ctx.storage.sql.exec("DELETE FROM runner_agents WHERE agent_id = ?", agentId);
+        this.ctx.storage.sql.exec("DELETE FROM runner_wakes WHERE agent_id = ?", agentId);
+      }
+
+      return {
+        result: {
+          deviceId: input.deviceId,
+          runnerEpoch: input.runnerEpoch,
+          agentIds: claims.map((claim) => claim.agent.id),
+          displacedDeviceIds: [...displaced].sort(),
+          releasedAgentIds: released,
+        },
+        effects: {
+          audit: {
+            eventType: "runner.registered",
+            outcome: "allowed",
+            requesterKind: "member",
+            requesterId: actor.id,
+            subjectKind: "device",
+            subjectId: input.deviceId,
+            // Counts and revisions only. What the presets are is the machine's
+            // business, and an audit record outlives the thing it describes.
+            metadata: {
+              agent_count: claims.length,
+              released_count: released.length,
+              runner_epoch: input.runnerEpoch,
+              config_revision: input.presetRevision,
+            },
+          },
+        } satisfies MutationEffects,
+      };
+    });
+
+    // Whatever was already connected for a displaced agent is told to stop, so
+    // two machines are never both working the same queue.
+    for (const deviceId of outcome.result.displacedDeviceIds) {
+      for (const agentId of outcome.result.agentIds) {
+        this.sendRunnerFrame(deviceId, { type: "stop", agentId, reason: "reassigned_to_another_device" });
+      }
+    }
+    for (const agentId of outcome.result.releasedAgentIds) {
+      this.sendRunnerFrame(input.deviceId, { type: "stop", agentId, reason: "released_by_runner" });
+    }
+    // An older process on this same device is no longer the runner.
+    this.closeSupersededRunnerSockets(input.deviceId, input.runnerEpoch);
+    return {
+      deviceId: outcome.result.deviceId,
+      runnerEpoch: outcome.result.runnerEpoch,
+      agentIds: outcome.result.agentIds,
+      displacedDeviceIds: outcome.result.displacedDeviceIds,
+    };
+  }
+
+  /**
+   * How much work is waiting for the agents this device answers for.
+   *
+   * The runner asks on every connection and after every process exit, and that
+   * is what closes the lost-wake race without anything being held open. D03
+   * measured the cost: one bounded call is the entire price of a wake that
+   * never arrived, which is why this design does not need a parked request to
+   * avoid losing work.
+   */
+  runnerQueueDepth(input: { actor: Actor; deviceId: string; now: number }): {
+    runnerEpoch: number;
+    agents: readonly { agentId: string; handle: string; presetId: string; depth: number; status: AgentRow["status"] }[];
+  } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const device = this.requireRunnerDevice(input.deviceId, actor.id);
+    this.ctx.storage.sql.exec(
+      "UPDATE runner_devices SET last_seen_at = ? WHERE device_id = ?", input.now, input.deviceId,
+    );
+
+    const agents: { agentId: string; handle: string; presetId: string; depth: number; status: AgentRow["status"] }[] = [];
+    const rows = this.ctx.storage.sql
+      .exec<{ agent_id: string; preset_id: string }>(
+        "SELECT agent_id, preset_id FROM runner_agents WHERE device_id = ? ORDER BY agent_id", input.deviceId,
+      )
+      .toArray();
+    for (const row of rows) {
+      const agent = readAgent(this.ctx.storage, row.agent_id);
+      if (agent === null) continue;
+      // A paused or archived agent reports no depth. Its queue may not be
+      // empty, but nothing on this machine should start a process for it.
+      const depth = agent.status === "active"
+        ? this.ctx.storage.sql
+            .exec<{ depth: number }>(
+              // Work a runner could actually claim right now. A leased item is
+              // somebody else's turn, and counting it would have the runner
+              // start a process for work it is about to be refused.
+              `SELECT COUNT(*) AS depth FROM agent_queue
+               WHERE agent_id = ? AND execution_state IN ('pending', 'needs_attention') AND not_before <= ?`,
+              agent.id,
+              input.now,
+            )
+            .one().depth
+        : 0;
+      agents.push({ agentId: agent.id, handle: agent.handle, presetId: row.preset_id, depth, status: agent.status });
+    }
+    return { runnerEpoch: device.runner_epoch, agents };
+  }
+
+  /** What a runner sees of its own registration, for a status command. */
+  describeRunner(input: { actor: Actor; deviceId: string }): {
+    deviceId: string;
+    runnerEpoch: number;
+    presetRevision: number;
+    connected: boolean;
+    pendingWakes: number;
+    agentIds: readonly string[];
+  } {
+    const actor = this.authorizeActor(input.actor);
+    const device = this.requireRunnerDevice(input.deviceId, actor.id);
+    return {
+      deviceId: device.device_id,
+      runnerEpoch: device.runner_epoch,
+      presetRevision: device.preset_revision,
+      connected: this.ctx.getWebSockets(runnerSocketTag(device.device_id)).length > 0,
+      pendingWakes: this.ctx.storage.sql
+        .exec<{ pending: number }>(
+          "SELECT COUNT(*) AS pending FROM runner_wakes WHERE device_id = ? AND delivered_at IS NULL", device.device_id,
+        )
+        .one().pending,
+      agentIds: this.ctx.storage.sql
+        .exec<{ agent_id: string }>("SELECT agent_id FROM runner_agents WHERE device_id = ? ORDER BY agent_id", device.device_id)
+        .toArray()
+        .map((row) => row.agent_id),
+    };
+  }
+
+  /**
+   * Stop answering for these agents, and stop anything already running.
+   *
+   * This is the offline half of the stop story: an owner turning a runner off
+   * from anywhere, without needing the machine to be reachable. The rows go
+   * away, so nothing new is queued for it; the frames are best effort, because
+   * a machine that is not listening is exactly the case this must still work in.
+   */
+  async releaseRunner(input: { actor: Actor; deviceId: string; reason?: string | null; now: number }): Promise<{ released: number }> {
+    const actor = this.authorizeActor(input.actor);
+    const device = this.requireRunnerDevice(input.deviceId, actor.id);
+    const reason = (input.reason ?? "released_by_owner").slice(0, 200);
+    const outcome = await this.commitMutation({ scope: "runner.release", now: input.now }, () => {
+      const agentIds = this.ctx.storage.sql
+        .exec<{ agent_id: string }>("SELECT agent_id FROM runner_agents WHERE device_id = ?", device.device_id)
+        .toArray()
+        .map((row) => row.agent_id);
+      this.ctx.storage.sql.exec("DELETE FROM runner_agents WHERE device_id = ?", device.device_id);
+      this.ctx.storage.sql.exec("DELETE FROM runner_wakes WHERE device_id = ?", device.device_id);
+      this.ctx.storage.sql.exec("DELETE FROM runner_devices WHERE device_id = ?", device.device_id);
+      return {
+        result: { agentIds },
+        effects: {
+          audit: {
+            eventType: "runner.released", outcome: "allowed", requesterKind: "member", requesterId: actor.id,
+            subjectKind: "device", subjectId: device.device_id,
+            metadata: { agent_count: agentIds.length, reason },
+          },
+        } satisfies MutationEffects,
+      };
+    });
+    for (const agentId of outcome.result.agentIds) {
+      this.sendRunnerFrame(device.device_id, { type: "stop", agentId, reason });
+    }
+    for (const socket of this.ctx.getWebSockets(runnerSocketTag(device.device_id))) {
+      try {
+        socket.close(4004, "runner released");
+      } catch {
+        // Already gone, which is the outcome this was asking for.
+      }
+    }
+    return { released: outcome.result.agentIds.length };
+  }
+
+  /* -- runner internals ------------------------------------------------ */
+
+  /**
+   * Accept a runner's outbound connection.
+   *
+   * Outbound, and only outbound: nothing listens on the machine, no port is
+   * opened, and the workspace never dials a home network. The runner connects
+   * to the workspace and the workspace answers on the socket the runner already
+   * holds — which is what makes this work from a laptop behind NAT without any
+   * of it being reachable from the internet.
+   */
+  private acceptRunnerSocket(request: Request): Response {
+    const url = new URL(request.url);
+    const memberId = request.headers.get("x-lepidy-member-id") ?? "";
+    const authorizationEpoch = Number(request.headers.get("x-lepidy-authorization-epoch"));
+    const deviceId = request.headers.get("x-lepidy-device-id") ?? "";
+    const runnerEpoch = Number(url.searchParams.get("runner_epoch") ?? "");
+    if (!this.authorizeMember(memberId, authorizationEpoch)) {
+      return new Response("Forbidden", { status: 403 });
+    }
+    const device = this.readRunnerDevice(deviceId);
+    // A socket is not a registration. A device that has not registered, or that
+    // has been released, or whose epoch has moved on, has nothing to listen for.
+    if (device === null || device.member_id !== memberId) {
+      return new Response("Runner is not registered", { status: 409 });
+    }
+    if (!Number.isSafeInteger(runnerEpoch) || runnerEpoch !== device.runner_epoch) {
+      return new Response("Runner epoch is stale", { status: 409 });
+    }
+
+    const now = Date.now();
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1], [runnerSocketTag(deviceId)]);
+    const attachment: RunnerAttachment = { kind: "runner", deviceId, memberId, authorizationEpoch, runnerEpoch, connectedAt: now };
+    pair[1].serializeAttachment(attachment);
+    this.ctx.storage.sql.exec("UPDATE runner_devices SET last_seen_at = ? WHERE device_id = ?", now, deviceId);
+
+    const agentIds = this.ctx.storage.sql
+      .exec<{ agent_id: string }>("SELECT agent_id FROM runner_agents WHERE device_id = ? ORDER BY agent_id", deviceId)
+      .toArray()
+      .map((row) => row.agent_id);
+    this.sendRunnerFrame(pair[1], { type: "welcome", deviceId, runnerEpoch, agentIds });
+    // Whatever was queued while nobody was listening is delivered now. This is
+    // the reconnect path, and it is the only path: the same code runs on a
+    // first connection and after an eviction, so it is exercised constantly
+    // rather than only during an incident.
+    this.flushRunnerWakes(deviceId, now);
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  /**
+   * A runner has nothing it needs to tell the workspace over this socket.
+   *
+   * Everything a runner *does* — claiming, starting, completing — happens over
+   * signed MCP calls that carry their own authority. Accepting instructions
+   * here would be a second, weaker path to the same effects, so there isn't one.
+   */
+  private runnerSocketMessage(socket: WebSocket, attachment: RunnerAttachment, message: string | null): void {
+    if (!this.authorizeMember(attachment.memberId, attachment.authorizationEpoch)) {
+      socket.close(4003, "membership authority changed");
+      return;
+    }
+    const device = this.readRunnerDevice(attachment.deviceId);
+    if (device === null || device.runner_epoch !== attachment.runnerEpoch) {
+      socket.close(4004, "runner registration has moved on");
+      return;
+    }
+    // One frame is accepted, and it says nothing: a keepalive the runtime's
+    // auto-response cannot cover because the runner sends it on its own timer.
+    if (message !== null && message.length <= 64 && message.includes("ping")) {
+      try {
+        socket.send(JSON.stringify({ type: "pong" }));
+      } catch {
+        // Gone; the next connection collects whatever is pending.
+      }
+      return;
+    }
+    socket.close(4002, "runner sockets receive only");
+  }
+
+  /**
+   * Record that an agent has work, inside the caller's transaction.
+   *
+   * The wake commits with the queue row it announces, so it cannot be lost by a
+   * delivery that failed, and delivery is staged rather than done here: a
+   * transaction that rolls back must not leave a runner having been told about
+   * work that does not exist.
+   */
+  private recordRunnerWake(agentId: string, now: number): void {
+    const assignment = this.ctx.storage.sql
+      .exec<{ device_id: string; preset_id: string }>(
+        "SELECT device_id, preset_id FROM runner_agents WHERE agent_id = ?", agentId,
+      )
+      .toArray()[0];
+    if (assignment === undefined) return;
+    const requestId = crypto.randomUUID();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO runner_wakes(agent_id, device_id, request_id, enqueued_at, delivered_at)
+       VALUES (?, ?, ?, ?, NULL)
+       ON CONFLICT(agent_id, device_id) DO UPDATE SET
+         request_id = excluded.request_id, enqueued_at = excluded.enqueued_at, delivered_at = NULL`,
+      agentId, assignment.device_id, requestId, now,
+    );
+    this.stagedRunnerWakes.set(`${assignment.device_id} ${agentId}`, {
+      deviceId: assignment.device_id,
+      agentId,
+      presetId: assignment.preset_id,
+      requestId,
+    });
+  }
+
+  /**
+   * Deliver the wakes a committed transaction produced.
+   *
+   * Called by `commitMutation` after the durable write and never before it, so
+   * a runner is only ever woken for work that actually exists.
+   */
+  private flushStagedRunnerWakes(now: number): void {
+    if (this.stagedRunnerWakes.size === 0) return;
+    const staged = [...this.stagedRunnerWakes.values()];
+    this.stagedRunnerWakes.clear();
+    for (const wake of staged) {
+      if (this.deliverRunnerWake(wake)) {
+        this.ctx.storage.sql.exec(
+          "UPDATE runner_wakes SET delivered_at = ? WHERE agent_id = ? AND device_id = ?", now, wake.agentId, wake.deviceId,
+        );
+      }
+    }
+  }
+
+  /** Hand a device every wake it has not been given, oldest first. */
+  private flushRunnerWakes(deviceId: string, now: number): number {
+    const pending = this.ctx.storage.sql
+      .exec<{ agent_id: string; request_id: string }>(
+        `SELECT agent_id, request_id FROM runner_wakes
+         WHERE device_id = ? AND delivered_at IS NULL ORDER BY enqueued_at`,
+        deviceId,
+      )
+      .toArray();
+    let delivered = 0;
+    for (const row of pending) {
+      const assignment = this.ctx.storage.sql
+        .exec<{ preset_id: string }>("SELECT preset_id FROM runner_agents WHERE agent_id = ? AND device_id = ?", row.agent_id, deviceId)
+        .toArray()[0];
+      if (assignment === undefined) continue;
+      const sent = this.deliverRunnerWake({ deviceId, agentId: row.agent_id, presetId: assignment.preset_id, requestId: row.request_id });
+      if (!sent) continue;
+      this.ctx.storage.sql.exec(
+        "UPDATE runner_wakes SET delivered_at = ? WHERE agent_id = ? AND device_id = ?", now, row.agent_id, deviceId,
+      );
+      delivered += 1;
+    }
+    return delivered;
+  }
+
+  /**
+   * Build and send one wake.
+   *
+   * The frame is run through the same D05a parser the runner will use, here, on
+   * the way out. It is not defensive theatre: it means a field added to this
+   * frame in future has to be added to the trigger schema deliberately, in a
+   * file whose whole purpose is to refuse remote launch configuration, rather
+   * than arriving quietly on a socket.
+   */
+  private deliverRunnerWake(wake: { deviceId: string; agentId: string; presetId: string; requestId: string }): boolean {
+    let trigger: LocalAgentTrigger;
+    try {
+      trigger = parseRemoteLocalAgentTrigger({
+        workspaceId: this.workspaceKey(),
+        agentId: wake.agentId,
+        deviceId: wake.deviceId,
+        presetId: wake.presetId,
+        configRevision: this.readRunnerDevice(wake.deviceId)?.preset_revision ?? 1,
+        requestId: wake.requestId,
+      });
+    } catch {
+      return false;
+    }
+    return this.sendRunnerFrame(wake.deviceId, { type: "wake", trigger });
+  }
+
+  /** Send one frame to every socket a device holds. */
+  private sendRunnerFrame(target: string | WebSocket, frame: RunnerFrame): boolean {
+    const sockets = typeof target === "string" ? this.ctx.getWebSockets(runnerSocketTag(target)) : [target];
+    let sent = false;
+    for (const socket of sockets) {
+      try {
+        socket.send(JSON.stringify(frame));
+        sent = true;
+      } catch {
+        // A socket that cannot be written to is gone. The durable wake stays
+        // where it is and the next connection collects it.
+      }
+    }
+    return sent;
+  }
+
+  /**
+   * Stop whichever runner is working this agent.
+   *
+   * Called wherever an agent's authority ends — paused, archived, its delegation
+   * revoked — so a machine that is mid-session finds out rather than finishing
+   * the work anyway. It is best effort by design: the durable refusal is that
+   * the agent's next bounded call is denied, which D03 measured at one call.
+   */
+  private stopRunnersForAgent(agentId: string, reason: string): void {
+    const assignment = this.ctx.storage.sql
+      .exec<{ device_id: string }>("SELECT device_id FROM runner_agents WHERE agent_id = ?", agentId)
+      .toArray()[0];
+    if (assignment === undefined) return;
+    // A wake nobody has collected yet must not survive the stop that overtook it.
+    this.ctx.storage.sql.exec("DELETE FROM runner_wakes WHERE agent_id = ?", agentId);
+    this.sendRunnerFrame(assignment.device_id, { type: "stop", agentId, reason });
+  }
+
+  /** Close connections left over from an earlier registration of this device. */
+  private closeSupersededRunnerSockets(deviceId: string, runnerEpoch: number): void {
+    for (const socket of this.ctx.getWebSockets(runnerSocketTag(deviceId))) {
+      const attachment = this.runnerAttachmentOf(socket);
+      if (attachment === null || attachment.runnerEpoch >= runnerEpoch) continue;
+      try {
+        socket.close(4004, "runner registration has moved on");
+      } catch {
+        // Already gone.
+      }
+    }
+  }
+
+  private readRunnerDevice(deviceId: string): RunnerDeviceRow | null {
+    if (deviceId.length === 0) return null;
+    return (
+      this.ctx.storage.sql
+        .exec<RunnerDeviceRow>(
+          `SELECT device_id, member_id, runner_epoch, preset_revision, registered_at, last_seen_at
+           FROM runner_devices WHERE device_id = ?`,
+          deviceId,
+        )
+        .toArray()[0] ?? null
+    );
+  }
+
+  /** Somebody else's device is reported as unregistered, not as forbidden. */
+  private requireRunnerDevice(deviceId: string, memberId: string): RunnerDeviceRow {
+    const device = this.readRunnerDevice(deviceId);
+    if (device === null || device.member_id !== memberId) throw new Error("runner is not registered");
+    return device;
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Alarm scheduler, transactional outbox and audit baseline (F06)      */
   /* ------------------------------------------------------------------ */
+
+  /**
+   * Run one mutation transaction, discarding any wake it staged if it fails.
+   */
+  private runTransactionOrDiscardWakes<T>(apply: () => T): T {
+    try {
+      return this.ctx.storage.transactionSync(apply);
+    } catch (error) {
+      this.stagedRunnerWakes.clear();
+      throw error;
+    }
+  }
 
   /**
    * The single durable transaction envelope every workspace mutation uses.
@@ -7322,7 +7954,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     if (input.idempotencyKey && key === null) throw new Error("invalid idempotency key");
     const requestHash = input.requestHash ?? "";
 
-    const committed = this.ctx.storage.transactionSync(() => {
+    // A rolled-back transaction leaves nothing owed. Without this, a wake
+    // staged by a mutation that failed would be delivered by whichever mutation
+    // committed next, waking a runner for work that was never written.
+    this.stagedRunnerWakes.clear();
+    const committed = this.runTransactionOrDiscardWakes(() => {
       if (key !== null) {
         const stored = this.ctx.storage.sql
           .exec<{ request_hash: string; response_json: string }>(
@@ -7373,6 +8009,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       return { replayed: false, result, audit, outboxQueued };
     });
 
+    // Runner wakes are sent here and nowhere else: after the transaction has
+    // committed, never inside it. A rolled-back transaction must not leave a
+    // machine having been told about work that does not exist.
+    this.flushStagedRunnerWakes(input.now);
     return { ...committed, alarmAt: await this.armAlarm() };
   }
 

@@ -945,6 +945,18 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX runner_wakes_pending_idx ON runner_wakes(device_id, delivered_at)`,
     ],
   },
+  {
+    version: 23,
+    name: "Runner preset identity per agent",
+    statements: [
+      // Which local preset this device runs for this agent, as an opaque name
+      // the device itself registered. The cloud may name a preset the machine
+      // already holds; it may never describe one, and a name the machine does
+      // not recognise is refused locally. That is the whole of the remote
+      // trigger's authority over what runs.
+      `ALTER TABLE runner_agents ADD COLUMN preset_id TEXT NOT NULL DEFAULT ''`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {
