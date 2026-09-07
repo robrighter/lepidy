@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 
 import { freshAccount, signUp } from "./auth-helpers";
 import { LOCALHOST_BASE } from "./device-helpers";
-import { CANARY, registerPasskey, requestRelease, seedAskCredential } from "./vault-helpers";
+import { CANARY, registerPasskey, requestRelease, seedAskCredential, seedCapturedCredential } from "./vault-helpers";
 
 /**
  * The vault and agent pages, driven against the built Worker.
@@ -127,4 +127,34 @@ test("VAULT-UI-INT-003 cuts one agent off from the vault without silencing it, w
   await expect(page.getByRole("button", { name: "Switch its vault access on" })).toBeDisabled();
   await expect(page.getByText(/needs a passkey on your account/)).toBeVisible();
   await context.close();
+});
+
+test("VAULT-UI-INT-004 shows a captured credential as unusable until somebody confirms it", async ({ page }) => {
+  const fixture = await seedCapturedCredential(page);
+
+  await page.goto(`${LOCALHOST_BASE}/vault/${fixture.credentialId}`);
+  await expect(page.getByRole("heading", { name: "CAPTURED_TOKEN" })).toBeVisible();
+  // The page says what produced it and why it cannot be used yet, which is the
+  // whole point of letting an agent create one at all.
+  // The description says it too, so the banner is addressed specifically.
+  await expect(page.getByText(/Captured from .* and switched off/)).toBeVisible();
+  await expect(page.getByText(/cannot make one usable/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Confirm this capture" })).toBeVisible();
+
+  // And it really is unusable: a release is refused while it waits.
+  const refused = (await (await requestRelease(page, fixture)).json()) as {
+    results: { decision: { kind: string; reason?: string } }[];
+  };
+  expect(refused.results[0].decision).toEqual({ kind: "deny", reason: "credential_frozen" });
+
+  await registerPasskey(page);
+  await page.goto(`${LOCALHOST_BASE}/vault/${fixture.credentialId}`);
+  await page.getByRole("button", { name: "Confirm this capture" }).click();
+  await expect(page.getByText(/cannot make one usable/)).toBeHidden();
+
+  // Confirmed, it behaves like any other ask-every-time credential.
+  const asked = (await (await requestRelease(page, fixture)).json()) as {
+    results: { decision: { kind: string } }[];
+  };
+  expect(asked.results[0].decision.kind).toBe("needs_approval");
 });

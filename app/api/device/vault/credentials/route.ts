@@ -52,6 +52,10 @@ export async function POST(request: Request) {
       envelope: body.envelope as VaultCiphertextEnvelope,
       wraps: body.wraps as readonly VaultKeyWrap[],
       acl: body.acl as readonly VaultAclEntry[],
+      // A capture names the program whose output became the value. The
+      // workspace stores it switched off until a custodian has seen it, which
+      // is what makes a write path an agent can reach safe to have.
+      ...(typeof body.capturedFrom === "string" ? { capturedFrom: body.capturedFrom } : {}),
       freshUserVerification: true,
       localVaultUnlocked: true,
       now: Date.now(),

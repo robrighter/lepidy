@@ -45,8 +45,33 @@ export default async function CredentialPage({ params }: { params: Promise<{ cre
           enrolled client and never sent here. This page shows what the credential is and who may use it; it has no
           way to receive the value, and the servers behind it hold ciphertext they cannot open.
         </p>
+        {detail.rotation === "none" ? null : (
+          <p className={detail.rotation === "overdue" ? "vault-frozen" : "approval-note"}>
+            {detail.rotation === "overdue"
+              ? "This credential is past the date it was meant to be replaced."
+              : "This credential is due to be replaced within a week."}{" "}
+            Rotate it from a client that holds its key: <code>lepidy rotate {detail.credential.name}</code>. This page
+            cannot do it — rotation re-encrypts the value, and the key for that has never been here.
+          </p>
+        )}
         <div className="vault-switch">
-          {detail.frozen ? (
+          {detail.awaitingCaptureReview ? (
+            <>
+              <p className="vault-frozen">
+                Captured from <code>{detail.capturedFrom ?? "a command"}</code> and switched off until you confirm it.
+                An agent can create a credential this way but cannot make one usable, which is what stops a captured
+                value from quietly replacing something you rely on.
+              </p>
+              {detail.viewer.mayManage ? (
+                <VaultStepUpSwitch
+                  action="vault.credential_on"
+                  subjectId={detail.credential.id}
+                  label="Confirm this capture"
+                  hasPasskey={hasPasskey}
+                />
+              ) : null}
+            </>
+          ) : detail.frozen ? (
             <>
               <p className="vault-frozen">
                 Switched off by @{detail.frozenByHandle ?? "somebody"}. Nobody can use it until it goes back on.
@@ -124,6 +149,26 @@ export default async function CredentialPage({ params }: { params: Promise<{ cre
               ? "no hourly limit"
               : `${detail.credential.policy.maxUsesPerHour} uses per hour`}
           </dd>
+          {detail.credential.kind === "structured" ? (
+            <>
+              <dt>Expands into</dt>
+              <dd>
+                {(detail.credential.fields ?? [])
+                  .map((field) => `${detail.credential.name}_${field}`)
+                  .join(", ")}
+              </dd>
+            </>
+          ) : null}
+          {detail.credential.rotateAt === undefined ? null : (
+            <>
+              <dt>Replace by</dt>
+              <dd>
+                <time dateTime={new Date(detail.credential.rotateAt).toISOString()}>
+                  {new Date(detail.credential.rotateAt).toISOString()}
+                </time>
+              </dd>
+            </>
+          )}
           <dt>Projects</dt>
           <dd>
             {detail.credential.policy.projectIds.length === 0

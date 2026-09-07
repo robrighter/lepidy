@@ -812,4 +812,120 @@ describe("encrypted credential vault", () => {
       );
     });
   });
+
+  it("VAULT-INT-019 accepts a captured value once, switched off until somebody confirms it", async () => {
+    const seeded = await seed("vault-capture");
+    const credentialId = "credential-CAPTURED";
+    const encrypted = await encryptVaultValue({
+      workspaceId: seeded.stub.id.toString(), credentialId, version: 1, keyEpoch: 1,
+      plaintext: encoder.encode("captured-plaintext-canary"),
+    });
+    const create = (id: string, key: string) =>
+      seeded.stub.createVaultCredential({
+        actor: seeded.owner, idempotencyKey: key, credentialId: id,
+        metadata: { name: "CAPTURED_TOKEN", description: "From a command", tags: [], commands: [], proxyHosts: [] },
+        // The most restrictive policy there is: inject only, ask every time, no
+        // TTL. A human loosens it afterwards, deliberately.
+        policy: { mode: "ask", allowedDeliveries: ["inject"], projectIds: [], highRisk: false },
+        envelope: encrypted.envelope, wraps: [wrap()],
+        acl: [
+          { subjectType: "member", subjectId: "owner", verb: "manage" },
+          { subjectType: "member", subjectId: "owner", verb: "use" },
+        ],
+        capturedFrom: "gh", freshUserVerification: true, localVaultUnlocked: true, now: NOW + 3,
+      });
+    await expect(create(credentialId, "vault:capture:0001")).resolves.toMatchObject({ created: true });
+
+    const detail = await seeded.stub.describeVaultCredential({ actor: seeded.owner, credentialId, now: NOW + 4 });
+    expect(detail).toMatchObject({ frozen: true, awaitingCaptureReview: true, capturedFrom: "gh" });
+
+    // Switched off means switched off: nothing can use it, not even under an
+    // automatic policy, until a human has seen what produced it.
+    const refused = await seeded.stub.releaseVaultCredential({
+      actor: seeded.owner, credentialId,
+      device: { id: "device-a", active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+      origin: { channelId: seeded.channelId, messageId: seeded.messageId },
+      projectId: "project-a", delivery: "inject", now: NOW + 5,
+    });
+    expect(refused.decision).toEqual({ kind: "deny", reason: "credential_frozen" });
+
+    // Create-only, which is what kills the credential-swap attack: a second
+    // capture of the same name is refused rather than overwriting.
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      await expect(
+        instance.createVaultCredential({
+          actor: seeded.owner, idempotencyKey: "vault:capture:0002", credentialId: "credential-OTHER",
+          metadata: { name: "CAPTURED_TOKEN", description: "", tags: [], commands: [], proxyHosts: [] },
+          policy: { mode: "ask", allowedDeliveries: ["inject"], projectIds: [], highRisk: false },
+          envelope: encrypted.envelope, wraps: [wrap()],
+          acl: [{ subjectType: "member", subjectId: "owner", verb: "manage" }],
+          capturedFrom: "gh", freshUserVerification: true, localVaultUnlocked: true, now: NOW + 6,
+        }),
+      ).rejects.toThrow();
+      // And the program's name is all that may be recorded.
+      await expect(
+        instance.createVaultCredential({
+          actor: seeded.owner, idempotencyKey: "vault:capture:0003", credentialId: "credential-ARGV",
+          metadata: { name: "ARGV_TOKEN", description: "", tags: [], commands: [], proxyHosts: [] },
+          policy: { mode: "ask", allowedDeliveries: ["inject"], projectIds: [], highRisk: false },
+          envelope: encrypted.envelope, wraps: [wrap()],
+          acl: [{ subjectType: "member", subjectId: "owner", verb: "manage" }],
+          capturedFrom: "gh auth token", freshUserVerification: true, localVaultUnlocked: true, now: NOW + 6,
+        }),
+      ).rejects.toThrow(/bare program name/);
+    });
+
+    // Confirming it is the ordinary switch-on, and then it behaves like any
+    // other ask-every-time credential.
+    await expect(
+      seeded.stub.setVaultCredentialFreeze({ actor: seeded.owner, credentialId, frozen: false, now: NOW + 7 }),
+    ).resolves.toMatchObject({ frozen: false });
+    const confirmed = await seeded.stub.describeVaultCredential({ actor: seeded.owner, credentialId, now: NOW + 8 });
+    expect(confirmed).toMatchObject({ frozen: false, awaitingCaptureReview: false, capturedFrom: "gh" });
+    const asked = await seeded.stub.releaseVaultCredential({
+      actor: seeded.owner, credentialId,
+      device: { id: "device-a", active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+      origin: { channelId: seeded.channelId, messageId: seeded.messageId },
+      projectId: "project-a", delivery: "inject", now: NOW + 9,
+    });
+    expect(asked.decision).toEqual({ kind: "needs_approval" });
+    expect(JSON.stringify(confirmed)).not.toContain("captured-plaintext-canary");
+  });
+
+  it("VAULT-INT-020 carries a structured credential's field names and its rotation date as metadata", async () => {
+    const seeded = await seed("vault-structured");
+    const credentialId = "credential-DATABASE";
+    const encrypted = await encryptVaultValue({
+      workspaceId: seeded.stub.id.toString(), credentialId, version: 1, keyEpoch: 1,
+      plaintext: encoder.encode(JSON.stringify({ HOST: "db.example.test", PASSWORD: "structured-plaintext-canary" })),
+    });
+    await seeded.stub.createVaultCredential({
+      actor: seeded.owner, idempotencyKey: "vault:structured:0001", credentialId,
+      metadata: {
+        name: "DATABASE", description: "Staging database", tags: ["db"], commands: [], proxyHosts: [],
+        kind: "structured", fields: ["HOST", "PASSWORD"], rotateAt: NOW + 60_000,
+      },
+      policy: { mode: "auto", allowedDeliveries: ["inject"], projectIds: [], highRisk: false },
+      envelope: encrypted.envelope, wraps: [wrap()],
+      acl: [
+        { subjectType: "member", subjectId: "owner", verb: "manage" },
+        { subjectType: "member", subjectId: "owner", verb: "use" },
+      ],
+      freshUserVerification: true, localVaultUnlocked: true, now: NOW + 3,
+    });
+
+    const detail = await seeded.stub.describeVaultCredential({ actor: seeded.owner, credentialId, now: NOW + 4 });
+    // The field names say what it expands into; the values behind them are in
+    // the ciphertext and no field on this result can reach them.
+    expect(detail.credential).toMatchObject({ kind: "structured", fields: ["HOST", "PASSWORD"], rotateAt: NOW + 60_000 });
+    expect(detail.rotation).toBe("due_soon");
+    expect(JSON.stringify(detail)).not.toContain("structured-plaintext-canary");
+    expect(JSON.stringify(detail)).not.toContain("db.example.test");
+
+    // The listing carries the same metadata, so a page can show what a
+    // credential expands into without opening anything.
+    const listed = await seeded.stub.listVaultCredentials({ actor: seeded.owner, now: NOW + 4 });
+    expect(listed.credentials[0]).toMatchObject({ kind: "structured", fields: ["HOST", "PASSWORD"] });
+    expect(JSON.stringify(listed)).not.toContain("structured-plaintext-canary");
+  });
 });

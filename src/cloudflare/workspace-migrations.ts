@@ -891,6 +891,26 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `ALTER TABLE agents ADD COLUMN vault_access_off_by_member_id TEXT REFERENCES members(id) ON DELETE SET NULL`,
     ],
   },
+  {
+    version: 21,
+    name: "Captured credentials, kinds and rotation dates",
+    statements: [
+      // A structured credential is one record that expands into several
+      // variables. The field *names* live here so a page can say what it
+      // expands into; the values are inside the ciphertext and nothing in this
+      // schema can reach them.
+      `ALTER TABLE vault_credentials ADD COLUMN kind TEXT NOT NULL DEFAULT 'opaque' CHECK (kind IN ('opaque', 'structured'))`,
+      `ALTER TABLE vault_credentials ADD COLUMN fields_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(fields_json))`,
+      `ALTER TABLE vault_credentials ADD COLUMN rotate_at INTEGER`,
+      // Why a credential is switched off, so "a human pulled the switch" and
+      // "captured, nobody has confirmed it yet" do not read the same.
+      `ALTER TABLE vault_credentials ADD COLUMN frozen_reason TEXT CHECK (frozen_reason IN ('switched_off', 'awaiting_capture_review'))`,
+      // What produced a captured value: the program's name, never its
+      // arguments. Arguments are where a path or a secret would be, and the
+      // authorization contract keeps local commands out of cloud state.
+      `ALTER TABLE vault_credentials ADD COLUMN captured_from TEXT`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

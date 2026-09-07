@@ -459,6 +459,67 @@ pub fn allow_release(vault_public_key: &[u8]) -> Value {
     allow_release_many(vault_public_key, &[CREDENTIAL_ID])
 }
 
+/// A release carrying a specific value, for the scenarios where what is inside
+/// the envelope is the thing under test.
+pub fn allow_release_value(vault_public_key: &[u8], credential_id: &str, value: &str) -> Value {
+    let mut release = allow_release_many(vault_public_key, &[credential_id]);
+    let sealed = seal_for(vault_public_key, credential_id, value);
+    release["results"][0]["envelope"] = sealed.0;
+    release["results"][0]["wrap"] = sealed.1;
+    release
+}
+
+fn seal_for(vault_public_key: &[u8], credential_id: &str, value: &str) -> (Value, Value) {
+    use lepidy_cli::crypto::{
+        aes_gcm_encrypt, credential_aad, encode, random_bytes, wrap_aad, wrap_dek, DEK_BYTES,
+        IV_BYTES,
+    };
+    let dek = random_bytes(DEK_BYTES);
+    let iv = random_bytes(IV_BYTES);
+    let ciphertext = aes_gcm_encrypt(
+        &dek,
+        &iv,
+        &credential_aad(WORKSPACE_ID, credential_id, 1),
+        value.as_bytes(),
+    )
+    .expect("a sealed value");
+    let wrap = wrap_dek(
+        vault_public_key,
+        &dek,
+        &wrap_aad(WORKSPACE_ID, credential_id, 1, MEMBER_ID, 1),
+    )
+    .expect("a sealed DEK");
+    (
+        json!({
+            "cipherSuite": "AES-256-GCM", "aadVersion": 1, "version": 1, "keyEpoch": 1,
+            "iv": encode(&iv), "ciphertext": encode(&ciphertext),
+        }),
+        json!({
+            "custodianMemberId": MEMBER_ID, "recipientKeyEpoch": 1, "wrapSuite": "P256-HKDF-SHA256-AES256GCM",
+            "ephemeralPublicKey": encode(&wrap.ephemeral_public_key), "iv": encode(&wrap.iv),
+            "wrappedDek": encode(&wrap.wrapped_dek),
+        }),
+    )
+}
+
+/// Credential metadata that expands into one variable per field.
+pub fn structured_credential_metadata() -> Value {
+    let mut metadata = credential_metadata();
+    metadata["kind"] = json!("structured");
+    metadata["fields"] = json!(["HOST", "PASSWORD"]);
+    metadata
+}
+
+/// Credential metadata carrying a tag, for the tagged-group scenarios.
+pub fn tagged_credential_metadata(id: &str, name: &str, tag: &str) -> Value {
+    let mut metadata = credential_metadata();
+    metadata["id"] = json!(id);
+    metadata["name"] = json!(name);
+    metadata["envVar"] = json!(name);
+    metadata["tags"] = json!([tag]);
+    metadata
+}
+
 /// Seal the canary the way a custodian client would, once per credential, so
 /// `run` has something real to open. Uses the CLI's own crypto, which is the
 /// code under test on the other side of the wire.

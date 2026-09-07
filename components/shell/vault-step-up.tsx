@@ -1,6 +1,7 @@
 "use client";
 
 import { KeyRound } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { useActionState, useState } from "react";
 
 import {
@@ -34,6 +35,7 @@ export function VaultStepUpSwitch({
   hasPasskey: boolean;
 }) {
   const hydrated = useHydrated();
+  const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
@@ -68,9 +70,11 @@ export function VaultStepUpSwitch({
         return;
       }
       setDone(true);
-      // The page is server-rendered from the workspace, so the switch's new
-      // state comes from a fresh read rather than from local state pretending.
-      window.location.reload();
+      // Re-read from the workspace rather than trusting local state, but as an
+      // ordinary refresh: a full reload tears the page down mid-flight and
+      // aborts whatever request is still in the air, which the dev server
+      // treats as a lost connection.
+      router.refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "That gesture could not be completed.");
     } finally {

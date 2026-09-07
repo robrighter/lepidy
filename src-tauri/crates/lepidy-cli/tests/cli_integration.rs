@@ -780,3 +780,341 @@ fn recovery_code(stdout: &str) -> String {
         .trim()
         .to_string()
 }
+
+/// VAULT-CLI-INT-017 — a captured value reaches the vault without passing
+/// through the terminal, an agent's context, or `argv`.
+#[test]
+fn vault_cli_int_017_capture_stores_output_without_showing_it() {
+    let double = Double::start();
+    let home = TempHome::create("capture");
+    assert!(login(&home, &double).status.success());
+
+    let output = cli(
+        &home,
+        &[
+            "capture",
+            "CAPTURED_TOKEN",
+            "--description",
+            "From a probe",
+            "--",
+            probe(),
+            "--print",
+            CANARY,
+        ],
+        &[PASSPHRASE, ACCOUNT_PASSWORD],
+    );
+    assert!(
+        output.status.success(),
+        "capture failed: {}",
+        text(&output.stderr)
+    );
+
+    // The value is in the vault and in neither of the places it must not be.
+    assert_absent(&text(&output.stdout), CANARY, "the capture output");
+    assert_absent(&text(&output.stderr), CANARY, "the capture output");
+    let sent = double.with_state(|state| state.bodies("/api/device/vault/credentials"));
+    assert_eq!(sent.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&sent[0]).expect("a JSON body");
+    assert_absent(
+        &String::from_utf8_lossy(&sent[0]),
+        CANARY,
+        "the create request",
+    );
+
+    // What produced it is recorded as a bare program name, never a command line.
+    let captured_from = body["capturedFrom"].as_str().expect("a capture source");
+    assert!(!captured_from.contains(' '));
+    assert!(!captured_from.contains('/'));
+    // A captured credential lands on the most restrictive policy there is.
+    assert_eq!(body["policy"]["mode"], "ask");
+    assert_eq!(
+        body["policy"]["allowedDeliveries"],
+        serde_json::json!(["inject"])
+    );
+    assert!(body["policy"]["grantTtlMs"].is_null());
+    assert!(text(&output.stdout).contains("switched off until a custodian confirms"));
+
+    // A command that fails stores nothing at all: its output is a diagnostic,
+    // not a credential.
+    let failed = cli(
+        &home,
+        &[
+            "capture",
+            "SECOND_TOKEN",
+            "--",
+            probe(),
+            "--print",
+            CANARY,
+            "--exit",
+            "3",
+        ],
+        &[PASSPHRASE, ACCOUNT_PASSWORD],
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(text(&failed.stderr).contains("nothing was stored"));
+    assert_eq!(
+        double.with_state(|state| state.bodies("/api/device/vault/credentials").len()),
+        1
+    );
+}
+
+/// VAULT-CLI-INT-018 — importing a `.env` creates credentials, reports what it
+/// skipped and why, and never removes the file unless asked.
+#[test]
+fn vault_cli_int_018_import_seeds_the_vault_and_leaves_the_source_alone() {
+    let double = Double::start();
+    let home = TempHome::create("import");
+    assert!(login(&home, &double).status.success());
+    let env_path = home.path.join("project.env");
+    std::fs::write(
+        &env_path,
+        format!("# seeds\nFIRST_TOKEN={CANARY}\nexport SECOND_TOKEN=\"quoted value\"\nlower=skipped\nEMPTY=\n"),
+    )
+    .expect("an env file");
+
+    // A dry run says what would happen and sends nothing.
+    let dry = cli(
+        &home,
+        &["import", &env_path.display().to_string(), "--dry-run"],
+        &[],
+    );
+    assert!(dry.status.success());
+    assert!(text(&dry.stdout).contains("would be created"));
+    assert_absent(&text(&dry.stdout), CANARY, "the dry run");
+    assert_eq!(
+        double.with_state(|state| state.bodies("/api/device/vault/credentials").len()),
+        0
+    );
+
+    let output = cli(
+        &home,
+        &[
+            "import",
+            &env_path.display().to_string(),
+            "--tag",
+            "project",
+        ],
+        &[PASSPHRASE, ACCOUNT_PASSWORD],
+    );
+    assert!(
+        output.status.success(),
+        "import failed: {}",
+        text(&output.stderr)
+    );
+    assert!(text(&output.stdout).contains("Created 2 of 2"));
+    // Every skip says which line and why, so a big file is fixable.
+    let reported = text(&output.stderr);
+    assert!(reported.contains("line 4"));
+    assert!(reported.contains("not usable as an environment variable"));
+    assert!(reported.contains("line 5"));
+    assert!(reported.contains("no value"));
+    // No value is ever printed, in any of it.
+    assert_absent(&text(&output.stdout), CANARY, "the import summary");
+    assert_absent(&reported, CANARY, "the import summary");
+
+    let sent = double.with_state(|state| state.bodies("/api/device/vault/credentials"));
+    assert_eq!(sent.len(), 2);
+    for body in &sent {
+        assert_absent(&String::from_utf8_lossy(body), CANARY, "an import request");
+        let parsed: serde_json::Value = serde_json::from_slice(body).expect("a JSON body");
+        assert_eq!(parsed["metadata"]["tags"], serde_json::json!(["project"]));
+        assert_eq!(parsed["policy"]["mode"], "ask");
+    }
+
+    // The source file is still there, because nobody asked for it to go.
+    assert!(env_path.exists());
+    assert!(text(&output.stdout).contains("was left where it is"));
+
+    let shredded = cli(
+        &home,
+        &["import", &env_path.display().to_string(), "--shred"],
+        &[PASSPHRASE, ACCOUNT_PASSWORD],
+    );
+    assert!(shredded.status.success());
+    assert!(!env_path.exists(), "--shred left the source file behind");
+    // And it says what shredding is and is not.
+    assert!(text(&shredded.stdout).contains("not shredding"));
+}
+
+/// VAULT-CLI-INT-019 — a template and a tagged group are one request, and the
+/// rendered file lives exactly as long as the command.
+#[test]
+fn vault_cli_int_019_templates_and_tags_are_one_request() {
+    let double = Double::start();
+    let home = TempHome::create("template");
+    assert!(login(&home, &double).status.success());
+    let vault_public_key = double
+        .with_state(|state| state.vault_public_key.clone())
+        .expect("a published key");
+    double.with_state(|state| {
+        state.credentials = vec![
+            tagged_credential_metadata(CREDENTIAL_ID, CREDENTIAL_NAME, "aws"),
+            tagged_credential_metadata(SECOND_CREDENTIAL_ID, SECOND_CREDENTIAL_NAME, "aws"),
+        ];
+        state.release =
+            allow_release_many(&vault_public_key, &[CREDENTIAL_ID, SECOND_CREDENTIAL_ID]);
+    });
+
+    // A whole tagged group under one request, so four credentials for one
+    // command do not become four cards.
+    let tagged = cli(
+        &home,
+        &[
+            "run",
+            "--all-tagged",
+            "aws",
+            "--origin-channel",
+            "channel-1",
+            "--origin-message",
+            "message-1",
+            "--reason",
+            "run the deploy",
+            "--",
+            probe(),
+            "--echo-env",
+            CREDENTIAL_NAME,
+        ],
+        &[PASSPHRASE],
+    );
+    assert!(
+        tagged.status.success(),
+        "tagged run failed: {}",
+        text(&tagged.stderr)
+    );
+    let asked: serde_json::Value = serde_json::from_slice(
+        &double.with_state(|state| state.bodies("/api/device/vault/release"))[0],
+    )
+    .expect("a JSON body");
+    assert_eq!(asked["credentialIds"].as_array().expect("ids").len(), 2);
+
+    // A template resolves its own placeholders and nothing else.
+    let source = home.path.join("config.template");
+    let rendered = home.path.join("config.rendered");
+    std::fs::write(&source, "token=${lepidy:PROBE_TOKEN}\nhome=${HOME}\n").expect("a template");
+    let output = cli(
+        &home,
+        &[
+            "run",
+            "--with-template",
+            &format!("{}={}", source.display(), rendered.display()),
+            "--origin-channel",
+            "channel-1",
+            "--origin-message",
+            "message-1",
+            "--reason",
+            "render the config",
+            "--scrub",
+            "never",
+            "--",
+            probe(),
+            "--cat",
+            &rendered.display().to_string(),
+        ],
+        &[PASSPHRASE],
+    );
+    assert!(
+        output.status.success(),
+        "template run failed: {}",
+        text(&output.stderr)
+    );
+    let shown = text(&output.stdout);
+    assert!(
+        shown.contains(&format!("token={CANARY}")),
+        "the template was not resolved: {shown}"
+    );
+    // Everything that is not a Lepidy placeholder is left exactly as it was.
+    assert!(shown.contains("home=${HOME}"));
+    // And the rendered credential does not outlive the command.
+    assert!(
+        !rendered.exists(),
+        "the rendered template outlived the command"
+    );
+}
+
+/// VAULT-CLI-INT-020 — a structured credential arrives as one variable per
+/// field rather than as a blob every tool would have to parse.
+#[test]
+fn vault_cli_int_020_a_structured_credential_expands_into_its_fields() {
+    let double = Double::start();
+    let home = TempHome::create("structured");
+    assert!(login(&home, &double).status.success());
+    let vault_public_key = double
+        .with_state(|state| state.vault_public_key.clone())
+        .expect("a published key");
+    double.with_state(|state| {
+        state.credentials = vec![structured_credential_metadata()];
+        state.release = allow_release_value(
+            &vault_public_key,
+            CREDENTIAL_ID,
+            &serde_json::json!({ "HOST": "db.example.test", "PASSWORD": CANARY }).to_string(),
+        );
+    });
+
+    let output = cli(
+        &home,
+        &[
+            "run",
+            "--with",
+            CREDENTIAL_NAME,
+            "--origin-channel",
+            "channel-1",
+            "--origin-message",
+            "message-1",
+            "--reason",
+            "connect to the database",
+            "--",
+            probe(),
+            "--echo-env",
+            "PROBE_TOKEN_HOST",
+            "--echo-env",
+            "PROBE_TOKEN_PASSWORD",
+            "--echo-env",
+            "PROBE_TOKEN",
+        ],
+        &[PASSPHRASE],
+    );
+    assert!(
+        output.status.success(),
+        "structured run failed: {}",
+        text(&output.stderr)
+    );
+    let shown = text(&output.stdout);
+    // One variable per field, and no undivided blob for a tool to have to
+    // parse. Every field is part of the credential, so every one of them is
+    // redacted on the way out — the marker naming each variable is what proves
+    // there was a value there to redact.
+    assert!(
+        shown.contains("PROBE_TOKEN_HOST=[redacted:PROBE_TOKEN_HOST]"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("PROBE_TOKEN_PASSWORD=[redacted:PROBE_TOKEN_PASSWORD]"),
+        "{shown}"
+    );
+    assert!(shown.contains("PROBE_TOKEN=<unset>"), "{shown}");
+    assert_absent(&shown, CANARY, "a structured credential's output");
+
+    // With scrubbing off, the fields are visibly the values they should be.
+    let unscrubbed = cli(
+        &home,
+        &[
+            "run",
+            "--with",
+            CREDENTIAL_NAME,
+            "--origin-channel",
+            "channel-1",
+            "--origin-message",
+            "message-1",
+            "--reason",
+            "connect to the database",
+            "--scrub",
+            "never",
+            "--",
+            probe(),
+            "--echo-env",
+            "PROBE_TOKEN_HOST",
+        ],
+        &[PASSPHRASE],
+    );
+    assert!(text(&unscrubbed.stdout).contains("PROBE_TOKEN_HOST=db.example.test"));
+}

@@ -531,3 +531,5 @@ button.danger:hover:not(:disabled) { background: #fdf2f4; }
   .vault-table td[data-label]::before { content: attr(data-label) ": "; color: var(--text-3); }
   .vault-table form { margin-top: 6px; }
 }
+.tag.overdue { background: #fdf2f4; color: #b03a52; }
+:root[data-theme="dark"] .tag.overdue { background: var(--surface-2); color: var(--coral); }

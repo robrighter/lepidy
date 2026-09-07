@@ -69,6 +69,16 @@ card, and the reason is what the person deciding actually reads. When a card is
 raised the command does not run — the CLI reports the request and exits 78, and
 the card is answered in the Inbox or in the direct message from `@a.vault`.
 
+`capture NAME -- command` stores a command's standard output as a new
+credential, so a token an agent mints never passes through its own context.
+It is create-only, and what it creates is switched off until a person confirms
+it in the vault — an agent can create a credential this way but cannot make one
+usable. `import` seeds the vault from a `.env` and leaves the file alone unless
+`--shred` is given; `rotate` replaces a value and is deliberately something only
+a person does. `run` also takes `--all-tagged TAG` for a whole tagged group
+under one approval and `--with-template SRC:PATH` to resolve `${lepidy:NAME}`
+placeholders into an owner-only file for the life of one command.
+
 ## Desktop shell
 
 Run `npm run desktop:dev` after installing the Tauri system prerequisites. The desktop window follows the current Slipchat platform pattern:

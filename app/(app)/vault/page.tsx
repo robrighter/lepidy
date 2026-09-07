@@ -5,6 +5,7 @@ import { VaultStepUpSwitch, VaultSwitchOffForm } from "@/components/shell/vault-
 import { ActivityLog, LiveGrants } from "@/components/shell/vault-tables";
 import { workspaceApprovals } from "@/src/shell/approvals-context";
 import { readCsrfToken } from "@/src/shell/session-cookies";
+import { rotationState } from "@/src/domain/vault-policy";
 import { vaultOverview } from "@/src/shell/vault-context";
 
 export default async function VaultPage() {
@@ -87,6 +88,12 @@ export default async function VaultPage() {
                   <strong>{credential.name}</strong>
                   {credential.policy.highRisk ? <span className="tag">high risk</span> : null}
                   <span className="tag">{credential.policy.mode}</span>
+                  {credential.kind === "structured" ? <span className="tag">structured</span> : null}
+                  {rotationState(credential.rotateAt, Date.now()) === "overdue" ? (
+                    <span className="tag overdue">replace it</span>
+                  ) : rotationState(credential.rotateAt, Date.now()) === "due_soon" ? (
+                    <span className="tag">replace soon</span>
+                  ) : null}
                 </Link>
                 <p>{credential.description || "No description."}</p>
               </li>

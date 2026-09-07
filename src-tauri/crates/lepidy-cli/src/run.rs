@@ -28,7 +28,7 @@ use crate::crypto::{aes_gcm_decrypt, credential_aad, decode, wrap_aad};
 use crate::error::{CliError, CliResult};
 use crate::scrub::Scrubber;
 use crate::session::Session;
-use crate::withfile::{parse_specs, Materialised};
+use crate::withfile::{parse_specs, FileSpec, Materialised};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ScrubMode {
@@ -60,11 +60,18 @@ struct Released {
     name: String,
     env_var: String,
     value: String,
+    /// Present for a structured credential: its fields, already parsed.
+    fields: Option<Vec<(String, String)>>,
 }
 
 impl Drop for Released {
     fn drop(&mut self) {
         self.value.zeroize();
+        if let Some(fields) = &mut self.fields {
+            for (_, value) in fields {
+                value.zeroize();
+            }
+        }
     }
 }
 
@@ -76,9 +83,13 @@ pub fn run(args: &Args) -> CliResult<i32> {
     }
     let names = args.list("with");
     let file_specs = parse_specs(&args.options("with-file"))?;
-    if names.is_empty() && file_specs.is_empty() {
+    if names.is_empty()
+        && file_specs.is_empty()
+        && args.list("all-tagged").is_empty()
+        && args.options("with-template").is_empty()
+    {
         return Err(CliError::usage(
-            "no credentials requested: pass --with NAME, or --with-file NAME:PATH",
+            "no credentials requested: pass --with NAME, --with-file NAME:PATH, --with-template SOURCE:PATH, or --all-tagged TAG",
         ));
     }
     let scrub_mode = match args.option("scrub").unwrap_or("auto") {
@@ -101,6 +112,56 @@ pub fn run(args: &Args) -> CliResult<i32> {
     let project = session.project(args.option("project"));
     let catalogue = catalogue(&session, &project)?;
 
+    // A whole tagged group under one approval, which is the point of tags: an
+    // `aws` command wants four credentials and should not produce four cards.
+    let mut names = names;
+    for tag in args.list("all-tagged") {
+        let mut tagged: Vec<String> = catalogue
+            .iter()
+            .filter(|(key, entry)| {
+                **key == entry.id && entry.tags.iter().any(|candidate| *candidate == tag)
+            })
+            .map(|(_, entry)| entry.id.clone())
+            .collect();
+        if tagged.is_empty() {
+            return Err(CliError::usage(format!(
+                "no credential this member can see carries the tag {tag}"
+            )));
+        }
+        tagged.sort();
+        for id in tagged {
+            if !names.contains(&id) {
+                names.push(id);
+            }
+        }
+    }
+
+    // A template names its own credentials, so they join the same request and
+    // the same card as everything else this command needs.
+    let template_specs = crate::template::parse_specs(&args.options("with-template"))?;
+    let mut templates = Vec::new();
+    for spec in &template_specs {
+        let source = std::fs::read_to_string(&spec.source).map_err(|error| {
+            CliError::usage(format!(
+                "could not read the template {}: {error}",
+                spec.source.display()
+            ))
+        })?;
+        let wanted = crate::template::placeholders(&source)?;
+        templates.push((spec.clone(), source, wanted));
+    }
+    let template_names: Vec<String> = {
+        let mut collected: Vec<String> = Vec::new();
+        for (_, _, wanted) in &templates {
+            for name in wanted {
+                if !collected.contains(name) {
+                    collected.push(name.clone());
+                }
+            }
+        }
+        collected
+    };
+
     // Environment and file deliveries are two different disclosures and are
     // requested as two different deliveries, so the workspace's policy and its
     // audit trail both see which one actually happened. Within a delivery it is
@@ -112,14 +173,46 @@ pub fn run(args: &Args) -> CliResult<i32> {
         reason: &reason,
     };
     let mut env_values = release_batch(&session, &catalogue, &request, &names, "inject")?;
-    let file_names: Vec<String> = file_specs.iter().map(|spec| spec.name.clone()).collect();
+    let mut file_names: Vec<String> = file_specs.iter().map(|spec| spec.name.clone()).collect();
+    // A rendered config is a plaintext credential on the disk, which is what the
+    // `file` delivery means, so the policy decides it as one.
+    file_names.extend(template_names.iter().cloned());
     let mut file_values = release_batch(&session, &catalogue, &request, &file_names, "file")?;
+    let template_values: Vec<(String, String)> = file_values
+        .iter()
+        .filter(|released| template_names.contains(&released.name))
+        .map(|released| (released.name.clone(), released.value.clone()))
+        .collect();
+    let rendered = Materialised::create(
+        &templates
+            .iter()
+            .map(|(spec, source, _)| {
+                crate::template::render(source, &template_values)
+                    .map(|body| (template_variable(&spec.source.display().to_string()), body))
+            })
+            .collect::<CliResult<Vec<_>>>()?,
+        &template_specs
+            .iter()
+            .map(|spec| FileSpec {
+                // A rendered template is named after its source, so the file it
+                // produces is traceable to the document that described it.
+                name: template_variable(&spec.source.display().to_string()),
+                path: spec.destination.clone(),
+            })
+            .collect::<Vec<_>>(),
+    )?;
 
     let materialised = Materialised::create(
-        &file_values
+        &file_specs
             .iter()
-            .map(|released| (released.env_var.clone(), released.value.clone()))
-            .collect::<Vec<_>>(),
+            .map(|spec| {
+                let released = file_values
+                    .iter()
+                    .find(|candidate| candidate.name == spec.name)
+                    .ok_or_else(|| CliError::failure(format!("{} was not released", spec.name)))?;
+                Ok((released.env_var.clone(), released.value.clone()))
+            })
+            .collect::<CliResult<Vec<_>>>()?,
         &file_specs,
     )?;
 
@@ -134,20 +227,58 @@ pub fn run(args: &Args) -> CliResult<i32> {
     let needles: Vec<(String, String)> = env_values
         .iter()
         .chain(file_values.iter())
-        .map(|released| (released.name.clone(), released.value.clone()))
+        .flat_map(|released| match &released.fields {
+            // A structured credential reaches the child as one variable per
+            // field, so it is the field values a command can print back — the
+            // undivided JSON never appears in the environment and matching only
+            // that would redact nothing.
+            Some(fields) => fields
+                .iter()
+                .map(|(field, value)| (format!("{}_{field}", released.name), value.clone()))
+                .collect::<Vec<_>>(),
+            None => vec![(released.name.clone(), released.value.clone())],
+        })
         .collect();
 
     let mut command = Command::new(&args.trailing[0]);
     command.args(&args.trailing[1..]);
     for released in &env_values {
-        command.env(&released.env_var, &released.value);
+        match &released.fields {
+            // A structured credential is one record that expands into one
+            // variable per field, so a database credential arrives as five
+            // rather than as a JSON blob every tool would have to parse.
+            Some(fields) => {
+                for (field, value) in fields {
+                    command.env(format!("{}_{field}", released.env_var), value);
+                }
+            }
+            None => {
+                command.env(&released.env_var, &released.value);
+            }
+        }
     }
     // A file-delivered credential also gets its name in the environment,
     // pointing at the path rather than holding the value — what
     // GOOGLE_APPLICATION_CREDENTIALS and KUBECONFIG already expect, and it saves
     // writing the same path twice.
-    for (spec, released) in file_specs.iter().zip(&file_values) {
-        command.env(&released.env_var, &spec.path);
+    for spec in &file_specs {
+        if let Some(released) = file_values
+            .iter()
+            .find(|candidate| candidate.name == spec.name)
+        {
+            command.env(&released.env_var, &spec.path);
+        }
+    }
+    for (spec, _, _) in &templates {
+        // The rendered path is offered under the template's own name, so a
+        // command can point at it without the operator writing the path twice.
+        command.env(
+            format!(
+                "LEPIDY_TEMPLATE_{}",
+                template_variable(&spec.source.display().to_string())
+            ),
+            &spec.destination,
+        );
     }
     command.stdin(Stdio::inherit());
     if scrubbing {
@@ -185,12 +316,67 @@ pub fn run(args: &Args) -> CliResult<i32> {
     // Explicit, so the unlink is visibly tied to the child having finished
     // rather than to wherever the borrow checker happens to end the scope.
     drop(materialised);
+    drop(rendered);
     Ok(exit_code(status))
 }
 
 enum Sink {
     Stdout,
     Stderr,
+}
+
+/// Split a structured value into the fields its metadata promised.
+///
+/// A field the metadata names but the value does not carry is an error rather
+/// than an empty variable: a command that authenticates with a blank password
+/// fails somewhere far away from the cause.
+fn structured_fields(
+    name: &str,
+    entry: &CatalogueEntry,
+    value: &str,
+) -> CliResult<Vec<(String, String)>> {
+    let parsed: serde_json::Value = serde_json::from_str(value).map_err(|_| {
+        CliError::failure(format!(
+            "{name} is structured but did not decrypt to a JSON object"
+        ))
+    })?;
+    let object = parsed.as_object().ok_or_else(|| {
+        CliError::failure(format!(
+            "{name} is structured but did not decrypt to a JSON object"
+        ))
+    })?;
+    let mut fields = Vec::new();
+    for field in &entry.fields {
+        let found = object
+            .get(field)
+            .ok_or_else(|| CliError::failure(format!("{name} has no {field} field")))?;
+        fields.push((
+            field.clone(),
+            match found {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            },
+        ));
+    }
+    Ok(fields)
+}
+
+/// A template's source path, as a usable environment-variable suffix.
+fn template_variable(source: &str) -> String {
+    source
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(source)
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect()
 }
 
 /// Stream one pipe through its own scrubber and out to the real handle.
@@ -250,9 +436,16 @@ fn report_redactions(redactions: &[HashMap<String, usize>]) {
     );
 }
 
-struct CatalogueEntry {
-    id: String,
-    env_var: String,
+#[derive(Clone)]
+pub struct CatalogueEntry {
+    pub id: String,
+    pub env_var: String,
+    pub version: u64,
+    pub key_epoch: u64,
+    pub tags: Vec<String>,
+    /// `structured` values expand into one variable per field.
+    pub kind: String,
+    pub fields: Vec<String>,
 }
 
 /// Names to ids, once per run.
@@ -260,7 +453,7 @@ struct CatalogueEntry {
 /// A person types `--with STRIPE_KEY`; the workspace's authority is the
 /// credential id. The listing is metadata-only, so this costs nothing in
 /// exposure, and it also gives the environment variable each credential expects.
-fn catalogue(session: &Session, project: &str) -> CliResult<HashMap<String, CatalogueEntry>> {
+pub fn catalogue(session: &Session, project: &str) -> CliResult<HashMap<String, CatalogueEntry>> {
     let response = session.client.post_signed(
         &session.profile,
         &session.signing,
@@ -289,18 +482,40 @@ fn catalogue(session: &Session, project: &str) -> CliResult<HashMap<String, Cata
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
         };
+        let strings = |name: &str| {
+            credential
+                .get(name)
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let number = |name: &str| {
+            credential
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1)
+        };
         let (Some(id), Some(name)) = (field("id"), field("name")) else {
             continue;
         };
-        let env_var = field("envVar").unwrap_or_else(|| name.clone());
-        catalogue.insert(
-            name,
-            CatalogueEntry {
-                id: id.clone(),
-                env_var: env_var.clone(),
-            },
-        );
-        catalogue.insert(id.clone(), CatalogueEntry { id, env_var });
+        let entry = CatalogueEntry {
+            id: id.clone(),
+            env_var: field("envVar").unwrap_or_else(|| name.clone()),
+            version: number("version"),
+            key_epoch: number("keyEpoch"),
+            tags: strings("tags"),
+            kind: field("kind").unwrap_or_else(|| "opaque".to_string()),
+            fields: strings("fields"),
+        };
+        // Reachable by either name, because a person types the name and the
+        // workspace answers by id.
+        catalogue.insert(name, entry.clone());
+        catalogue.insert(id, entry);
     }
     Ok(catalogue)
 }
@@ -486,10 +701,16 @@ fn open_release(
         .map_err(|_| CliError::failure(format!("{name} did not decrypt to text")));
     plaintext.zeroize();
 
+    let value = value?;
+    let fields = match entry.kind.as_str() {
+        "structured" => Some(structured_fields(name, entry, &value)?),
+        _ => None,
+    };
     Ok(Released {
         name: name.to_string(),
         env_var: entry.env_var.clone(),
-        value: value?,
+        value,
+        fields,
     })
 }
 
@@ -518,6 +739,13 @@ mod tests {
     }
 
     /// VAULT-CLI-RULE-022
+    /// VAULT-CLI-RULE-031
+    #[test]
+    fn names_a_rendered_template_after_its_source_file() {
+        assert_eq!(template_variable("config/wrangler.toml"), "WRANGLER_TOML");
+        assert_eq!(template_variable("/tmp/.npmrc"), "_NPMRC");
+    }
+
     #[test]
     fn a_file_spec_names_the_credential_and_the_path() {
         let specs: Vec<crate::withfile::FileSpec> =

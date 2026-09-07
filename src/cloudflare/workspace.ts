@@ -251,10 +251,14 @@ import {
   type KillSwitchScope,
 } from "../domain/vault-approval";
 import {
+  normalizeCapturedFrom,
   normalizeVaultMetadata,
   normalizeVaultPolicy,
+  rotationState,
   validateVaultAcl,
   type VaultAclEntry,
+  type RotationState,
+  type VaultCredentialKind,
   type VaultCredentialMetadata,
   type VaultPolicy,
 } from "../domain/vault-policy";
@@ -476,6 +480,11 @@ export type VaultCredentialDetail = {
   frozen: boolean;
   frozenAt: number | null;
   frozenByHandle: string | null;
+  /** Switched off because nobody has confirmed the capture that made it yet. */
+  awaitingCaptureReview: boolean;
+  /** The program whose output became this value, if one did. */
+  capturedFrom: string | null;
+  rotation: RotationState;
   createdByHandle: string;
   use: readonly VaultAclSubject[];
   reveal: readonly VaultAclSubject[];
@@ -539,6 +548,8 @@ type VaultCredentialRow = {
   high_risk: number; created_by_member_id: string; created_at: number; updated_at: number;
   last_accessed_at: number | null; access_count: number;
   frozen_at: number | null; frozen_by_member_id: string | null;
+  kind: VaultCredentialKind; fields_json: string; rotate_at: number | null;
+  frozen_reason: "switched_off" | "awaiting_capture_review" | null; captured_from: string | null;
 };
 
 export type CreatedChannel = { channelId: string; kind: ChannelKind; created: boolean };
@@ -4232,6 +4243,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     acl: readonly VaultAclEntry[];
     freshUserVerification: boolean;
     localVaultUnlocked: boolean;
+    /**
+     * Present when a command's output became this value. The program's name
+     * only — arguments stay on the machine that ran them, because that is where
+     * a path or another secret would be.
+     */
+    capturedFrom?: string;
     now: number;
   }): Promise<{ credential: VaultCredentialSummary; created: boolean }> {
     const actor = this.authorizeActor(input.actor);
@@ -4256,10 +4273,16 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         if (this.ctx.storage.sql.exec<{ present: number }>("SELECT 1 AS present FROM vault_credential_deletions WHERE credential_id = ?", input.credentialId).toArray()[0]) {
           throw new Error("a deleted vault credential id cannot be reused");
         }
-        this.insertVaultCredential(input.credentialId, actor.id, metadata, policy, envelope, wraps, acl, input.now);
+        this.insertVaultCredential(
+          input.credentialId, actor.id, metadata, policy, envelope, wraps, acl, input.now,
+          input.capturedFrom === undefined ? null : normalizeCapturedFrom(input.capturedFrom),
+        );
         return {
           result: { credential: this.vaultSummary(this.readVaultCredential(input.credentialId)!), created: true },
-          effects: this.vaultEffects("vault.credential_created", input.credentialId, actor, { version: 1, policy_epoch: 1, custodian_count: wraps.length }),
+          effects: this.vaultEffects("vault.credential_created", input.credentialId, actor, {
+            version: 1, policy_epoch: 1, custodian_count: wraps.length,
+            captured: input.capturedFrom !== undefined, item_kind: metadata.kind ?? "opaque",
+          }),
         };
       },
     );
@@ -4295,10 +4318,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       const live = this.requireVaultCredential(input.credentialId);
       if (live.version !== current.version || live.policy_epoch !== current.policy_epoch) throw new Error("vault credential changed concurrently");
       this.ctx.storage.sql.exec(
-        `UPDATE vault_credentials SET name = ?, description = ?, env_var = ?, tags_json = ?, commands_json = ?, proxy_hosts_json = ?,
+        `UPDATE vault_credentials SET kind = ?, fields_json = ?, rotate_at = ?, name = ?, description = ?, env_var = ?, tags_json = ?, commands_json = ?, proxy_hosts_json = ?,
           cipher_suite = ?, aad_version = ?, ciphertext = ?, iv = ?, key_epoch = ?, version = ?, policy_epoch = ?, mode = ?,
           allowed_deliveries_json = ?, project_ids_json = ?, grant_ttl_ms = ?, available_until = ?, max_uses_per_hour = ?, high_risk = ?, updated_at = ?
          WHERE id = ?`,
+        metadata.kind ?? "opaque", JSON.stringify(metadata.fields ?? []), metadata.rotateAt ?? null,
         metadata.name, metadata.description, metadata.envVar ?? null, JSON.stringify(metadata.tags), JSON.stringify(metadata.commands), JSON.stringify(metadata.proxyHosts),
         envelope.cipherSuite, envelope.aadVersion, envelope.ciphertext, envelope.iv, envelope.keyEpoch, envelope.version, live.policy_epoch + 1,
         policy.mode, JSON.stringify(policy.allowedDeliveries), JSON.stringify(policy.projectIds), policy.grantTtlMs ?? null, policy.availableUntil ?? null,
@@ -5069,8 +5093,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
 
     const outcome = await this.commitMutation({ scope: "vault.credential.freeze", now: input.now }, () => {
       this.ctx.storage.sql.exec(
-        "UPDATE vault_credentials SET frozen_at = ?, frozen_by_member_id = ?, updated_at = ? WHERE id = ?",
-        input.frozen ? input.now : null, input.frozen ? actor.id : null, input.now, row.id,
+        "UPDATE vault_credentials SET frozen_at = ?, frozen_by_member_id = ?, frozen_reason = ?, updated_at = ? WHERE id = ?",
+        input.frozen ? input.now : null, input.frozen ? actor.id : null,
+        input.frozen ? "switched_off" : null, input.now, row.id,
       );
       let revokedGrants = 0;
       let expiredApprovals = 0;
@@ -5463,6 +5488,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       frozen: row.frozen_at !== null,
       frozenAt: row.frozen_at,
       frozenByHandle: row.frozen_by_member_id === null ? null : this.memberHandle(row.frozen_by_member_id),
+      // A captured credential is switched off until somebody has seen what
+      // produced it, which is a different state from one a human switched off.
+      awaitingCaptureReview: row.frozen_reason === "awaiting_capture_review",
+      capturedFrom: row.captured_from,
+      rotation: rotationState(row.rotate_at ?? undefined, input.now),
       createdByHandle: this.memberHandle(row.created_by_member_id),
       use: scope("use"),
       reveal: scope("reveal"),
@@ -5645,6 +5675,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       id: row.id, name: row.name, description: row.description,
       ...(row.env_var === null ? {} : { envVar: row.env_var }),
       tags: JSON.parse(row.tags_json) as string[], commands: JSON.parse(row.commands_json) as string[], proxyHosts: JSON.parse(row.proxy_hosts_json) as string[],
+      kind: row.kind, fields: JSON.parse(row.fields_json) as string[],
+      ...(row.rotate_at === null ? {} : { rotateAt: row.rotate_at }),
       policy: this.vaultPolicy(row), version: row.version, keyEpoch: row.key_epoch, policyEpoch: row.policy_epoch,
       createdAt: row.created_at, updatedAt: row.updated_at,
       ...(row.last_accessed_at === null ? {} : { lastAccessedAt: row.last_accessed_at }), accessCount: row.access_count,
@@ -5704,16 +5736,22 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     ).toArray().map((row) => ({ custodianMemberId: row.custodian_member_id, recipientKeyEpoch: row.recipient_key_epoch, wrapSuite: row.wrap_suite, ephemeralPublicKey: row.ephemeral_public_key, iv: row.iv, wrappedDek: row.wrapped_dek }));
   }
 
-  private insertVaultCredential(id: string, creatorId: string, metadata: VaultCredentialMetadata, policy: VaultPolicy, envelope: VaultCiphertextEnvelope, wraps: readonly VaultKeyWrap[], acl: readonly VaultAclEntry[], now: number): void {
+  private insertVaultCredential(id: string, creatorId: string, metadata: VaultCredentialMetadata, policy: VaultPolicy, envelope: VaultCiphertextEnvelope, wraps: readonly VaultKeyWrap[], acl: readonly VaultAclEntry[], now: number, capturedFrom: string | null = null): void {
     this.ctx.storage.sql.exec(
       `INSERT INTO vault_credentials(id, name, description, env_var, tags_json, commands_json, proxy_hosts_json,
        cipher_suite, aad_version, ciphertext, iv, key_epoch, version, policy_epoch, mode, allowed_deliveries_json,
-       project_ids_json, grant_ttl_ms, available_until, max_uses_per_hour, high_risk, created_by_member_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       project_ids_json, grant_ttl_ms, available_until, max_uses_per_hour, high_risk, created_by_member_id, created_at, updated_at,
+       kind, fields_json, rotate_at, frozen_at, frozen_reason, captured_from)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id, metadata.name, metadata.description, metadata.envVar ?? null, JSON.stringify(metadata.tags), JSON.stringify(metadata.commands), JSON.stringify(metadata.proxyHosts),
       envelope.cipherSuite, envelope.aadVersion, envelope.ciphertext, envelope.iv, envelope.keyEpoch, envelope.version, policy.mode,
       JSON.stringify(policy.allowedDeliveries), JSON.stringify(policy.projectIds), policy.grantTtlMs ?? null, policy.availableUntil ?? null,
       policy.maxUsesPerHour ?? null, policy.highRisk ? 1 : 0, creatorId, now, now,
+      metadata.kind ?? "opaque", JSON.stringify(metadata.fields ?? []), metadata.rotateAt ?? null,
+      // A captured credential arrives switched off. Nothing can use it until a
+      // custodian has seen what produced it and turned it on, which is what
+      // makes an agent-initiated write safe to have at all.
+      capturedFrom === null ? null : now, capturedFrom === null ? null : "awaiting_capture_review", capturedFrom,
     );
     this.insertVaultWrapsAndAcl(id, envelope.version, wraps, acl, now);
   }

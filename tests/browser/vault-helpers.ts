@@ -96,6 +96,60 @@ export async function seedAskCredential(
   return { account, enrolment, keys, origin, credentialId };
 }
 
+/**
+ * A credential created the way `lepidy capture` creates one: switched off, with
+ * the program that produced it recorded.
+ */
+export async function seedCapturedCredential(page: Page): Promise<Fixture> {
+  const fixture = await seedAskCredential(page);
+  const credentialId = `cred-captured-${Date.now()}`;
+  const encrypted = await encryptVaultValue({
+    workspaceId: fixture.enrolment.workspaceId,
+    credentialId,
+    version: 1,
+    keyEpoch: 1,
+    plaintext: new TextEncoder().encode(CANARY),
+  });
+  const wrap = await wrapVaultDek({
+    workspaceId: fixture.enrolment.workspaceId,
+    credentialId,
+    version: 1,
+    custodianMemberId: fixture.enrolment.memberId,
+    recipientKeyEpoch: fixture.enrolment.vaultKey.keyEpoch,
+    recipientPublicKey: fixture.keys.vaultPublicKey,
+    dek: encrypted.dek,
+  });
+  const created = await signedRequest(page.request, {
+    keys: fixture.keys,
+    enrolment: fixture.enrolment,
+    path: "/api/device/vault/credentials",
+    base: LOCALHOST_BASE,
+    body: {
+      credentialId,
+      idempotencyKey: `browser:capture:${credentialId}`,
+      password: fixture.account.password,
+      metadata: {
+        name: "CAPTURED_TOKEN",
+        description: "Captured from a command",
+        envVar: "CAPTURED_TOKEN",
+        tags: [],
+        commands: [],
+        proxyHosts: [],
+      },
+      policy: { mode: "ask", allowedDeliveries: ["inject"], projectIds: [PROJECT], highRisk: false },
+      envelope: encrypted.envelope,
+      wraps: [{ ...wrap, wrapSuite: VAULT_WRAP_SUITE }],
+      acl: [
+        { subjectType: "member", subjectId: fixture.enrolment.memberId, verb: "manage" },
+        { subjectType: "member", subjectId: fixture.enrolment.memberId, verb: "use" },
+      ],
+      capturedFrom: "gh",
+    },
+  });
+  expect(created.status()).toBe(200);
+  return { ...fixture, credentialId };
+}
+
 export function requestRelease(page: Page, fixture: Fixture) {
   return signedRequest(page.request, {
     keys: fixture.keys,
