@@ -8,6 +8,7 @@ import type { AgentSummary } from "@/src/cloudflare/workspace";
 import { SECURITY_PREAMBLE } from "@/src/domain/agent-preamble";
 import { browserCsrfToken } from "@/src/shell/browser-csrf";
 import { AgentAvatar } from "./avatar";
+import { useHydrated } from "./use-hydrated";
 
 export function AgentDirectory({ agents }: { agents: readonly AgentSummary[] }) {
   const [current, setCurrent] = useState(agents);
@@ -15,6 +16,7 @@ export function AgentDirectory({ agents }: { agents: readonly AgentSummary[] }) 
   const [error, setError] = useState<string | null>(null);
   const [handle, setHandle] = useState("");
   const [description, setDescription] = useState("");
+  const hydrated = useHydrated();
 
   return (
     <>
@@ -53,7 +55,7 @@ export function AgentDirectory({ agents }: { agents: readonly AgentSummary[] }) 
             placeholder="Watches deploys."
           />
         </label>
-        <button type="submit" className="primary" disabled={pending}>
+        <button type="submit" className="primary" disabled={pending || !hydrated}>
           Create agent
         </button>
         {error ? (

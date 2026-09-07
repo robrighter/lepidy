@@ -6,6 +6,7 @@ import { useState, useTransition } from "react";
 import { createEmojiAction, deleteEmojiAction } from "@/app/(app)/emoji/actions";
 import type { CustomEmojiRow } from "@/src/cloudflare/workspace-rooms";
 import { browserCsrfToken } from "@/src/shell/browser-csrf";
+import { useHydrated } from "./use-hydrated";
 
 export function EmojiAdmin({
   emoji,
@@ -21,6 +22,7 @@ export function EmojiAdmin({
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [alias, setAlias] = useState("");
+  const hydrated = useHydrated();
 
   return (
     <>
@@ -54,7 +56,7 @@ export function EmojiAdmin({
             <span>Stands for</span>
             <input value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="🚀" />
           </label>
-          <button type="submit" className="primary" disabled={pending}>
+          <button type="submit" className="primary" disabled={pending || !hydrated}>
             Name it
           </button>
           {error ? (

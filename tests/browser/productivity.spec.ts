@@ -134,3 +134,34 @@ test("AGENT-INT-015 creates an agent and shows the ceiling its owners cannot cha
   await page.reload();
   await expect(page.locator(".agent-list li")).toHaveCount(1);
 });
+
+/**
+ * The paired case for the two forms above. Both do their work in an onSubmit
+ * handler, which does not exist until React has hydrated the page. A browser
+ * that submits one of them before then performs its own default submission
+ * instead: a GET back to the same URL that reloads the page and silently throws
+ * away what was typed.
+ *
+ * Running with scripting switched off is the only way to hold a page in that
+ * state long enough to assert on it, and it is the honest worst case: if the
+ * button is unavailable with no JavaScript at all, it is also unavailable
+ * during the moment before hydration finishes.
+ */
+test.describe("without hydration", () => {
+  test.use({ javaScriptEnabled: false });
+
+  test("FORM-INT-001 offers no submit button until the page can honour it", async ({ page }) => {
+    await page.goto("/agents");
+    await expect(page.getByRole("button", { name: "Create agent" })).toBeDisabled();
+
+    // Nothing is lost, because there is nothing to submit: a form with no
+    // enabled submit button has no implicit submission either.
+    await page.getByLabel("Handle").fill("releasebot");
+    await page.getByLabel("Handle").press("Enter");
+    await expect(page).toHaveURL(/\/agents$/);
+    await expect(page.getByLabel("Handle")).toHaveValue("releasebot");
+
+    await page.goto("/emoji");
+    await expect(page.getByRole("button", { name: "Name it" })).toBeDisabled();
+  });
+});
