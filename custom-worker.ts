@@ -2,9 +2,20 @@
 // @ts-expect-error -- the adapter creates this module before bundling the Worker.
 import openNextWorker from "./.open-next/worker.js";
 
+import { handleRunnerSocketRequest } from "./src/cloudflare/runner-socket";
+import type { ShellEnvironment } from "./src/shell/resolve-shell-source";
+
 export { Accounts } from "./src/cloudflare/accounts";
 export { Workspace } from "./src/cloudflare/workspace";
 
 export default {
-  fetch: openNextWorker.fetch,
+  async fetch(request: Request, env: ShellEnvironment, ctx: unknown): Promise<Response> {
+    // The runner's socket is answered before Next sees the request. Next's own
+    // documentation is explicit that a Route Handler cannot hold a WebSocket —
+    // the connection closes once the response is generated — so this is the
+    // only place it can live. Everything else is Next's.
+    const socket = await handleRunnerSocketRequest(env, request);
+    if (socket !== null) return socket;
+    return openNextWorker.fetch(request, env, ctx) as Promise<Response>;
+  },
 };
