@@ -4,60 +4,66 @@ import type { CustomEmojiRow } from "@/src/cloudflare/workspace-rooms";
 import { isFailure, shellErrorReason, viewerWorkspace } from "@/src/shell/viewer-workspace";
 
 /**
- * The action hands back the list it produced, and deliberately does not
- * revalidate the path.
+ * One action for both things somebody can do to the emoji registry, driven from
+ * a real `<form action>` rather than a click handler.
  *
- * Waiting for the framework to re-render after a mutation makes what somebody
- * sees depend on revalidation timing. Worse, a revalidation that lands after the
- * client has already applied the result re-seeds the component with the props
- * the server had *before* the write, so the change disappears again. Returning
- * the new list and leaving the page alone removes both problems; a fresh
- * navigation reads from the server as usual.
+ * Two properties come out of that shape and neither is decorative:
+ *
+ * A submission made before React has hydrated is still carried out, because the
+ * browser posts the form itself and React replays it. A handler-based form loses
+ * that submission and reloads the page with what was typed thrown away, which is
+ * a defect this codebase has already paid for twice.
+ *
+ * And the result carries the list it produced, so the component advances from
+ * the answer rather than waiting on a re-render. The action deliberately does
+ * not revalidate: a revalidation landing after the client has applied the result
+ * re-seeds the component with the props the server held *before* the write, so
+ * the change disappears again.
+ *
+ * The failure case carries the list too whenever it is known, so a refusal
+ * leaves on screen exactly what is really stored.
  */
-export type EmojiResult =
-  | { ok: true; emoji: readonly CustomEmojiRow[] }
-  | { ok: false; reason: string };
+export type EmojiResult = {
+  ok: boolean;
+  reason?: string;
+  emoji?: readonly CustomEmojiRow[];
+};
 
-/**
- * Naming an emoji is workspace administration. The object refuses anybody who
- * is not an admin; this only carries the request and the CSRF token to it.
- */
-export async function createEmojiAction(input: {
-  csrfToken?: string;
-  name: string;
-  aliasEmoji: string;
-}): Promise<EmojiResult> {
-  const workspace = await viewerWorkspace(input.csrfToken);
-  if (isFailure(workspace)) return workspace;
-  try {
-    await workspace.stub.createCustomEmoji({
-      actor: workspace.actor,
-      name: input.name,
-      aliasEmoji: input.aliasEmoji,
-      now: Date.now(),
-    });
-    const listed = await workspace.stub.listCustomEmoji({ actor: workspace.actor });
-    return { ok: true, emoji: listed.emoji };
-  } catch (error) {
-    return { ok: false, reason: shellErrorReason(error) };
-  }
-}
+export async function emojiAdminAction(
+  previous: EmojiResult | null,
+  form: FormData,
+): Promise<EmojiResult> {
+  const field = (name: string): string => {
+    const value = form.get(name);
+    return typeof value === "string" ? value : "";
+  };
+  const keepList = { emoji: previous?.emoji };
 
-export async function deleteEmojiAction(input: {
-  csrfToken?: string;
-  name: string;
-}): Promise<EmojiResult> {
-  const workspace = await viewerWorkspace(input.csrfToken);
-  if (isFailure(workspace)) return workspace;
+  const workspace = await viewerWorkspace(field("csrfToken"));
+  if (isFailure(workspace)) return { ok: false, reason: workspace.reason, ...keepList };
+
   try {
-    await workspace.stub.deleteCustomEmoji({
-      actor: workspace.actor,
-      name: input.name,
-      now: Date.now(),
-    });
-    const listed = await workspace.stub.listCustomEmoji({ actor: workspace.actor });
-    return { ok: true, emoji: listed.emoji };
+    if (field("intent") === "delete") {
+      await workspace.stub.deleteCustomEmoji({
+        actor: workspace.actor,
+        name: field("name"),
+        now: Date.now(),
+      });
+    } else {
+      await workspace.stub.createCustomEmoji({
+        actor: workspace.actor,
+        name: field("name"),
+        aliasEmoji: field("aliasEmoji"),
+        now: Date.now(),
+      });
+    }
   } catch (error) {
-    return { ok: false, reason: shellErrorReason(error) };
+    // The list is re-read even after a refusal, so what stays on screen is what
+    // is actually stored rather than what the client happened to be holding.
+    const listed = await workspace.stub.listCustomEmoji({ actor: workspace.actor });
+    return { ok: false, reason: shellErrorReason(error), emoji: listed.emoji };
   }
+
+  const listed = await workspace.stub.listCustomEmoji({ actor: workspace.actor });
+  return { ok: true, emoji: listed.emoji };
 }

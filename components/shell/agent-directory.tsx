@@ -1,72 +1,59 @@
 "use client";
 
 import { ShieldCheck, Sparkles } from "lucide-react";
-import { useState, useTransition } from "react";
+import { useActionState } from "react";
 
-import { createAgentAction } from "@/app/(app)/agents/actions";
+import { createAgentAction, type AgentsResult } from "@/app/(app)/agents/actions";
 import type { AgentSummary } from "@/src/cloudflare/workspace";
 import { SECURITY_PREAMBLE } from "@/src/domain/agent-preamble";
-import { browserCsrfToken } from "@/src/shell/browser-csrf";
 import { AgentAvatar } from "./avatar";
-import { useHydrated } from "./use-hydrated";
 
-export function AgentDirectory({ agents }: { agents: readonly AgentSummary[] }) {
-  const [current, setCurrent] = useState(agents);
-  const [pending, startTransition] = useTransition();
-  const [error, setError] = useState<string | null>(null);
-  const [handle, setHandle] = useState("");
-  const [description, setDescription] = useState("");
-  const hydrated = useHydrated();
+/**
+ * The directory, and a create form that is a real form posting to a server
+ * action. A submission made before React has hydrated is carried out rather
+ * than becoming a page reload with the typed handle thrown away, and the fields
+ * are uncontrolled so what somebody types in that moment is still there when it
+ * is submitted.
+ */
+export function AgentDirectory({
+  agents,
+  csrfToken,
+  keySeed,
+}: {
+  agents: readonly AgentSummary[];
+  csrfToken: string;
+  /** Rendered by the server so a pre-hydration submission carries a key too. */
+  keySeed: string;
+}) {
+  const [state, formAction, pending] = useActionState<AgentsResult | null, FormData>(
+    createAgentAction,
+    null,
+  );
+  const current = state?.agents ?? agents;
+  // The key changes only when the directory does, so resubmitting a form that
+  // failed is the same request while a second successful create is a new one.
+  const idempotencyKey = `agent:${keySeed}:${current.length}`;
 
   return (
     <>
-      <form
-        className="agent-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          setError(null);
-          startTransition(async () => {
-            const result = await createAgentAction({
-              csrfToken: browserCsrfToken(),
-              handle,
-              description,
-              idempotencyKey: `agent:${crypto.randomUUID()}`.slice(0, 128),
-            });
-            if (!result.ok) {
-              setError(result.reason);
-              return;
-            }
-            setCurrent(result.agents);
-            setHandle("");
-            setDescription("");
-          });
-        }}
-      >
+      <form className="agent-form" action={formAction}>
+        <input type="hidden" name="csrfToken" value={csrfToken} />
+        <input type="hidden" name="idempotencyKey" value={idempotencyKey} />
         <label>
           <span>Handle</span>
-          <input
-            value={handle}
-            readOnly={!hydrated}
-            onChange={(event) => setHandle(event.target.value)}
-            placeholder="releasebot"
-          />
+          <input name="handle" defaultValue="" placeholder="releasebot" />
           <em>Agents always live in the a. namespace.</em>
         </label>
         <label>
           <span>What it does</span>
-          <input
-            value={description}
-            readOnly={!hydrated}
-            onChange={(event) => setDescription(event.target.value)}
-            placeholder="Watches deploys."
-          />
+          <input name="description" defaultValue="" placeholder="Watches deploys." />
         </label>
-        <button type="submit" className="primary" disabled={pending || !hydrated}>
+        <button type="submit" className="primary" disabled={pending}>
           Create agent
         </button>
-        {error ? (
+        {state && !state.ok && state.reason ? (
           <p className="message-error" role="alert">
-            {error}
+            {state.reason}
           </p>
         ) : null}
       </form>

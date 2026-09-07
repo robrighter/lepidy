@@ -1,77 +1,56 @@
 "use client";
 
 import { Trash2 } from "lucide-react";
-import { useState, useTransition } from "react";
+import { useActionState } from "react";
 
-import { createEmojiAction, deleteEmojiAction } from "@/app/(app)/emoji/actions";
+import { emojiAdminAction, type EmojiResult } from "@/app/(app)/emoji/actions";
 import type { CustomEmojiRow } from "@/src/cloudflare/workspace-rooms";
-import { browserCsrfToken } from "@/src/shell/browser-csrf";
-import { useHydrated } from "./use-hydrated";
 
+/**
+ * Every control here is a real form posting to a server action, so a click made
+ * before the page has hydrated is carried out rather than lost. One action and
+ * one piece of state serve both the create form and each row's delete, so there
+ * is never a question of which answer is the newer one.
+ */
 export function EmojiAdmin({
   emoji,
   canAdminister,
+  csrfToken,
 }: {
   emoji: readonly CustomEmojiRow[];
   canAdminister: boolean;
+  csrfToken: string;
 }) {
-  // Seeded by the server, then advanced by whatever each action returns, so the
-  // list never waits on a re-render to show what somebody just did.
-  const [current, setCurrent] = useState(emoji);
-  const [pending, startTransition] = useTransition();
-  const [error, setError] = useState<string | null>(null);
-  const [name, setName] = useState("");
-  const [alias, setAlias] = useState("");
-  const hydrated = useHydrated();
+  const [state, formAction, pending] = useActionState<EmojiResult | null, FormData>(
+    emojiAdminAction,
+    null,
+  );
+  // Seeded by the server, then advanced by whatever the last action returned.
+  const current = state?.emoji ?? emoji;
 
   return (
     <>
       {canAdminister ? (
-        <form
-          className="emoji-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            setError(null);
-            startTransition(async () => {
-              const result = await createEmojiAction({
-                csrfToken: browserCsrfToken(),
-                name,
-                aliasEmoji: alias,
-              });
-              if (!result.ok) {
-                setError(result.reason);
-                return;
-              }
-              setCurrent(result.emoji);
-              setName("");
-              setAlias("");
-            });
-          }}
-        >
+        <form className="emoji-form" action={formAction}>
+          <input type="hidden" name="csrfToken" value={csrfToken} />
+          <input type="hidden" name="intent" value="create" />
           <label>
             <span>Name</span>
-            <input
-              value={name}
-              readOnly={!hydrated}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="shipit"
-            />
+            {/* Uncontrolled, so characters typed before hydration are still here
+                when the form is submitted rather than being reconciled away
+                against state that never saw them. */}
+            <input name="name" defaultValue="" placeholder="shipit" />
           </label>
           <label>
             <span>Stands for</span>
-            <input
-              value={alias}
-              readOnly={!hydrated}
-              onChange={(event) => setAlias(event.target.value)}
-              placeholder="🚀"
-            />
+            <input name="aliasEmoji" defaultValue="" placeholder="🚀" />
           </label>
-          <button type="submit" className="primary" disabled={pending || !hydrated}>
+          <button type="submit" className="primary" disabled={pending}>
             Name it
           </button>
-          {error ? (
+          {state && !state.ok && state.reason ? (
             <p className="message-error" role="alert">
-              {error}
+              {state.reason}
             </p>
           ) : null}
         </form>
@@ -96,23 +75,14 @@ export function EmojiAdmin({
               </span>
               <code>:{entry.name}:</code>
               {canAdminister ? (
-                <button
-                  type="button"
-                  aria-label={`Remove :${entry.name}:`}
-                  disabled={pending}
-                  onClick={() =>
-                    startTransition(async () => {
-                      const result = await deleteEmojiAction({
-                        csrfToken: browserCsrfToken(),
-                        name: entry.name,
-                      });
-                      if (!result.ok) setError(result.reason);
-                      else setCurrent(result.emoji);
-                    })
-                  }
-                >
-                  <Trash2 size={13} aria-hidden="true" />
-                </button>
+                <form action={formAction}>
+                  <input type="hidden" name="csrfToken" value={csrfToken} />
+                  <input type="hidden" name="intent" value="delete" />
+                  <input type="hidden" name="name" value={entry.name} />
+                  <button type="submit" disabled={pending} aria-label={`Remove :${entry.name}:`}>
+                    <Trash2 size={13} aria-hidden="true" />
+                  </button>
+                </form>
               ) : null}
             </li>
           ))}

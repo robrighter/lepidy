@@ -7,6 +7,12 @@ export default defineConfig({
   // means an Argon2id hash. Left to one worker per core the sign-ups alone
   // saturate it and unrelated tests fail on a timeout. This is the real capacity
   // of the single-process harness, not a flake to retry away.
+  //
+  // Do not lower this to chase a crashed `wrangler dev`. That was tried on
+  // 2026-09-06 and made it strictly worse: at two workers the dev server died
+  // earlier and took 45 scenarios instead of 21. Whatever kills it is not
+  // concurrency and not memory — see the C01a evidence record for what was
+  // ruled out and what to look at instead.
   workers: 3,
   // Assertions still wait on observed state rather than sleeping; the budget is
   // simply larger because every scenario is served by one local Worker doing

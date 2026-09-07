@@ -150,24 +150,46 @@ test("AGENT-INT-015 creates an agent and shows the ceiling its owners cannot cha
 test.describe("without hydration", () => {
   test.use({ javaScriptEnabled: false });
 
-  test("FORM-INT-001 says it is not ready rather than losing what somebody does", async ({
-    page,
-  }) => {
+  /**
+   * Scripting off is the only way to hold a page in the state it is in for the
+   * moment before React hydrates, and it is the honest worst case: whatever
+   * works here works during that moment too.
+   *
+   * The agent and emoji forms post to a server action, so they are expected to
+   * work completely. The composer cannot — it is a client-state surface — so it
+   * is expected to say so rather than take characters it will discard.
+   */
+  test("FORM-INT-001 creates an agent and an emoji with no scripting at all", async ({ page }) => {
     await page.goto("/agents");
-    // A form with no enabled submit button has no implicit submission either,
-    // so pressing Enter in a field cannot navigate away with the work lost.
-    await expect(page.getByRole("button", { name: "Create agent" })).toBeDisabled();
-    // And a controlled input is connected to nothing until React hydrates:
-    // characters typed into it are wiped by the first render, because it is
-    // reconciled against state that never saw them.
-    await expect(page.getByLabel("Handle")).not.toBeEditable();
-    await expect(page.getByLabel("What it does")).not.toBeEditable();
+    await page.getByLabel("Handle").fill("releasebot");
+    await page.getByLabel("What it does").fill("Watches deploys.");
+    await page.getByRole("button", { name: "Create agent" }).click();
+
+    // The browser posted the form itself and the server carried it out.
+    const listed = page.locator(".agent-list li");
+    await expect(listed).toHaveCount(1);
+    await expect(listed.first()).toContainText("@a.releasebot");
+
+    // A refusal is reported the same way, without scripting to render it.
+    await page.getByLabel("Handle").fill("g.fieldtechs");
+    await page.getByRole("button", { name: "Create agent" }).click();
+    await expect(page.locator(".message-error")).toContainText("a. namespace");
+    await expect(page.locator(".agent-list li")).toHaveCount(1);
 
     await page.goto("/emoji");
-    await expect(page.getByRole("button", { name: "Name it" })).toBeDisabled();
-    await expect(page.getByLabel("Name")).not.toBeEditable();
-    await expect(page.getByLabel("Stands for")).not.toBeEditable();
+    await page.getByLabel("Name").fill("shipit");
+    await page.getByLabel("Stands for").fill("\u{1F680}");
+    await page.getByRole("button", { name: "Name it" }).click();
+    await expect(page.locator(".emoji-list li")).toHaveCount(1);
+    await expect(page.locator(".emoji-list li").first()).toContainText(":shipit:");
 
+    // And removing one, which is a form of its own on the row.
+    await page.getByRole("button", { name: "Remove :shipit:" }).click();
+    await expect(page.getByRole("heading", { name: "No custom emoji yet" })).toBeVisible();
+
+    // The composer is the paired case: it does its work in a click handler, so
+    // before hydration it reports itself as not ready rather than accepting
+    // characters the first render would reconcile away.
     await page.goto("/c/general");
     await expect(page.getByRole("textbox", { name: /Message #general/ })).not.toBeEditable();
   });

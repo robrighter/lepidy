@@ -1,5 +1,6 @@
 import { EmojiAdmin } from "@/components/shell/emoji-admin";
 import { customEmoji } from "@/src/shell/emoji-context";
+import { readCsrfToken } from "@/src/shell/session-cookies";
 import { shellState } from "@/src/shell/shell-context";
 
 export default async function EmojiPage() {
@@ -31,6 +32,7 @@ export default async function EmojiPage() {
         <EmojiAdmin
           emoji={emoji.status === "ready" ? emoji.emoji : []}
           canAdminister={canAdminister}
+          csrfToken={(await readCsrfToken()) ?? ""}
         />
       </section>
     </>

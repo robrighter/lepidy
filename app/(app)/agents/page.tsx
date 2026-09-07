@@ -1,5 +1,7 @@
 import { AgentDirectory } from "@/components/shell/agent-directory";
+import { randomSecret } from "@/src/domain/mcp-oauth";
 import { workspaceAgents } from "@/src/shell/agents-context";
+import { readCsrfToken } from "@/src/shell/session-cookies";
 
 export default async function AgentsPage() {
   const state = await workspaceAgents();
@@ -24,7 +26,11 @@ export default async function AgentsPage() {
         </p>
       </section>
       <section className="panel">
-        <AgentDirectory agents={state.status === "ready" ? state.agents : []} />
+        <AgentDirectory
+          agents={state.status === "ready" ? state.agents : []}
+          csrfToken={(await readCsrfToken()) ?? ""}
+          keySeed={randomSecret(12)}
+        />
       </section>
     </>
   );
