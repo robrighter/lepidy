@@ -30,7 +30,7 @@ This document decides **how Lepidy is built**, and one question dominates it: *w
 - **Lepidy does not host agent execution.** Local execution runs on customer machines; cloud execution runs in the customer's provider account. Customer-funded execution is distinct from Lepidy's storage and coordination costs.
 - **Allow idle workspaces to stop accruing duration charges.** Use hibernating WebSockets. An open client or a harness working elsewhere must not require a continuously pending workspace request. The exact session-wait transport remains a prototype decision (§10.1).
 
-These decisions supersede the earlier frontend comparison, session-cache proposal and server-decryptable vault design. Runner failover, vault owner sharing and the provider authorization mechanism remain explicit engineering decisions in §18.
+These decisions supersede the earlier frontend comparison, session-cache proposal and server-decryptable vault design. The remaining explicit engineering questions are tracked in §18; cloud-provider authorization is settled by D06.
 
 ```
    ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐
@@ -524,11 +524,31 @@ Two directions, deliberately asymmetric:
 - **Inbound content**: over **MCP**, as an ordinary client (§11). Nothing special.
 - **Inbound lifecycle**: the webhook route.
 
+Provider authorization is the customer-workspace WIF flow fixed by the
+[cloud and custom runtime contract](./docs/cloud-custom-runtime-contract.md):
+the customer binds an exact Lepidy integration subject to a developer service
+account, and Lepidy exchanges short-lived assertions in memory. The integration
+never accepts or stores an Anthropic API key. The WIF signer and the envelope
+key for webhook transport secrets are platform keys, not user vault roots.
+
 The webhook route is `POST /hooks/anthropic`, exact-match, and **it never returns a 3xx** — a redirect auto-disables the endpoint immediately on the first attempt, and on a Worker a trailing-slash redirect is one router change away. There is a test asserting the route returns 2xx or 4xx for every input shape, and it is not optional.
 
-Handling: verify the signature against the raw body (never a re-serialized one), dedupe on the event id in D1, then route to the tenant and **fetch the resource** — payloads are thin and carry no state worth reading.
+Handling: parse the unverified body only far enough to select a candidate
+organization/workspace integration, verify the signature against the raw body
+(never a re-serialized one), match the signed organization/workspace again,
+dedupe on the event id in D1, then route to the tenant and **fetch the resource**
+— payloads are thin and carry no state worth reading.
 
 **Delivery is lossy — three attempts, then dropped silently — so correctness comes from reconciliation, not from receipt.** Each workspace object runs a sweep on its daily alarm: for every session or deployment run it believes is open, fetch and settle. Without it a session shows "working" forever because one delivery failed at 3am, and everything looks fine until it doesn't.
+
+The `custom` runtime uses the same content plane and a different wake plane. A
+durable outbox POSTs a versioned, HMAC-signed metadata-only wake to one
+owner-configured public HTTPS endpoint. It contains an agent id and queue depth,
+never message content, a command, credential or callback URL. The remote service
+uses its delegation-scoped MCP session to claim and post. URL validation is
+repeated at delivery, redirects are never followed, special-use destinations
+are refused and `global_fetch_strictly_public` remains enabled. The full signing,
+retry, replay, secret-scan and SSRF rules are normative in the D06 contract.
 
 ### 10.3 Scheduled work belongs to the tenant, not to a cron
 
@@ -697,7 +717,10 @@ Next.js built with the OpenNext Cloudflare adapter and deployed with Wrangler, a
 
 - **Waiting adapter certification:** the no-park transport and lifecycle are fixed by §10.1 and the runner contract. D03 must demonstrate session reuse, cancellation, reconnect and the exit race against each supported harness.
 - **Vault owner sharing:** the user-held AVK and recovery protocol are fixed by §9 and the [vault key and recovery contract](./docs/vault-key-recovery-contract.md). Specify multi-owner envelope distribution, removal and rekeying without creating a server-decryptable wrap before V01.
-- **Cloud provider authorization:** specify what credential authorizes session creation and resource fetches in the customer's account, where it is stored, and how it is revoked. Customer-paid execution does not eliminate this integration credential.
+- **Cloud provider authorization is settled:** D06 selects customer-configured
+  Workload Identity Federation with an exact integration subject and no stored
+  Anthropic API key. See the
+  [cloud and custom runtime contract](./docs/cloud-custom-runtime-contract.md).
 
 - **Does the object need splitting before 50 seats?** §3.4 argues no on a soft 1,000 req/s ceiling. Before GA, load-test one object with 50 simulated users, 500 sockets, a busy queue and two local agents draining, and find the real number rather than trusting the soft one.
 - **What exactly does a workspace cost per month?** Row-write billing with FTS5 in the loop is the single largest unknown in the business model, and Free gives away a full-featured workspace. Instrument a synthetic busy tenant for a week before pricing is committed publicly.

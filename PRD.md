@@ -277,7 +277,11 @@ An agent row says how it is operated. The first division that matters is not *wh
 
 Claude has a cloud lane because Anthropic ships the primitives for one — persisted agents, hosted sandboxes, cron deployments and webhooks. Codex and Open Coder don't have an equivalent we can wire up in a form, so they are local-only, and `custom` is the escape hatch for anyone who wants to host one of those themselves and just needs the queue, the identity and the credentials.
 
-`custom` takes a webhook plus a shared secret.
+`custom` takes one public HTTPS endpoint plus a Lepidy-generated shared signing
+secret. Its signed callback is only a metadata wake; the remote runtime claims
+and posts through a delegation-scoped MCP session. The full replay, retry and
+SSRF boundary is fixed by the
+[cloud and custom runtime contract](./docs/cloud-custom-runtime-contract.md).
 
 #### The delegation, and why it has to exist
 
@@ -433,6 +437,14 @@ Everything above amounts to: *anyone in the workspace can cause a process to sta
 
 The agent is a **Claude Managed Agent**: a persisted, versioned config that Anthropic stores, running in a per-session sandbox Anthropic hosts, with the loop driven by Anthropic's orchestration. Lepidy holds the identity, the queue, the brief, the scope and the credentials; Anthropic holds the compute.
 
+**Provider authorization does not put an Anthropic API key in Lepidy.** The
+customer's Anthropic administrator configures Workload Identity Federation from
+an exact Lepidy integration subject to a developer service account in the
+customer workspace. Lepidy exchanges short-lived assertions in memory and
+stores only opaque provider ids. Personal, service-account and legacy workspace
+API keys are not accepted by the v1 connect flow. See the
+[D06 contract](./docs/cloud-custom-runtime-contract.md).
+
 #### Two ways a session starts
 
 | Trigger | Mechanism | What it's for |
@@ -467,7 +479,17 @@ Anthropic POSTs to one HTTPS endpoint on our Worker. Every delivery is HMAC-sign
 
 Deliveries are deduped on the event id, which is stable across retries.
 
-**The setup step we cannot automate, and must therefore design for.** Webhook endpoints are registered in the Anthropic Console by hand — there is no endpoint-management API — and the signing secret is shown exactly once. So connecting a workspace has a manual step, and pretending otherwise produces a half-configured integration that fails silently later. Lepidy's connect flow gives the exact URL to paste, the exact list of event types to subscribe to, a field for the signing secret, and **a "send a test event" check that will not let the setup be marked done until a signed delivery has actually arrived.**
+**The setup step we cannot automate, and must therefore design for.** The
+customer configures WIF and the webhook in the Anthropic Console, and the
+webhook signing secret is shown exactly once. So connecting a workspace has a
+manual step, and pretending otherwise produces a half-configured integration
+that fails silently later. Lepidy gives the exact federation subject/audience,
+URL and event list, then refuses to mark setup done until WIF retrieves the
+configured resources and a matching signed delivery arrives. A Console test
+event may supply that proof; otherwise Lepidy drives a visibly customer-paid,
+small budgeted test session. The signing secret is an envelope-encrypted server
+transport secret—never an agent/user credential—and is available only to the
+raw-body webhook verifier.
 
 #### Credentials: the sandbox has no `lepidy` CLI
 
@@ -480,9 +502,11 @@ That availability tradeoff is explicit in the runtime picker: local injection ne
 
 #### Budgets, which are better here than anywhere else
 
-Managed Agents takes a real dollar cap on a session, and a deployment copies its cap onto every session it fires. So a scheduled agent has a **platform-enforced ceiling** rather than an advisory one — the strongest spend control in the product, and it costs us nothing to offer. A session that stops at its cap surfaces as an idle with a budget stop reason, at which point further messages to it are refused; Lepidy reads that, posts in the room that the agent stopped on budget, and offers the owner a one-click raise.
+Managed Agents takes a real dollar cap on a session, and a deployment copies its cap onto every session it fires. So a scheduled agent has a **platform-enforced ceiling** rather than an advisory one — the strongest spend control in the product, and it costs us nothing to offer. A session that stops at its cap surfaces as idle with a budget stop reason; Lepidy reads that, posts in the room that the agent stopped on budget, and offers the owner a one-click raise. Replacing the cap with one above consumed cost, or removing it, automatically resumes the paused work. Lepidy always creates a session with a cap because a cap cannot be added later to a session created without one, and removing a session cap is one-way.
 
-Budget changes apply from the next fired session, not to one already running. The form says so, because "I raised it and nothing happened" is otherwise a support ticket.
+Deployment-budget changes apply from the next fired session, not to one already
+running; an existing session's own cap is changed separately. The form says so,
+because treating the two budgets as one is otherwise a support ticket.
 
 #### Failure, made visible
 
