@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -573,19 +573,4 @@ pub fn allow_release_many(vault_public_key: &[u8], credential_ids: &[&str]) -> V
 
 pub fn assert_absent(haystack: &str, needle: &str, what: &str) {
     assert!(!haystack.contains(needle), "{what} contained {needle}");
-}
-
-pub fn file_is_owner_only(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        return std::fs::metadata(path)
-            .map(|data| data.permissions().mode() & 0o077 == 0)
-            .unwrap_or(false);
-    }
-    // Windows ACL verification is the R04 platform matrix, not this suite's.
-    #[cfg(not(unix))]
-    {
-        return path.exists();
-    }
 }

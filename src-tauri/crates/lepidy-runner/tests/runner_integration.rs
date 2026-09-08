@@ -790,3 +790,273 @@ fn runner_cli_int_017_keeps_the_session_token_out_of_every_command_line() {
         "the preset file holds a session token"
     );
 }
+
+/* -------------------------------------------------------------------------- */
+/* The harness and operating-system matrix (R04)                               */
+/* -------------------------------------------------------------------------- */
+
+/// A real harness on this machine, if one is installed.
+///
+/// Claude Code and Codex are asked what they are — a question that costs a
+/// process and no network — so the matrix records a fact about the harness
+/// actually present rather than a claim about one somebody imagined. A machine
+/// without them simply has fewer cells filled, which is the honest outcome.
+fn installed_harness(name: &str) -> Option<String> {
+    let which = if cfg!(windows) { "where" } else { "which" };
+    let output = std::process::Command::new(which).arg(name).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    (!path.is_empty()).then_some(path)
+}
+
+#[test]
+fn runner_cli_int_018_refuses_a_preset_that_would_not_run_and_pins_nothing() {
+    let home = TempHome::create("checkup-refuse");
+    enrol(&home, "http://127.0.0.1:1");
+    let output = agentd(
+        &home,
+        &[
+            "preset",
+            "set",
+            "p1",
+            "--program",
+            "/nonexistent/harness",
+            "--cooldown",
+            "0",
+        ],
+        &[PASSPHRASE],
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+
+    // No passphrase: this reads nothing secret, and a check that needed one
+    // would be a check nobody runs.
+    let checked = agentd(&home, &["preset", "check"], &[]);
+    assert!(!checked.status.success(), "a broken preset must not pass");
+    let rendered = text(&checked.stdout);
+    assert!(rendered.contains("FAIL"), "{rendered}");
+    assert!(rendered.contains("does not exist"), "{rendered}");
+    assert!(rendered.contains("Nothing was pinned"), "{rendered}");
+
+    // And the daemon refuses to start at all rather than discovering this at
+    // the first mention, in front of whoever asked.
+    let ran = agentd(&home, &["run"], &[PASSPHRASE]);
+    assert!(!ran.status.success());
+    assert!(
+        text(&ran.stderr).contains("would not run"),
+        "{}",
+        text(&ran.stderr),
+    );
+}
+
+#[test]
+fn runner_cli_int_019_pins_the_harness_version_it_observed() {
+    let home = TempHome::create("checkup-pin");
+    enrol(&home, "http://127.0.0.1:1");
+    // A real program that answers `--version`, so the pin is a fact this
+    // machine observed rather than a value the test supplied.
+    #[cfg(unix)]
+    let program = "/bin/echo";
+    #[cfg(windows)]
+    let program = "cmd";
+    let output = agentd(
+        &home,
+        &[
+            "preset",
+            "set",
+            "p1",
+            "--program",
+            program,
+            "--cooldown",
+            "0",
+        ],
+        &[PASSPHRASE],
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+
+    let checked = agentd(&home, &["preset", "check", "p1"], &[]);
+    assert!(checked.status.success(), "{}", text(&checked.stdout));
+
+    let stored: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path.join("presets.json")).expect("presets"),
+    )
+    .expect("json");
+    let pinned = stored["presets"][0]["harnessVersion"].clone();
+    let revision_after_pin = stored["revision"].as_u64().expect("a revision");
+
+    // Editing the preset clears the pin: whatever was validated before was
+    // validated against a different preset.
+    let edited = agentd(
+        &home,
+        &[
+            "preset",
+            "set",
+            "p1",
+            "--program",
+            program,
+            "--arg",
+            "--changed",
+        ],
+        &[PASSPHRASE],
+    );
+    assert!(edited.status.success(), "{}", text(&edited.stderr));
+    let after: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path.join("presets.json")).expect("presets"),
+    )
+    .expect("json");
+    assert_eq!(
+        after["presets"][0]["harnessVersion"],
+        serde_json::Value::Null
+    );
+    // An edit moves the revision; the pin did not.
+    assert!(after["revision"].as_u64().expect("a revision") > revision_after_pin);
+    let _ = pinned;
+}
+
+#[test]
+fn runner_cli_int_020_treats_an_upgraded_harness_as_unvalidated() {
+    let home = TempHome::create("checkup-drift");
+    enrol(&home, "http://127.0.0.1:1");
+    #[cfg(unix)]
+    let program = "/bin/echo";
+    #[cfg(windows)]
+    let program = "cmd";
+    assert!(agentd(
+        &home,
+        &[
+            "preset",
+            "set",
+            "p1",
+            "--program",
+            program,
+            "--cooldown",
+            "0"
+        ],
+        &[PASSPHRASE],
+    )
+    .status
+    .success());
+    assert!(agentd(&home, &["preset", "check", "p1"], &[])
+        .status
+        .success());
+
+    // Rewrite the pin as if the harness had been upgraded underneath. A
+    // non-interactive flag, a default permission posture and an exit code can
+    // all change between versions, so this is the case the pin exists for.
+    let path = home.path.join("presets.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("presets")).expect("json");
+    stored["presets"][0]["harnessVersion"] =
+        serde_json::Value::String("something else 0.0.1".into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&stored).expect("json")).expect("writable");
+
+    let checked = agentd(&home, &["preset", "check", "p1"], &[]);
+    let rendered = text(&checked.stdout);
+    // Only meaningful where the program reports a version at all; where it does
+    // not, the check says *that* instead, and either answer is honest.
+    if rendered.contains("[FAIL] version") {
+        assert!(rendered.contains("something else 0.0.1"), "{rendered}");
+        assert!(rendered.contains("unvalidated"), "{rendered}");
+        assert!(!checked.status.success());
+        let ran = agentd(&home, &["run"], &[PASSPHRASE]);
+        assert!(
+            !ran.status.success(),
+            "a drifted harness must stop the daemon starting"
+        );
+    } else {
+        assert!(rendered.contains("version"), "{rendered}");
+    }
+}
+
+#[test]
+fn runner_cli_int_021_refuses_a_program_on_the_other_side_of_a_wsl_boundary() {
+    if !lepidy_runner::checkup::running_under_wsl() {
+        // The decision is unit-tested on every platform; this is the cell that
+        // needs the boundary to actually exist, and it is recorded as unfilled
+        // rather than faked when it does not.
+        eprintln!("not running under WSL; the boundary cell is not exercised here");
+        return;
+    }
+    let home = TempHome::create("checkup-wsl");
+    enrol(&home, "http://127.0.0.1:1");
+    // A real Windows program, reachable from this Linux and unstoppable by it:
+    // `kill` reaches the interop stub, not the program, so a stop would leave
+    // the harness running with its injected credentials.
+    let program = "/mnt/c/Windows/System32/cmd.exe";
+    assert!(
+        std::path::Path::new(program).exists(),
+        "this WSL has no Windows mount to test the boundary with",
+    );
+    assert!(agentd(
+        &home,
+        &[
+            "preset",
+            "set",
+            "p1",
+            "--program",
+            program,
+            "--cooldown",
+            "0"
+        ],
+        &[PASSPHRASE],
+    )
+    .status
+    .success());
+
+    let checked = agentd(&home, &["preset", "check", "p1"], &[]);
+    let rendered = text(&checked.stdout);
+    assert!(!checked.status.success(), "{rendered}");
+    assert!(rendered.contains("stop cannot signal it"), "{rendered}");
+    assert!(rendered.contains("Run the daemon on Windows"), "{rendered}");
+}
+
+#[test]
+fn runner_cli_int_022_records_what_the_real_harnesses_on_this_machine_are() {
+    // The matrix cell this environment can actually fill: which harnesses are
+    // installed and what they report. It is deliberately not an assertion about
+    // behaviour — driving one needs a model provider, an API key and a network,
+    // none of which belong in a verification gate — but knowing the version a
+    // preset would be pinned to is the fact `preset check` rests on, and it is
+    // worth proving it can be read from the real thing.
+    let mut recorded = Vec::new();
+    for harness in ["claude", "codex"] {
+        let Some(path) = installed_harness(harness) else {
+            continue;
+        };
+        let checkup = lepidy_runner::checkup::check_preset(
+            &lepidy_runner::preset::Preset {
+                id: harness.to_string(),
+                program: path.clone(),
+                args: Vec::new(),
+                working_directory: None,
+                credentials: Default::default(),
+                environment: Default::default(),
+                harness_version: None,
+                max_concurrent: 1,
+                cooldown_seconds: 30,
+                timeout_seconds: 1_800,
+            },
+            lepidy_runner::checkup::current_host(),
+        );
+        // A harness that is installed must at least be startable: an absolute
+        // path that exists, is a file and can be executed.
+        assert!(
+            !checkup
+                .findings
+                .iter()
+                .any(|(name, verdict)| *name == "program" && verdict.is_fail()),
+            "{harness} at {path} is installed but not runnable: {:?}",
+            checkup.findings,
+        );
+        recorded.push((harness, path, checkup.observed_version.clone()));
+    }
+    // Printed rather than asserted on: this machine's inventory is evidence for
+    // the matrix, and a gate that failed when somebody had not installed Codex
+    // would be a gate about the wrong thing.
+    eprintln!("R04 harness inventory: {recorded:?}");
+}

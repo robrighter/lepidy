@@ -42,6 +42,17 @@ fn main() {
                 let path = arguments.next().unwrap_or_default();
                 println!("mode={}", file_mode(&path));
             }
+            // The real permission question, asked from inside the command's
+            // lifetime: mode bits on Unix, and on Windows the file's own
+            // access-control list, which is the only thing that means anything
+            // there. A file that merely exists proves nothing.
+            "--assert-owner-only" => {
+                let path = arguments.next().unwrap_or_default();
+                println!(
+                    "owner-only={}",
+                    if owner_only(&path) { "yes" } else { "no" }
+                );
+            }
             "--exists" => {
                 let path = arguments.next().unwrap_or_default();
                 println!("exists={}", std::path::Path::new(&path).exists());
@@ -71,6 +82,48 @@ fn main() {
         }
     }
     std::process::exit(exit);
+}
+
+/// Is this file readable by its owner and nobody else?
+fn owner_only(path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(path)
+            .map(|data| data.permissions().mode() & 0o077 == 0)
+            .unwrap_or(false);
+    }
+    #[cfg(windows)]
+    {
+        let Ok(output) = std::process::Command::new("icacls").arg(path).output() else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let rendered = String::from_utf8_lossy(&output.stdout).to_string();
+        let Ok(principals) = lepidy_cli::profile::acl_principals(&rendered, path) else {
+            return false;
+        };
+        let user = std::env::var("USERNAME")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        // Exactly the current user. Inheritance was stripped when the file was
+        // created, so `Users`, `Everyone`, `SYSTEM` and the administrators
+        // group should all be absent — stricter than the preset file's rule,
+        // and correct for something that holds a credential for seconds.
+        !user.is_empty()
+            && !principals.is_empty()
+            && principals.iter().all(|principal| {
+                let lowered = principal.to_ascii_lowercase();
+                lowered == user || lowered.ends_with(&format!("\\{user}"))
+            })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 #[cfg(unix)]

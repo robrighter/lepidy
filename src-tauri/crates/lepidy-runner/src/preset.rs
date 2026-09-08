@@ -48,6 +48,15 @@ pub struct Preset {
     /// and launch configuration has exactly one author.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// The harness version this preset was last validated against (R04).
+    ///
+    /// Recorded by `preset check` and compared on every later check. A
+    /// non-interactive flag, a default permission posture and an exit code can
+    /// all change between versions, so a preset validated against one version
+    /// and running under another is unvalidated — and saying so is the whole
+    /// point of writing it down.
+    #[serde(default)]
+    pub harness_version: Option<String>,
     /// How many of this preset may run at once on this machine.
     #[serde(default = "default_concurrency")]
     pub max_concurrent: u32,
@@ -105,6 +114,25 @@ impl PresetStore {
         self.presets.push(preset);
         self.presets.sort_by(|a, b| a.id.cmp(&b.id));
         self.revision = self.revision.saturating_add(1);
+    }
+
+    /// Record what the harness reported, without moving the revision.
+    ///
+    /// Deliberately not an edit: pinning a version is this machine writing down
+    /// what it observed, not somebody changing what runs, and bumping the
+    /// revision would invalidate every live session for no reason.
+    pub fn pin_harness_version(&mut self, preset_id: &str, version: Option<String>) -> bool {
+        match self
+            .presets
+            .iter_mut()
+            .find(|preset| preset.id == preset_id)
+        {
+            Some(preset) => {
+                preset.harness_version = version;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn remove(&mut self, preset_id: &str) -> bool {
@@ -236,7 +264,7 @@ fn assert_windows_acl_is_owner_only(path: &Path) -> CliResult<()> {
     let user = std::env::var("USERNAME")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    for principal in acl_principals(&rendered, &path.display().to_string())? {
+    for principal in lepidy_cli::profile::acl_principals(&rendered, &path.display().to_string())? {
         let lowered = principal.to_ascii_lowercase();
         let allowed = lowered.ends_with("\\system")
             || lowered == "nt authority\\system"
@@ -252,41 +280,6 @@ fn assert_windows_acl_is_owner_only(path: &Path) -> CliResult<()> {
         }
     }
     Ok(())
-}
-
-/// The principals named in `icacls` output, one per access-control entry.
-///
-/// Split out so the parsing has its own scenarios. `icacls` prints the path and
-/// the first entry on one line, and both a Windows path and a principal like
-/// `NT AUTHORITY\SYSTEM` contain spaces — so the path is stripped by the exact
-/// text that was passed in rather than guessed at. A line that cannot be read
-/// is an error, never a line that is skipped: a parser that silently drops
-/// entries is a check that silently passes.
-#[cfg(any(windows, test))]
-pub fn acl_principals(rendered: &str, path: &str) -> CliResult<Vec<String>> {
-    let unreadable = || CliError::failure(format!("could not read the permissions of {path}"));
-    let mut principals = Vec::new();
-    for (index, line) in rendered.lines().enumerate() {
-        let line = line.trim_end();
-        if line.trim().is_empty() || line.contains("Successfully processed") {
-            continue;
-        }
-        let entry = if index == 0 {
-            line.strip_prefix(path).ok_or_else(unreadable)?.trim_start()
-        } else {
-            line.trim()
-        };
-        let (principal, rights) = entry.split_once(':').ok_or_else(unreadable)?;
-        if !rights.trim_start().starts_with('(') {
-            return Err(unreadable());
-        }
-        let principal = principal.trim();
-        if principal.is_empty() {
-            return Err(unreadable());
-        }
-        principals.push(principal.to_string());
-    }
-    Ok(principals)
 }
 
 #[cfg(unix)]
@@ -339,6 +332,7 @@ mod tests {
             working_directory: None,
             credentials: BTreeMap::new(),
             environment: BTreeMap::new(),
+            harness_version: None,
             max_concurrent: 1,
             cooldown_seconds: 15,
             timeout_seconds: 60,
@@ -361,6 +355,25 @@ mod tests {
         // Removing something that was not there is not an edit.
         assert!(!store.remove("a"));
         assert_eq!(store.revision, 4);
+    }
+
+    #[test]
+    fn pinning_a_version_is_not_an_edit() {
+        let mut store = PresetStore::default();
+        store.upsert(preset("a"));
+        let revision = store.revision;
+        assert!(store.pin_harness_version("a", Some("harness 1.2.3".to_string())));
+        // The revision does not move: this machine wrote down what it observed,
+        // it did not change what runs, and bumping the revision would strand
+        // every live session for nothing.
+        assert_eq!(store.revision, revision);
+        assert_eq!(
+            store
+                .get("a")
+                .and_then(|preset| preset.harness_version.clone()),
+            Some("harness 1.2.3".to_string()),
+        );
+        assert!(!store.pin_harness_version("missing", None));
     }
 
     #[test]
@@ -401,45 +414,6 @@ mod tests {
             error.message,
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reads_the_principals_out_of_an_access_control_list() {
-        const PATH: &str = r"C:\Users\maya\my files\presets.json";
-
-        // Real `icacls` output. Both the path and the first principal contain
-        // spaces, which is why the path is stripped by the exact text passed in
-        // rather than guessed at.
-        let rendered = format!(
-            "{PATH} NT AUTHORITY\\SYSTEM:(F)\r\nBUILTIN\\Administrators:(F)\r\nDESKTOP-1\\maya:(F)\r\n\r\nSuccessfully processed 1 files; Failed processing 0 files"
-        );
-        assert_eq!(
-            acl_principals(&rendered, PATH).expect("well-formed output parses"),
-            vec![
-                r"NT AUTHORITY\SYSTEM".to_string(),
-                r"BUILTIN\Administrators".to_string(),
-                r"DESKTOP-1\maya".to_string(),
-            ],
-        );
-
-        // The entry this check exists to catch is not skipped.
-        let open = format!("{PATH} BUILTIN\\Users:(RX)\r\nDESKTOP-1\\maya:(F)");
-        assert!(acl_principals(&open, PATH)
-            .expect("parses")
-            .contains(&r"BUILTIN\Users".to_string()));
-
-        // Output this cannot read is an error, never an empty list: a parser
-        // that silently drops entries is a check that silently passes.
-        for broken in [
-            "something else entirely\r\nBUILTIN\\Users:(RX)".to_string(),
-            format!("{PATH} BUILTIN\\Users(RX)"),
-            format!("{PATH} :(RX)"),
-        ] {
-            assert!(
-                acl_principals(&broken, PATH).is_err(),
-                "unreadable output was accepted: {broken}",
-            );
-        }
     }
 
     #[test]

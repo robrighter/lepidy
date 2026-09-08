@@ -448,7 +448,8 @@ fn vault_cli_int_009_a_file_delivery_is_owner_only_while_it_exists() {
             "the credential file was not owner-only: {shown}"
         );
     } else {
-        // Windows ACL hardening and its proof are the R04 platform matrix.
+        // Windows has no mode bits, so the probe cannot report one — the real
+        // question is the file's access-control list, asked below.
         assert!(
             shown.contains("mode=unsupported"),
             "the credential file was missing: {shown}"
@@ -458,6 +459,64 @@ fn vault_cli_int_009_a_file_delivery_is_owner_only_while_it_exists() {
         !key_path.exists(),
         "the materialised credential outlived the command"
     );
+}
+
+/// VAULT-CLI-INT-021 — the delivered file's real permissions, on this platform.
+///
+/// Until R04 the Windows half of this claim only asserted that the file
+/// existed. A credential file inherits its directory's access by default, which
+/// is usually a per-user profile directory and usually fine — but "usually" is
+/// not something to rest a private key on. So the delivery strips inheritance
+/// and grants exactly one principal, and this reads that back with `icacls`.
+#[test]
+fn vault_cli_int_021_a_file_delivery_is_owner_only_on_this_platform() {
+    let double = Double::start();
+    let home = TempHome::create("run-file-acl");
+    assert!(login(&home, &double).status.success());
+    let vault_public_key = double
+        .with_state(|state| state.vault_public_key.clone())
+        .expect("a published key");
+    double.with_state(|state| {
+        state.credentials = vec![credential_metadata()];
+        state.release = allow_release(&vault_public_key);
+    });
+
+    let key_path = home.path.join("acl-check");
+    let spec = format!("{CREDENTIAL_NAME}:{}", key_path.display());
+    // The child holds the file open long enough for this process to inspect it,
+    // because the permissions only matter while the credential is on disk.
+    let output = cli(
+        &home,
+        &[
+            "run",
+            "--with-file",
+            &spec,
+            "--origin-channel",
+            "channel-1",
+            "--origin-message",
+            "message-1",
+            "--reason",
+            "run the deploy",
+            "--scrub",
+            "never",
+            "--",
+            probe(),
+            "--assert-owner-only",
+            &key_path.display().to_string(),
+        ],
+        &[PASSPHRASE],
+    );
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        text(&output.stderr)
+    );
+    let shown = text(&output.stdout);
+    assert!(
+        shown.contains("owner-only=yes"),
+        "the delivered credential was readable by somebody else: {shown}"
+    );
+    assert_absent(&shown, CANARY, "the permission report");
 }
 
 /// VAULT-CLI-INT-010 — a refusal stops before the spawn and says so in the exit

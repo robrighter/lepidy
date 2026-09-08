@@ -152,6 +152,9 @@ fn preset_command(args: &Args) -> CliResult<i32> {
                 working_directory: args.option("dir").map(str::to_string),
                 credentials,
                 environment,
+                // Cleared by an edit on purpose: whatever was validated before
+                // was validated against a different preset.
+                harness_version: None,
                 max_concurrent: parse_number(args.option("max-concurrent"), 1)?,
                 cooldown_seconds: parse_number(args.option("cooldown"), 15)?,
                 timeout_seconds: parse_number(args.option("timeout"), 30 * 60)?,
@@ -183,7 +186,55 @@ fn preset_command(args: &Args) -> CliResult<i32> {
             );
             Ok(0)
         }
-        _ => Err(CliError::usage("preset takes list, set or remove")),
+        Some("check") => {
+            let store = load_presets()?;
+            let host = lepidy_runner::checkup::current_host();
+            let wanted = args.positional(1);
+            let presets: Vec<&Preset> = match wanted {
+                Some(id) => vec![store
+                    .get(id)
+                    .ok_or_else(|| CliError::failure(format!("there is no preset named {id}")))?],
+                None => store.presets.iter().collect(),
+            };
+            if presets.is_empty() {
+                return Err(CliError::failure(
+                    "there are no presets to check; define one with `lepidy-agentd preset set`",
+                ));
+            }
+
+            let mut failed = false;
+            let mut observed: Vec<(String, Option<String>)> = Vec::new();
+            for preset in &presets {
+                let checkup = lepidy_runner::checkup::check_preset(preset, host);
+                println!("\n{}", checkup.preset_id);
+                for (name, verdict) in &checkup.findings {
+                    println!("  [{}] {name:<9} {}", verdict.marker(), verdict.message());
+                }
+                failed |= !checkup.passed();
+                observed.push((checkup.preset_id.clone(), checkup.observed_version.clone()));
+            }
+
+            // Pinning happens only when everything else passed. Recording a
+            // version for a preset that cannot run would be writing down that
+            // something broken was validated.
+            if !failed {
+                let mut store = load_presets()?;
+                for (preset_id, version) in observed {
+                    if version.is_some() {
+                        store.pin_harness_version(&preset_id, version);
+                    }
+                }
+                save_presets_at(&preset_path(), &store)?;
+                println!("\nEverything checked out. Harness versions pinned.");
+                return Ok(0);
+            }
+            println!("\nSomething would stop this machine answering. Nothing was pinned.");
+            Err(CliError::denied(
+                "one or more presets would not run".to_string(),
+                None,
+            ))
+        }
+        _ => Err(CliError::usage("preset takes list, set, check or remove")),
     }
 }
 
@@ -347,6 +398,36 @@ fn run_command(args: &Args) -> CliResult<i32> {
             "there are no local presets, so nothing would run: define one with `lepidy-agentd preset set`",
         ));
     }
+    // Everything answerable offline, before anything is registered. A preset
+    // whose harness has been upgraded since somebody validated it is
+    // unvalidated, and a machine that discovered that at the first mention
+    // would discover it by failing in front of whoever asked.
+    let host = lepidy_runner::checkup::current_host();
+    let mut unusable = Vec::new();
+    for preset in &session.presets.presets {
+        let checkup = lepidy_runner::checkup::check_preset(preset, host);
+        for (name, verdict) in &checkup.findings {
+            match verdict {
+                lepidy_runner::checkup::Verdict::Fail(message) => {
+                    eprintln!("lepidy-agentd: {} [{name}] {message}", preset.id);
+                }
+                lepidy_runner::checkup::Verdict::Warn(message) => {
+                    eprintln!("lepidy-agentd: {} [{name}] {message}", preset.id);
+                }
+                lepidy_runner::checkup::Verdict::Ok(_) => {}
+            }
+        }
+        if !checkup.passed() {
+            unusable.push(preset.id.clone());
+        }
+    }
+    if !unusable.is_empty() {
+        return Err(CliError::usage(format!(
+            "these presets would not run: {}. Fix them, then `lepidy-agentd preset check`",
+            unusable.join(", ")
+        )));
+    }
+
     let idle_check = clamp_idle_check(Duration::from_secs(parse_number(
         args.option("idle-check"),
         DEFAULT_IDLE_CHECK.as_secs(),

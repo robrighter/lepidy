@@ -196,6 +196,7 @@ mod tests {
             working_directory: None,
             credentials: BTreeMap::new(),
             environment: BTreeMap::new(),
+            harness_version: None,
             max_concurrent,
             cooldown_seconds,
             timeout_seconds: 60,

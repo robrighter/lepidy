@@ -134,11 +134,17 @@ impl Drop for Materialised {
     }
 }
 
-/// `O_CREAT|O_EXCL` and, where the platform has one, an owner-only mode.
+/// `O_CREAT|O_EXCL` and an owner-only file on both platforms.
 ///
 /// Refusing to overwrite matters twice over: it protects a file the user cares
 /// about, and it stops a pre-created symlink from redirecting a credential
 /// somewhere the attacker can read.
+///
+/// The mode bit is set at creation on Unix, so the file is never briefly
+/// readable. Windows has no such flag, so the file is created and then its
+/// inherited access is stripped — a window of microseconds during which the
+/// file exists with its directory's permissions and no content, which is why
+/// the value is written only after this returns.
 fn create_owner_only(path: &Path, name: &str) -> CliResult<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -147,12 +153,55 @@ fn create_owner_only(path: &Path, name: &str) -> CliResult<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path).map_err(|error| {
+    let file = options.open(path).map_err(|error| {
         CliError::failure(format!(
             "could not create {} for {name}: {error}",
             path.display()
         ))
-    })
+    })?;
+    #[cfg(windows)]
+    restrict_to_current_user(path, name)?;
+    Ok(file)
+}
+
+/// Drop every inherited access-control entry and grant this user alone (R04).
+///
+/// Until this existed, a delivered credential inherited whatever the containing
+/// directory allowed. That is usually a per-user profile directory and usually
+/// fine — but "usually" is not a guarantee anybody should rest a private key
+/// on, and a shared or misconfigured directory would hand the file to everyone
+/// it grants. `/inheritance:r` removes the inherited entries and the grant puts
+/// exactly one principal back.
+///
+/// Failing here removes the file rather than leaving a credential behind under
+/// permissions nobody checked.
+#[cfg(windows)]
+fn restrict_to_current_user(path: &Path, name: &str) -> CliResult<()> {
+    use std::process::Command;
+
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    if user.is_empty() {
+        let _ = fs::remove_file(path);
+        return Err(CliError::failure(format!(
+            "could not determine the current user to secure {} for {name}",
+            path.display()
+        )));
+    }
+    let output = Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant")
+        .arg(format!("{user}:(R,W)"))
+        .output();
+    let ok = matches!(&output, Ok(output) if output.status.success());
+    if !ok {
+        let _ = fs::remove_file(path);
+        return Err(CliError::failure(format!(
+            "could not secure {} for {name}; refusing to write a credential to a file whose permissions are unknown",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

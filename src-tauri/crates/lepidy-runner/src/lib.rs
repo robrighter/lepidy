@@ -18,6 +18,7 @@
 //! machine decides *whether*, *how often*, *how many at once* and *for how
 //! long*, and it can be told to stop by anyone with the authority to stop it.
 
+pub mod checkup;
 pub mod daemon;
 pub mod policy;
 pub mod preset;
@@ -37,6 +38,14 @@ lepidy-agentd — the local runner for Lepidy agents
 
   lepidy-agentd preset list [--json]
       What this machine will run, and under which limits.
+
+  lepidy-agentd preset check [ID]
+      Everything about a preset that can be answered without a model: the
+      program exists and can be run, the working directory is there, the limits
+      are not self-defeating, the program is on the same side of a WSL boundary
+      as this daemon, and the harness is the version this preset was validated
+      against. Pins that version when everything passes. Reads nothing secret,
+      so it needs no passphrase.
 
   lepidy-agentd preset remove ID
       Forget a preset. Reads the local vault passphrase.

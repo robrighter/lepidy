@@ -311,6 +311,40 @@ pub fn restrict_to_owner(path: &Path) -> CliResult<()> {
     Ok(())
 }
 
+/// The principals named in `icacls` output, one per access-control entry.
+///
+/// Split out so the parsing has its own scenarios. `icacls` prints the path and
+/// the first entry on one line, and both a Windows path and a principal like
+/// `NT AUTHORITY\SYSTEM` contain spaces — so the path is stripped by the exact
+/// text that was passed in rather than guessed at. A line that cannot be read
+/// is an error, never a line that is skipped: a parser that silently drops
+/// entries is a check that silently passes.
+pub fn acl_principals(rendered: &str, path: &str) -> CliResult<Vec<String>> {
+    let unreadable = || CliError::failure(format!("could not read the permissions of {path}"));
+    let mut principals = Vec::new();
+    for (index, line) in rendered.lines().enumerate() {
+        let line = line.trim_end();
+        if line.trim().is_empty() || line.contains("Successfully processed") {
+            continue;
+        }
+        let entry = if index == 0 {
+            line.strip_prefix(path).ok_or_else(unreadable)?.trim_start()
+        } else {
+            line.trim()
+        };
+        let (principal, rights) = entry.split_once(':').ok_or_else(unreadable)?;
+        if !rights.trim_start().starts_with('(') {
+            return Err(unreadable());
+        }
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Err(unreadable());
+        }
+        principals.push(principal.to_string());
+    }
+    Ok(principals)
+}
+
 /// A recovery code the operator writes down: 24 characters from an alphabet
 /// with no `I`, `O`, `1` or `0`, so a transcription error is a failed unlock
 /// rather than a silently different code.
@@ -344,4 +378,48 @@ pub fn assert_key_length(bytes: &[u8], field: &str) -> CliResult<()> {
         return Err(CliError::failure(format!("{field} must be 256 bits")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_principals_out_of_an_access_control_list() {
+        const PATH: &str = r"C:\Users\maya\my files\presets.json";
+
+        // Real `icacls` output. Both the path and the first principal contain
+        // spaces, which is why the path is stripped by the exact text passed in
+        // rather than guessed at.
+        let rendered = format!(
+            "{PATH} NT AUTHORITY\\SYSTEM:(F)\r\nBUILTIN\\Administrators:(F)\r\nDESKTOP-1\\maya:(F)\r\n\r\nSuccessfully processed 1 files; Failed processing 0 files"
+        );
+        assert_eq!(
+            acl_principals(&rendered, PATH).expect("well-formed output parses"),
+            vec![
+                r"NT AUTHORITY\SYSTEM".to_string(),
+                r"BUILTIN\Administrators".to_string(),
+                r"DESKTOP-1\maya".to_string(),
+            ],
+        );
+
+        // The entry an owner-only check exists to catch is not skipped.
+        let open = format!("{PATH} BUILTIN\\Users:(RX)\r\nDESKTOP-1\\maya:(F)");
+        assert!(acl_principals(&open, PATH)
+            .expect("parses")
+            .contains(&r"BUILTIN\Users".to_string()));
+
+        // Output this cannot read is an error, never an empty list: a parser
+        // that silently drops entries is a check that silently passes.
+        for broken in [
+            "something else entirely\r\nBUILTIN\\Users:(RX)".to_string(),
+            format!("{PATH} BUILTIN\\Users(RX)"),
+            format!("{PATH} :(RX)"),
+        ] {
+            assert!(
+                acl_principals(&broken, PATH).is_err(),
+                "unreadable output was accepted: {broken}",
+            );
+        }
+    }
 }
