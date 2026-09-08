@@ -9,6 +9,8 @@ export type ShellEnvironment = {
   WORKSPACE?: CloudflareEnv["WORKSPACE"];
   ACCOUNTS?: CloudflareEnv["ACCOUNTS"];
   ENVIRONMENT?: string;
+  TRANSPORT_SECRET_KEY?: string;
+  WIF_SIGNING_JWK?: string;
 };
 
 /**

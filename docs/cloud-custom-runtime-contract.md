@@ -5,7 +5,7 @@
 **Decision:** D06
 
 **Date:** 2026-09-07
-**Provider snapshot:** Claude Platform documentation read 2026-09-07; Managed Agents beta `managed-agents-2026-04-01`
+**Provider snapshot:** Claude Platform documentation rechecked 2026-09-08; Managed Agents beta `managed-agents-2026-04-01`
 
 This contract fixes the provider-authentication, lifecycle, callback and
 reconciliation boundaries that A05 must implement. It preserves the core
@@ -126,7 +126,7 @@ session.
 
 For a verified webhook:
 
-1. dedupe durably on the top-level event id (equal to `webhook-id`);
+1. dedupe durably on the signed top-level event id (equal to `webhook-id`);
 2. acknowledge with `204` only after the receipt and tenant work item commit;
 3. fetch the named resource through the authenticated provider client rather
    than deriving state from delivery order or the thin event body;
@@ -137,8 +137,10 @@ For a verified webhook:
 Anthropic can deliver events out of order or more than once. It tries at most
 three times with jittered backoff, drops the event without a loss signal after
 the last failure, and never backfills events emitted while a type was
-unsubscribed or the endpoint was disabled. A `3xx` disables the endpoint on the
-first attempt. Those are provider facts, not behavior Lepidy can tune.
+unsubscribed or the endpoint was disabled. A `3xx` or a hostname resolving to a
+non-public address disables the endpoint immediately. A sustained uninterrupted
+period of delivery failure also disables it; one `2xx` resets that window. Those
+are provider facts, not behavior Lepidy can tune.
 
 Therefore webhooks accelerate state; they never establish completeness. Each
 workspace keeps a recurring reconciliation item in its existing multiplexed

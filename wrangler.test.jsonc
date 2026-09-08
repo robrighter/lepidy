@@ -3,7 +3,10 @@
   "name": "lepidy-test",
   "main": "tests/fixtures/workspace-worker.ts",
   "compatibility_date": "2026-09-05",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "vars": {
+    "TRANSPORT_SECRET_KEY": "test-only-transport-key-32-bytes-long"
+  },
   "durable_objects": {
     "bindings": [
       {

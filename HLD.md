@@ -531,7 +531,7 @@ account, and Lepidy exchanges short-lived assertions in memory. The integration
 never accepts or stores an Anthropic API key. The WIF signer and the envelope
 key for webhook transport secrets are platform keys, not user vault roots.
 
-The webhook route is `POST /hooks/anthropic`, exact-match, and **it never returns a 3xx** — a redirect auto-disables the endpoint immediately on the first attempt, and on a Worker a trailing-slash redirect is one router change away. There is a test asserting the route returns 2xx or 4xx for every input shape, and it is not optional.
+The webhook route is `POST /hooks/anthropic`, exact-match, and **it never returns a 3xx** — a redirect auto-disables the endpoint immediately on the first attempt, and on a Worker a trailing-slash redirect is one router change away. There is a test asserting the route returns 2xx or 4xx for every input shape, and it is not optional. Resolution to a non-public address also disables immediately; a sustained uninterrupted failure period can disable it, while one `2xx` resets that window.
 
 Handling: parse the unverified body only far enough to select a candidate
 organization/workspace integration, verify the signature against the raw body
@@ -539,7 +539,7 @@ organization/workspace integration, verify the signature against the raw body
 dedupe on the event id in D1, then route to the tenant and **fetch the resource**
 — payloads are thin and carry no state worth reading.
 
-**Delivery is lossy — three attempts, then dropped silently — so correctness comes from reconciliation, not from receipt.** Each workspace object runs a sweep on its daily alarm: for every session or deployment run it believes is open, fetch and settle. Without it a session shows "working" forever because one delivery failed at 3am, and everything looks fine until it doesn't.
+**Delivery is lossy — three attempts, then dropped silently — so correctness comes from reconciliation, not from receipt.** Events may be duplicated or out of order, gaps are not backfilled, and an endpoint can be automatically disabled. Each workspace object runs a sweep on its daily alarm: for every session or deployment run it believes is open, fetch and settle. Without it a session can show "working" forever after a missed delivery, and everything looks fine until it doesn't.
 
 The `custom` runtime uses the same content plane and a different wake plane. A
 durable outbox POSTs a versioned, HMAC-signed metadata-only wake to one

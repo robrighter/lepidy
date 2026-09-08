@@ -469,12 +469,12 @@ The webhook carries **lifecycle only** — started, idled, terminated, and the o
 
 #### Webhooks, and the five delivery facts that shape the design
 
-Anthropic POSTs to one HTTPS endpoint on our Worker. Every delivery is HMAC-signed with `webhook-id` / `webhook-timestamp` / `webhook-signature` headers, verified with the SDK's `unwrap()` against a `whsec_` secret. Five properties of that channel are not incidental — each one dictates something:
+Anthropic POSTs to one HTTPS endpoint on our Worker. Every delivery is HMAC-signed with `webhook-id` / `webhook-timestamp` / `webhook-signature` headers, verified with the SDK's `unwrap()` against the raw request bytes and a `whsec_` secret; the SDK also enforces a five-minute freshness bound. The signed top-level event ID, equal to `webhook-id`, is the durable dedupe key. Five properties of that channel are not incidental — each one dictates something:
 
 1. **Payloads are thin** — an event type and a resource id, nothing else. No `stop_reason`, no results. So the handler always *fetches the resource*; anything that reads state off the webhook body is a bug waiting for a schema change.
 2. **No ordering guarantee.** `session.status_idled` can arrive before the event that explains it, and a `.deleted` can beat its own `.archived`. **State is driven by what we fetch, never by arrival order.**
 3. **Three attempts, then the event is dropped** — silently, with no signal. Webhooks are not a durable log, so Lepidy reconciles: a periodic sweep lists sessions and deployment runs for anything it thinks is still open. Without that, an agent shows "working" forever because one delivery failed at 3am.
-4. **A `3xx` response auto-disables the endpoint immediately, on the first attempt.** This is a real trap on Workers, where a trailing-slash redirect is one router config away from silently killing every customer's integration. The route is exact-match, returns 2xx or 4xx and never redirects, and there is a test that asserts it.
+4. **A `3xx` response auto-disables the endpoint immediately, on the first attempt.** This is a real trap on Workers, where a trailing-slash redirect is one router config away from silently killing every customer's integration. The route is exact-match, returns 2xx or 4xx and never redirects, and there is a test that asserts it. Resolution to a non-public address also disables immediately; sustained uninterrupted delivery failures can disable the endpoint, while one `2xx` resets that window.
 5. **Events emitted while a type was unsubscribed are never backfilled.** So the subscription list is part of setup, not something to add later when a feature needs it.
 
 Deliveries are deduped on the event id, which is stable across retries.
@@ -1250,7 +1250,7 @@ CREATE TABLE agent_cloud_runs (
 -- or complete — a sweep reconciles anything still open (§7.9).
 CREATE TABLE webhook_events (              -- CONTROL PLANE (D1): arrives before we
   -- know which tenant it belongs to, so dedupe happens at the door.
-  event_id text PRIMARY KEY,                 -- whe_… ; also the webhook-id header
+  event_id text PRIMARY KEY,                 -- signed top-level event id
   workspace_id text NOT NULL,
   data_type text NOT NULL, resource_id text,
   received_at integer NOT NULL, processed_at integer
@@ -1487,7 +1487,7 @@ Stated plainly, because each one is a thing a reviewer should be able to push ba
 
 **The Claude Cloud connect flow has a manual step we cannot remove.** Webhook endpoints are registered by hand in the Anthropic Console, so setup is paste-and-verify rather than a click, and some fraction of people will not finish it. The test-event gate stops a half-finished setup from *looking* finished — the failure worth preventing — but it does nothing about the drop-off.
 
-**Webhook delivery is lossy by design:** three attempts, then dropped with no signal. The reconciliation sweep is what makes the feature correct, and it is the piece most likely to be cut under deadline and missed in review, because everything works fine until a delivery fails at 3am.
+**Webhook delivery is lossy by design:** three attempts, then dropped with no signal; gaps are not backfilled, and the endpoint can be automatically disabled. The reconciliation sweep is what makes the feature correct, and it is the piece most likely to be cut under deadline and missed in review, because everything works fine until a delivery fails at 3am.
 
 **Our phone app is smaller than Slack's, on purpose** (§9.11). A team comparing the two side by side will notice, and the PWA is the answer in v1. This is the most likely reason a team says no on a feature comparison rather than on the merits.
 

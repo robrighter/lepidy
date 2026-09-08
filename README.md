@@ -90,3 +90,10 @@ Run `npm run desktop:dev` after installing the Tauri system prerequisites. The d
 Only development localhost receives the narrow window capabilities needed by the custom Windows controls. Release builds currently show the bundled connection screen; the hosted production origin and its explicit capability scope will be added with the authenticated desktop bridge.
 
 The placeholder Cloudflare resource identifiers in `wrangler.jsonc` support local type generation and dry-run builds. Provisioned environment IDs belong in deployment-specific configuration, never in source secrets.
+
+Cloud/custom runtimes additionally require two platform secret bindings:
+`TRANSPORT_SECRET_KEY` (at least 32 random bytes) envelopes webhook transport
+secrets, and `WIF_SIGNING_JWK` contains the private platform OIDC signing JWK.
+Provision both with the deployment secret store (for example, `wrangler secret
+put`), never in `wrangler.jsonc`, logs, tenant data, or a checked-in environment
+file. The matching public key must be published by Lepidy's OIDC issuer.

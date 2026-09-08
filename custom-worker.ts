@@ -3,6 +3,7 @@
 import openNextWorker from "./.open-next/worker.js";
 
 import { handleRunnerSocketRequest } from "./src/cloudflare/runner-socket";
+import { handleRuntimeGatewayRequest } from "./src/cloudflare/runtime-gateway";
 import type { ShellEnvironment } from "./src/shell/resolve-shell-source";
 
 export { Accounts } from "./src/cloudflare/accounts";
@@ -10,6 +11,8 @@ export { Workspace } from "./src/cloudflare/workspace";
 
 export default {
   async fetch(request: Request, env: ShellEnvironment, ctx: unknown): Promise<Response> {
+    const runtimeGateway = await handleRuntimeGatewayRequest(env as CloudflareEnv, request);
+    if (runtimeGateway !== null) return runtimeGateway;
     // The runner's socket is answered before Next sees the request. Next's own
     // documentation is explicit that a Route Handler cannot hold a WebSocket —
     // the connection closes once the response is generated — so this is the

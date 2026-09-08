@@ -6,6 +6,7 @@ import {
   AUDIT_ANCHOR_WORK_ID,
   OUTBOX_FLUSH_WORK_ID,
   RETENTION_SWEEP_WORK_ID,
+  RUNTIME_RECONCILIATION_WORK_ID,
   type Workspace,
 } from "../src/cloudflare/workspace";
 import type { OutboxEntry, OutboxOutcome } from "../src/cloudflare/workspace-scheduler";
@@ -52,6 +53,7 @@ describe("workspace alarm scheduler", () => {
       "expiry.late",
       AUDIT_ANCHOR_WORK_ID,
       RETENTION_SWEEP_WORK_ID,
+      RUNTIME_RECONCILIATION_WORK_ID,
     ]);
 
     // Only the earliest deadline is due; the alarm re-points at the next one.
@@ -70,6 +72,7 @@ describe("workspace alarm scheduler", () => {
     expect((await stub.schedulerState()).dueWork.map((item) => item.id)).toEqual([
       AUDIT_ANCHOR_WORK_ID,
       RETENTION_SWEEP_WORK_ID,
+      RUNTIME_RECONCILIATION_WORK_ID,
     ]);
   });
 
@@ -189,6 +192,7 @@ describe("workspace alarm scheduler", () => {
         expect(state.dueWork.map((item) => item.id)).toEqual([
           AUDIT_ANCHOR_WORK_ID,
           RETENTION_SWEEP_WORK_ID,
+          RUNTIME_RECONCILIATION_WORK_ID,
         ]);
         expect(state.alarmAt).not.toBeNull();
       },

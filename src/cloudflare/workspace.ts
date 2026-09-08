@@ -103,6 +103,21 @@ import {
   type ServerFrame,
 } from "../domain/socket-protocol";
 import { parseMentions } from "../domain/mentions";
+import {
+  callManagedAgents,
+  customWake,
+  decryptTransportSecret,
+  deliverCustomWake,
+  encryptTransportSecret,
+  exchangeWifAssertion,
+  mintWifAssertion,
+  validateBudgetChange,
+  validateProviderSchedule,
+  validatePublicCallbackUrl,
+  validateWifAuthority,
+  type AnthropicThinEvent,
+  type WifAuthority,
+} from "../domain/cloud-custom-runtime";
 import { isEmojiToken, parseCustomEmojiName } from "../domain/emoji";
 import {
   agentMayPostIn,
@@ -837,6 +852,7 @@ export type OauthConnectionSummary = {
 
 /** One multiplexed deadline covers every pending scheduled send. */
 export const SCHEDULED_SEND_WORK_ID = "system:scheduled_send";
+export const RUNTIME_RECONCILIATION_WORK_ID = "system:runtime_reconciliation";
 const SCHEDULED_SEND_BATCH = 25;
 /** A year is already further ahead than anybody means; beyond it is a mistake. */
 const MAX_SCHEDULE_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
@@ -901,6 +917,17 @@ type VaultProxyRequestRow = {
   created_at: number; expires_at: number;
 };
 
+type AgentRuntimeConfigRow = {
+  agent_id: string; kind: "local" | "claude_cloud" | "custom"; status: "pending" | "active" | "disconnected";
+  organization_id: string | null; provider_workspace_id: string | null; provider_agent_id: string | null;
+  provider_environment_id: string | null; provider_deployment_id: string | null; wif_issuer: string | null;
+  wif_audience: string | null; wif_subject: string | null; service_account_id: string | null;
+  federation_rule_id: string | null; callback_url: string | null; secret_envelope: string | null;
+  budget_cents: number | null; resource_proved_at: number | null; webhook_proved_at: number | null;
+  wif_failures: number;
+  created_at: number; updated_at: number;
+};
+
 /** A wake that has committed and is waiting to be handed to a socket. */
 type StagedRunnerWake = { deviceId: string; agentId: string; presetId: string; requestId: string };
 
@@ -932,6 +959,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           [
             { id: RETENTION_SWEEP_WORK_ID, kind: "retention_sweep", dueAt: now + DAY_MS, intervalMs: DAY_MS },
             { id: AUDIT_ANCHOR_WORK_ID, kind: "audit_anchor", dueAt: now + DAY_MS, intervalMs: DAY_MS },
+            { id: RUNTIME_RECONCILIATION_WORK_ID, kind: "runtime_reconciliation", dueAt: now + DAY_MS, intervalMs: DAY_MS },
           ],
           now,
         );
@@ -3446,6 +3474,227 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       },
     );
     return { ...outcome.result, created: !outcome.replayed };
+  }
+
+  /** Configure provider authority without ever accepting a static Anthropic API key. */
+  async configureClaudeRuntime(input: {
+    actor: Actor;
+    agentId: string;
+    authority: WifAuthority;
+    providerAgentId: string;
+    providerEnvironmentId: string;
+    providerDeploymentId?: string | null;
+    webhookSigningSecret: string;
+    budgetCents: number;
+    now: number;
+  }): Promise<{ status: "pending"; subject: string }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireOwnedAgent(input.agentId, actor.id);
+    const authority = validateWifAuthority(input.authority);
+    if (!input.webhookSigningSecret.startsWith("whsec_") || input.webhookSigningSecret.length < 32) throw new Error("invalid webhook signing secret");
+    if (!Number.isSafeInteger(input.budgetCents) || input.budgetCents < 1) throw new Error("cloud runtime needs a positive budget");
+    for (const value of [input.providerAgentId, input.providerEnvironmentId, input.providerDeploymentId ?? "ok"]) {
+      if (!/^[A-Za-z0-9_-]{2,200}$/.test(value)) throw new Error("invalid provider resource id");
+    }
+    const key = this.transportSecretKey();
+    const context = `anthropic:${this.workspaceKey()}:${authority.organizationId}:${authority.workspaceId}`;
+    const envelope = await encryptTransportSecret(input.webhookSigningSecret, key, context);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO agent_runtime_configs(
+           agent_id, kind, status, organization_id, provider_workspace_id, provider_agent_id,
+           provider_environment_id, provider_deployment_id, wif_issuer, wif_audience, wif_subject,
+           service_account_id, federation_rule_id, secret_envelope, budget_cents, created_at, updated_at)
+         VALUES (?, 'claude_cloud', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET kind = 'claude_cloud', status = 'pending',
+           organization_id = excluded.organization_id, provider_workspace_id = excluded.provider_workspace_id,
+           provider_agent_id = excluded.provider_agent_id, provider_environment_id = excluded.provider_environment_id,
+           provider_deployment_id = excluded.provider_deployment_id, wif_issuer = excluded.wif_issuer,
+           wif_audience = excluded.wif_audience, wif_subject = excluded.wif_subject,
+           service_account_id = excluded.service_account_id, federation_rule_id = excluded.federation_rule_id,
+           callback_url = NULL, secret_envelope = excluded.secret_envelope, budget_cents = excluded.budget_cents,
+           resource_proved_at = NULL, webhook_proved_at = NULL, updated_at = excluded.updated_at`,
+        input.agentId, authority.organizationId, authority.workspaceId, input.providerAgentId,
+        input.providerEnvironmentId, input.providerDeploymentId ?? null, authority.issuer, authority.audience,
+        authority.subject, authority.serviceAccountId, authority.federationRuleId, envelope,
+        input.budgetCents, input.now, input.now,
+      );
+    });
+    if (this.env.CONTROL_DB) {
+      const workspace = await this.env.CONTROL_DB.prepare(
+        "SELECT id FROM workspaces WHERE durable_object_id = ? AND status = 'active'",
+      ).bind(this.workspaceKey()).first<{ id: string }>();
+      if (workspace) {
+        await this.env.CONTROL_DB.prepare(
+          `INSERT INTO runtime_webhook_routes(organization_id, provider_workspace_id, workspace_id, durable_object_id,
+             secret_envelope, transport_context, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+           ON CONFLICT(organization_id, provider_workspace_id) DO UPDATE SET workspace_id = excluded.workspace_id,
+             durable_object_id = excluded.durable_object_id, secret_envelope = excluded.secret_envelope,
+             transport_context = excluded.transport_context, status = 'pending', updated_at = excluded.updated_at`,
+        ).bind(authority.organizationId, authority.workspaceId, workspace.id, this.workspaceKey(), envelope, context,
+          input.now, input.now).run();
+      }
+    }
+    return { status: "pending", subject: authority.subject };
+  }
+
+  /** Authenticated GET proof for the exact configured agent and environment. */
+  async proveClaudeRuntimeResources(input: { actor: Actor; agentId: string; now: number }): Promise<{ status: "pending" | "active" }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireOwnedAgent(input.agentId, actor.id);
+    const config = this.requireRuntimeConfig(input.agentId, "claude_cloud");
+    const accessToken = await this.providerAccessToken(config, input.now);
+    await callManagedAgents({ accessToken, path: `/v1/agents/${config.provider_agent_id!}` });
+    await callManagedAgents({ accessToken, path: `/v1/environments/${config.provider_environment_id!}` });
+    const status = config.webhook_proved_at === null ? "pending" : "active";
+    this.ctx.storage.sql.exec(
+      "UPDATE agent_runtime_configs SET resource_proved_at = ?, status = ?, updated_at = ? WHERE agent_id = ?",
+      input.now, status, input.now, input.agentId,
+    );
+    return { status };
+  }
+
+  /** Store and test one metadata-only custom wake endpoint. */
+  async configureCustomRuntime(input: {
+    actor: Actor; agentId: string; callbackUrl: string; signingSecret: string; now: number;
+  }): Promise<{ status: "active" }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireOwnedAgent(input.agentId, actor.id);
+    if (input.signingSecret.length < 32) throw new Error("custom callback secret is too short");
+    const url = await validatePublicCallbackUrl(input.callbackUrl, (hostname) => this.resolvePublicDns(hostname));
+    const context = `custom:${this.workspaceKey()}:${input.agentId}`;
+    const envelope = await encryptTransportSecret(input.signingSecret, this.transportSecretKey(), context);
+    const probe = customWake({ type: "custom.test", delivery_id: crypto.randomUUID(), created_at: new Date(input.now).toISOString(),
+      workspace_id: this.workspaceKey(), agent_id: input.agentId, queue_depth: 0 });
+    const result = await deliverCustomWake({ url: url.toString(), wake: probe, secret: input.signingSecret,
+      resolve: (hostname) => this.resolvePublicDns(hostname), now: input.now });
+    if (result.status !== "delivered") throw new Error(`custom callback test failed: ${result.error}`);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO agent_runtime_configs(agent_id, kind, status, callback_url, secret_envelope, created_at, updated_at)
+       VALUES (?, 'custom', 'active', ?, ?, ?, ?)
+       ON CONFLICT(agent_id) DO UPDATE SET kind = 'custom', status = 'active', callback_url = excluded.callback_url,
+         secret_envelope = excluded.secret_envelope, organization_id = NULL, provider_workspace_id = NULL,
+         provider_agent_id = NULL, provider_environment_id = NULL, provider_deployment_id = NULL,
+         budget_cents = NULL, resource_proved_at = NULL, webhook_proved_at = NULL, updated_at = excluded.updated_at`,
+      input.agentId, url.toString(), envelope, input.now, input.now,
+    );
+    return { status: "active" };
+  }
+
+  /** Called only by the exact Worker gateway after SDK verification. */
+  async acceptAnthropicWebhook(input: { event: AnthropicThinEvent; now: number }): Promise<{ duplicate: boolean }> {
+    const config = this.ctx.storage.sql.exec<AgentRuntimeConfigRow>(
+      `SELECT * FROM agent_runtime_configs WHERE kind = 'claude_cloud' AND organization_id = ?
+       AND provider_workspace_id = ? AND status IN ('pending', 'active')`,
+      input.event.data.organization_id, input.event.data.workspace_id,
+    ).toArray()[0];
+    if (!config) throw new Error("webhook authority does not match this workspace");
+    const result = this.ctx.storage.transactionSync(() => {
+      const duplicate = this.ctx.storage.sql.exec<{ present: number }>(
+        "SELECT 1 AS present FROM anthropic_webhook_receipts WHERE event_id = ?", input.event.id,
+      ).toArray()[0] !== undefined;
+      if (duplicate) return { duplicate: true };
+      this.ctx.storage.sql.exec(
+        `INSERT INTO anthropic_webhook_receipts(event_id, event_type, resource_id, organization_id,
+           provider_workspace_id, received_at) VALUES (?, ?, ?, ?, ?, ?)`,
+        input.event.id, input.event.data.type, input.event.data.id, input.event.data.organization_id,
+        input.event.data.workspace_id, input.now,
+      );
+      const status = config.resource_proved_at === null ? "pending" : "active";
+      this.ctx.storage.sql.exec(
+        "UPDATE agent_runtime_configs SET webhook_proved_at = COALESCE(webhook_proved_at, ?), status = ?, updated_at = ? WHERE agent_id = ?",
+        input.now, status, input.now, config.agent_id,
+      );
+      enqueueOutbox(this.ctx.storage, [{ id: `anthropic_event.${input.event.id}`, kind: "anthropic_resource_fetch",
+        dedupeKey: `anthropic_resource_fetch:${input.event.id}`, payload: {
+          eventId: input.event.id, eventType: input.event.data.type, resourceId: input.event.data.id, agentId: config.agent_id,
+        } }], input.now);
+      scheduleDueWork(this.ctx.storage, [{ id: OUTBOX_FLUSH_WORK_ID, kind: "outbox_flush", dueAt: input.now }], input.now);
+      return { duplicate: false };
+    });
+    await this.armAlarm();
+    return result;
+  }
+
+  runtimeSummary(input: { actor: Actor; agentId: string }): Omit<AgentRuntimeConfigRow, "secret_envelope"> | null {
+    const actor = this.authorizeActor(input.actor);
+    this.requireOwnedAgent(input.agentId, actor.id);
+    const row = this.ctx.storage.sql.exec<AgentRuntimeConfigRow>("SELECT * FROM agent_runtime_configs WHERE agent_id = ?", input.agentId).toArray()[0];
+    if (!row) return null;
+    const { secret_envelope: _secret, ...summary } = row;
+    return summary;
+  }
+
+  async createClaudeSchedule(input: {
+    actor: Actor; agentId: string; cron: string; timezone: string; budgetCents: number; now: number;
+  }): Promise<{ deploymentId: string; upcomingRunsAt: readonly string[] }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireOwnedAgent(input.agentId, actor.id);
+    const config = this.requireRuntimeConfig(input.agentId, "claude_cloud");
+    if (config.status !== "active") throw new Error("cloud runtime setup is not complete");
+    if (!Number.isSafeInteger(input.budgetCents) || input.budgetCents < 1) throw new Error("scheduled runs need a positive budget");
+    const schedule = validateProviderSchedule(input.cron, input.timezone);
+    const accessToken = await this.providerAccessToken(config, input.now);
+    const response = await callManagedAgents({ accessToken, path: "/v1/deployments", body: {
+      agent_id: config.provider_agent_id, environment_id: config.provider_environment_id,
+      schedule: { cron: schedule.cron, timezone: schedule.timezone },
+      budget: { amount: String(input.budgetCents), currency: "USD" },
+    } });
+    if (!response || typeof response !== "object" || Array.isArray(response)) throw new Error("unknown deployment response");
+    const resource = response as Record<string, unknown>;
+    if (typeof resource.id !== "string") throw new Error("unknown deployment response");
+    const upcomingRunsAt = Array.isArray(resource.upcoming_runs_at)
+      ? resource.upcoming_runs_at.filter((value): value is string => typeof value === "string").slice(0, 100) : [];
+    this.ctx.storage.sql.exec(
+      "UPDATE agent_runtime_configs SET provider_deployment_id = ?, budget_cents = ?, updated_at = ? WHERE agent_id = ?",
+      resource.id, input.budgetCents, input.now, input.agentId,
+    );
+    return { deploymentId: resource.id, upcomingRunsAt };
+  }
+
+  async startManualClaudeRun(input: {
+    actor: Actor; agentId: string; delegationId?: string | null; budgetCents: number; now: number;
+  }): Promise<{ runId: string; providerRunId: string }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireOwnedAgent(input.agentId, actor.id);
+    const config = this.requireRuntimeConfig(input.agentId, "claude_cloud");
+    if (config.status !== "active" || !config.provider_deployment_id) throw new Error("cloud deployment is not configured");
+    if (!Number.isSafeInteger(input.budgetCents) || input.budgetCents < 1) throw new Error("manual runs need a positive budget");
+    const accessToken = await this.providerAccessToken(config, input.now);
+    const response = await callManagedAgents({ accessToken,
+      path: `/v1/deployments/${config.provider_deployment_id}/runs`, body: {
+        budget: { amount: String(input.budgetCents), currency: "USD" },
+      } });
+    if (!response || typeof response !== "object" || Array.isArray(response) || typeof (response as Record<string, unknown>).id !== "string") {
+      throw new Error("unknown deployment run response");
+    }
+    const providerRunId = (response as Record<string, unknown>).id as string;
+    const runId = crypto.randomUUID();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO runtime_runs(id, agent_id, kind, delegation_id, provider_deployment_run_id, budget_cents,
+         state, created_at, updated_at) VALUES (?, ?, 'manual', ?, ?, ?, 'running', ?, ?)`,
+      runId, input.agentId, input.delegationId ?? null, providerRunId, input.budgetCents, input.now, input.now,
+    );
+    return { runId, providerRunId };
+  }
+
+  async updateClaudeSessionBudget(input: {
+    actor: Actor; runId: string; nextBudgetCents: number | null; consumedCents: number; now: number;
+  }): Promise<{ budgetCents: number | null }> {
+    const actor = this.authorizeActor(input.actor);
+    const run = this.ctx.storage.sql.exec<{ agent_id: string; provider_session_id: string | null; budget_cents: number | null }>(
+      "SELECT agent_id, provider_session_id, budget_cents FROM runtime_runs WHERE id = ?", input.runId,
+    ).toArray()[0];
+    if (!run?.provider_session_id) throw new Error("cloud session run does not exist");
+    this.requireOwnedAgent(run.agent_id, actor.id);
+    const next = validateBudgetChange(run.budget_cents, input.nextBudgetCents, input.consumedCents);
+    const config = this.requireRuntimeConfig(run.agent_id, "claude_cloud");
+    const accessToken = await this.providerAccessToken(config, input.now);
+    await callManagedAgents({ accessToken, method: "PATCH", path: `/v1/sessions/${run.provider_session_id}`,
+      body: { budget: next === null ? null : { amount: String(next), currency: "USD" } } });
+    this.ctx.storage.sql.exec("UPDATE runtime_runs SET budget_cents = ?, updated_at = ? WHERE id = ?", next, input.now, input.runId);
+    return { budgetCents: next };
   }
 
   /** Owners are the agent's accountable humans, so only an owner may add one. */
@@ -7029,7 +7278,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         // The wake commits with the queue row it announces (R01). Delivery
         // happens after this transaction, and a wake nobody was listening for
         // stays pending until a runner reconnects and collects it.
-        this.recordRunnerWake(agent.id, input.now);
+        this.recordRuntimeWake(agent.id, input.messageId, input.now);
       }
     }
     return enqueued;
@@ -8116,6 +8365,40 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     });
   }
 
+  /** Select exactly one configured execution lane for a committed queue item. */
+  private recordRuntimeWake(agentId: string, messageId: string, now: number): void {
+    const config = this.ctx.storage.sql.exec<AgentRuntimeConfigRow>(
+      "SELECT * FROM agent_runtime_configs WHERE agent_id = ?", agentId,
+    ).toArray()[0];
+    if (!config || config.kind === "local") {
+      this.recordRunnerWake(agentId, now);
+      return;
+    }
+    if (config.status !== "active") return;
+    if (config.kind === "custom") {
+      const deliveryId = crypto.randomUUID();
+      const depth = this.ctx.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM agent_queue WHERE agent_id = ? AND execution_state = 'pending'", agentId,
+      ).one().count;
+      this.ctx.storage.sql.exec(
+        `INSERT INTO custom_runtime_deliveries(delivery_id, agent_id, queue_depth, state, created_at)
+         VALUES (?, ?, ?, 'pending', ?)`, deliveryId, agentId, depth, now,
+      );
+      enqueueOutbox(this.ctx.storage, [{ id: `custom_wake.${deliveryId}`, kind: "custom_runtime_wake",
+        dedupeKey: `custom_runtime_wake:${deliveryId}`, payload: { deliveryId, agentId } }], now);
+    } else {
+      const runId = crypto.randomUUID();
+      this.ctx.storage.sql.exec(
+        `INSERT INTO runtime_runs(id, agent_id, kind, origin_message_id, budget_cents, state, created_at, updated_at)
+         VALUES (?, ?, 'mention', ?, ?, 'queued', ?, ?)`,
+        runId, agentId, messageId, config.budget_cents, now, now,
+      );
+      enqueueOutbox(this.ctx.storage, [{ id: `cloud_run.${runId}`, kind: "cloud_runtime_mention",
+        dedupeKey: `cloud_runtime_mention:${runId}`, payload: { runId, agentId } }], now);
+    }
+    scheduleDueWork(this.ctx.storage, [{ id: OUTBOX_FLUSH_WORK_ID, kind: "outbox_flush", dueAt: now }], now);
+  }
+
   /**
    * Deliver the wakes a committed transaction produced.
    *
@@ -8598,6 +8881,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
             approvals = { expired: approvals.expired + report.expired };
             break;
           }
+          case "runtime_reconciliation":
+            await this.reconcileCloudRuntimes(now);
+            break;
           case "audit_anchor":
             anchor = this.ctx.storage.transactionSync(() =>
               writeAuditAnchor(this.ctx.storage, this.workspaceKey(), now),
@@ -8671,7 +8957,18 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         settleOutbox(this.ctx.storage, entry, outcome, now),
       );
       if (settled === "delivered") delivered += 1;
-      else if (settled === "dead") dead += 1;
+      else if (settled === "dead") {
+        dead += 1;
+        if (entry.kind === "custom_runtime_wake") {
+          const payload = entry.payload as { deliveryId?: unknown };
+          if (typeof payload.deliveryId === "string") {
+            this.ctx.storage.sql.exec(
+              "UPDATE custom_runtime_deliveries SET state = 'dead', completed_at = ? WHERE delivery_id = ?",
+              now, payload.deliveryId,
+            );
+          }
+        }
+      }
       else retried += 1;
     }
 
@@ -8699,6 +8996,69 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     return this.ctx.id.toString();
   }
 
+  private transportSecretKey(): string {
+    const key = this.env.TRANSPORT_SECRET_KEY;
+    if (!key || key.length < 32) throw new Error("platform transport-secret key is unavailable");
+    return key;
+  }
+
+  private requireRuntimeConfig(agentId: string, kind: AgentRuntimeConfigRow["kind"]): AgentRuntimeConfigRow {
+    const row = this.ctx.storage.sql.exec<AgentRuntimeConfigRow>(
+      "SELECT * FROM agent_runtime_configs WHERE agent_id = ? AND kind = ?", agentId, kind,
+    ).toArray()[0];
+    if (!row) throw new Error(`${kind} runtime is not configured`);
+    return row;
+  }
+
+  private async providerAccessToken(config: AgentRuntimeConfigRow, now: number): Promise<string> {
+    if (!this.env.WIF_SIGNING_JWK) throw new Error("platform WIF signing key is unavailable");
+    let jwk: JsonWebKey;
+    try {
+      jwk = JSON.parse(this.env.WIF_SIGNING_JWK) as JsonWebKey;
+    } catch {
+      throw new Error("platform WIF signing key is invalid");
+    }
+    const required = [config.wif_issuer, config.wif_audience, config.wif_subject, config.organization_id,
+      config.provider_workspace_id, config.service_account_id, config.federation_rule_id];
+    if (required.some((value) => !value)) throw new Error("cloud runtime authority is incomplete");
+    const keyId = (jwk as JsonWebKey & { kid?: unknown }).kid;
+    const assertion = await mintWifAssertion({ authority: {
+      issuer: config.wif_issuer!, audience: config.wif_audience!, subject: config.wif_subject!,
+      organizationId: config.organization_id!, workspaceId: config.provider_workspace_id!,
+      serviceAccountId: config.service_account_id!, federationRuleId: config.federation_rule_id!,
+    }, privateJwk: jwk, keyId: typeof keyId === "string" ? keyId : "current", now });
+    try {
+      const accessToken = (await exchangeWifAssertion({ assertion })).accessToken;
+      if (config.wif_failures > 0) {
+        this.ctx.storage.sql.exec("UPDATE agent_runtime_configs SET wif_failures = 0 WHERE agent_id = ?", config.agent_id);
+      }
+      return accessToken;
+    } catch {
+      const failures = config.wif_failures + 1;
+      this.ctx.storage.sql.exec(
+        "UPDATE agent_runtime_configs SET wif_failures = ?, status = CASE WHEN ? >= 3 THEN 'disconnected' ELSE status END, updated_at = ? WHERE agent_id = ?",
+        failures, failures, now, config.agent_id,
+      );
+      throw new Error(failures >= 3 ? "cloud runtime authority was revoked or repeatedly refused" : "cloud runtime authentication failed");
+    }
+  }
+
+  /** Resolve both address families and reject the whole name if either query fails. */
+  private async resolvePublicDns(hostname: string): Promise<readonly string[]> {
+    const lookup = async (type: "A" | "AAAA") => {
+      const response = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=${type}`, {
+        headers: { accept: "application/dns-json" }, redirect: "manual", signal: AbortSignal.timeout(5_000),
+      });
+      if (!response.ok) throw new Error("custom callback DNS lookup failed");
+      const body = await response.json() as { Answer?: { type?: unknown; data?: unknown }[] };
+      const expectedType = type === "A" ? 1 : 28;
+      return (body.Answer ?? []).filter((answer) => answer.type === expectedType).map((answer) => answer.data)
+        .filter((value): value is string => typeof value === "string");
+    };
+    const [v4, v6] = await Promise.all([lookup("A"), lookup("AAAA")]);
+    return [...v4, ...v6];
+  }
+
   /** Point the object's one alarm at the earliest deadline it owns. */
   private async armAlarm(): Promise<number | null> {
     const due = nextDueAt(this.ctx.storage);
@@ -8715,6 +9075,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }
 
   private async dispatchToQueue(entry: OutboxEntry): Promise<OutboxOutcome> {
+    if (entry.kind === "custom_runtime_wake") return this.dispatchCustomRuntimeWake(entry);
+    if (entry.kind === "cloud_runtime_mention") return this.dispatchCloudRuntimeMention(entry);
+    if (entry.kind === "anthropic_resource_fetch") return this.dispatchAnthropicResourceFetch(entry);
     const queue = this.env.EVENTS;
     if (!queue) return { status: "retry", error: "events queue binding is unavailable" };
     try {
@@ -8729,6 +9092,144 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       return { status: "delivered" };
     } catch (error) {
       return { status: "retry", error: redactedError(error) };
+    }
+  }
+
+  private async dispatchAnthropicResourceFetch(entry: OutboxEntry): Promise<OutboxOutcome> {
+    const payload = entry.payload as { eventType?: unknown; resourceId?: unknown; agentId?: unknown };
+    if (typeof payload.eventType !== "string" || typeof payload.resourceId !== "string" || typeof payload.agentId !== "string") {
+      return { status: "permanent", error: "invalid provider event payload" };
+    }
+    const config = this.ctx.storage.sql.exec<AgentRuntimeConfigRow>(
+      "SELECT * FROM agent_runtime_configs WHERE agent_id = ? AND kind = 'claude_cloud' AND status IN ('pending', 'active')",
+      payload.agentId,
+    ).toArray()[0];
+    if (!config) return { status: "permanent", error: "cloud runtime is disconnected" };
+    try {
+      const deleted = payload.eventType.endsWith(".deleted");
+      let resource: Record<string, unknown> = { id: payload.resourceId, status: "terminated" };
+      if (!deleted) {
+        const family = payload.eventType.startsWith("session.") ? "sessions" :
+          payload.eventType.startsWith("deployment_run.") ? "deployment_runs" :
+          payload.eventType.startsWith("deployment.") ? "deployments" : null;
+        if (!family) return { status: "delivered" };
+        const response = await callManagedAgents({ accessToken: await this.providerAccessToken(config, Date.now()),
+          path: `/v1/${family}/${payload.resourceId}` });
+        if (!response || typeof response !== "object" || Array.isArray(response)) throw new Error("unknown provider resource response");
+        resource = response as Record<string, unknown>;
+      }
+      const providerState = typeof resource.status === "string" ? resource.status :
+        payload.eventType.includes("failed") ? "failed" : payload.eventType.includes("succeeded") ? "succeeded" : "running";
+      const state = providerState === "idle" ? "idle" : providerState === "succeeded" ? "succeeded" :
+        providerState === "failed" ? "failed" : providerState === "terminated" || providerState === "archived" ? "terminated" : "running";
+      this.ctx.storage.sql.exec(
+        `UPDATE runtime_runs SET state = ?, failure_code = CASE WHEN ? = 'failed' THEN 'provider_failed' ELSE failure_code END,
+           updated_at = ? WHERE agent_id = ? AND (provider_session_id = ? OR provider_deployment_run_id = ?)`,
+        state, state, Date.now(), payload.agentId, payload.resourceId, payload.resourceId,
+      );
+      return { status: "delivered" };
+    } catch (error) {
+      return { status: "retry", error: redactedError(error) };
+    }
+  }
+
+  private async dispatchCustomRuntimeWake(entry: OutboxEntry): Promise<OutboxOutcome> {
+    const payload = entry.payload as { deliveryId?: unknown; agentId?: unknown };
+    if (typeof payload.deliveryId !== "string" || typeof payload.agentId !== "string") {
+      return { status: "permanent", error: "invalid custom runtime outbox payload" };
+    }
+    const config = this.ctx.storage.sql.exec<AgentRuntimeConfigRow>(
+      "SELECT * FROM agent_runtime_configs WHERE agent_id = ? AND kind = 'custom' AND status = 'active'", payload.agentId,
+    ).toArray()[0];
+    const delivery = this.ctx.storage.sql.exec<{ queue_depth: number; created_at: number }>(
+      "SELECT queue_depth, created_at FROM custom_runtime_deliveries WHERE delivery_id = ? AND agent_id = ?",
+      payload.deliveryId, payload.agentId,
+    ).toArray()[0];
+    if (!config || !delivery || !config.callback_url || !config.secret_envelope) {
+      return { status: "permanent", error: "custom runtime is no longer active" };
+    }
+    const secret = await decryptTransportSecret(config.secret_envelope, this.transportSecretKey(),
+      `custom:${this.workspaceKey()}:${payload.agentId}`);
+    const wake = customWake({ delivery_id: payload.deliveryId, created_at: new Date(delivery.created_at).toISOString(),
+      workspace_id: this.workspaceKey(), agent_id: payload.agentId, queue_depth: delivery.queue_depth });
+    const result = await deliverCustomWake({ url: config.callback_url, wake, secret,
+      resolve: (hostname) => this.resolvePublicDns(hostname), now: Date.now() });
+    if (result.status === "delivered") {
+      this.ctx.storage.sql.exec(
+        "UPDATE custom_runtime_deliveries SET state = 'delivered', attempts = attempts + 1, completed_at = ? WHERE delivery_id = ?",
+        Date.now(), payload.deliveryId,
+      );
+      return result;
+    }
+    this.ctx.storage.sql.exec(
+      "UPDATE custom_runtime_deliveries SET attempts = attempts + 1, last_error = ? WHERE delivery_id = ?",
+      redactedError(result.error), payload.deliveryId,
+    );
+    return result;
+  }
+
+  private async dispatchCloudRuntimeMention(entry: OutboxEntry): Promise<OutboxOutcome> {
+    const payload = entry.payload as { runId?: unknown; agentId?: unknown };
+    if (typeof payload.runId !== "string" || typeof payload.agentId !== "string") {
+      return { status: "permanent", error: "invalid cloud runtime outbox payload" };
+    }
+    const config = this.ctx.storage.sql.exec<AgentRuntimeConfigRow>(
+      "SELECT * FROM agent_runtime_configs WHERE agent_id = ? AND kind = 'claude_cloud' AND status = 'active'", payload.agentId,
+    ).toArray()[0];
+    const run = this.ctx.storage.sql.exec<{ origin_message_id: string | null; provider_session_id: string | null }>(
+      "SELECT origin_message_id, provider_session_id FROM runtime_runs WHERE id = ? AND agent_id = ?", payload.runId, payload.agentId,
+    ).toArray()[0];
+    if (!config || !run?.origin_message_id) return { status: "permanent", error: "cloud runtime is no longer active" };
+    if (run.provider_session_id) return { status: "delivered" };
+    const message = this.ctx.storage.sql.exec<{ body_markdown: string }>(
+      "SELECT body_markdown FROM messages WHERE id = ? AND deleted_at IS NULL", run.origin_message_id,
+    ).toArray()[0];
+    if (!message) return { status: "permanent", error: "originating work no longer exists" };
+    try {
+      this.ctx.storage.sql.exec("UPDATE runtime_runs SET state = 'starting', updated_at = ? WHERE id = ?", Date.now(), payload.runId);
+      const accessToken = await this.providerAccessToken(config, Date.now());
+      const response = await callManagedAgents({ accessToken, path: "/v1/sessions", body: {
+        agent_id: config.provider_agent_id!, environment_id: config.provider_environment_id!,
+        budget: { amount: String(config.budget_cents), currency: "USD" },
+        events: [{ type: "user.message", content: message.body_markdown }],
+        metadata: { lepidy_run_id: payload.runId },
+      } });
+      if (!response || typeof response !== "object" || Array.isArray(response)) throw new Error("unknown session response");
+      const result = response as Record<string, unknown>;
+      if (typeof result.id !== "string") throw new Error("unknown session response");
+      const version = typeof result.agent_version === "string" ? result.agent_version : null;
+      this.ctx.storage.sql.exec(
+        `UPDATE runtime_runs SET provider_session_id = ?, resolved_agent_version = ?, state = 'running', updated_at = ?
+         WHERE id = ? AND provider_session_id IS NULL`, result.id, version, Date.now(), payload.runId,
+      );
+      return { status: "delivered" };
+    } catch (error) {
+      this.ctx.storage.sql.exec(
+        "UPDATE runtime_runs SET state = 'queued', failure_code = ?, updated_at = ? WHERE id = ?",
+        redactedError(error), Date.now(), payload.runId,
+      );
+      return { status: "retry", error: redactedError(error) };
+    }
+  }
+
+  private async reconcileCloudRuntimes(now: number): Promise<void> {
+    const runs = this.ctx.storage.sql.exec<{ id: string; agent_id: string; provider_session_id: string | null; provider_deployment_run_id: string | null }>(
+      `SELECT id, agent_id, provider_session_id, provider_deployment_run_id FROM runtime_runs
+       WHERE state IN ('starting', 'running', 'idle') ORDER BY updated_at LIMIT 100`,
+    ).toArray();
+    for (const run of runs) {
+      const config = this.requireRuntimeConfig(run.agent_id, "claude_cloud");
+      const accessToken = await this.providerAccessToken(config, now);
+      const path = run.provider_session_id
+        ? `/v1/sessions/${run.provider_session_id}`
+        : `/v1/deployment_runs/${run.provider_deployment_run_id}`;
+      const response = await callManagedAgents({ accessToken, path });
+      if (!response || typeof response !== "object" || Array.isArray(response)) throw new Error("unknown reconciliation response");
+      const resource = response as Record<string, unknown>;
+      const providerState = typeof resource.status === "string" ? resource.status : "running";
+      const state = providerState === "idle" ? "idle" : providerState === "succeeded" ? "succeeded" :
+        providerState === "failed" ? "failed" : providerState === "terminated" || providerState === "archived" ? "terminated" : "running";
+      this.ctx.storage.sql.exec("UPDATE runtime_runs SET state = ?, updated_at = ? WHERE id = ?", state, now, run.id);
     }
   }
 

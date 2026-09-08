@@ -994,6 +994,71 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
        ON vault_proxy_requests(state, expires_at)`,
     ],
   },
+  {
+    version: 25,
+    name: "Cloud and custom agent runtimes",
+    statements: [
+      `CREATE TABLE agent_runtime_configs (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('local', 'claude_cloud', 'custom')),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'disconnected')),
+        organization_id TEXT,
+        provider_workspace_id TEXT,
+        provider_agent_id TEXT,
+        provider_environment_id TEXT,
+        provider_deployment_id TEXT,
+        wif_issuer TEXT,
+        wif_audience TEXT,
+        wif_subject TEXT,
+        service_account_id TEXT,
+        federation_rule_id TEXT,
+        callback_url TEXT,
+        secret_envelope TEXT,
+        budget_cents INTEGER CHECK (budget_cents IS NULL OR budget_cents > 0),
+        resource_proved_at INTEGER,
+        webhook_proved_at INTEGER,
+        wif_failures INTEGER NOT NULL DEFAULT 0 CHECK (wif_failures >= 0),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK ((kind = 'claude_cloud' AND budget_cents IS NOT NULL) OR kind <> 'claude_cloud')
+      ) STRICT`,
+      `CREATE INDEX agent_runtime_provider_idx ON agent_runtime_configs(organization_id, provider_workspace_id)`,
+      `CREATE TABLE runtime_runs (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('mention', 'scheduled', 'manual')),
+        origin_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        delegation_id TEXT REFERENCES agent_delegations(id) ON DELETE SET NULL,
+        provider_session_id TEXT,
+        provider_deployment_run_id TEXT,
+        resolved_agent_version TEXT,
+        budget_cents INTEGER,
+        state TEXT NOT NULL CHECK (state IN ('queued', 'starting', 'running', 'idle', 'succeeded', 'failed', 'terminated')),
+        failure_code TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE INDEX runtime_runs_open_idx ON runtime_runs(agent_id, state, updated_at)`,
+      `CREATE TABLE anthropic_webhook_receipts (
+        event_id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        organization_id TEXT NOT NULL,
+        provider_workspace_id TEXT NOT NULL,
+        received_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE TABLE custom_runtime_deliveries (
+        delivery_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        queue_depth INTEGER NOT NULL CHECK (queue_depth >= 0),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'delivered', 'dead')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        completed_at INTEGER
+      ) STRICT`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

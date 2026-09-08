@@ -8,6 +8,7 @@ declare global {
     MIGRATION_FIXTURE: DurableObjectNamespace<MigrationFixture>;
     ACCOUNTS: DurableObjectNamespace<Accounts>;
     TEST_CONTROL_MIGRATIONS: D1Migration[];
+    TRANSPORT_SECRET_KEY?: string;
   }
 
   namespace Cloudflare {
@@ -15,6 +16,7 @@ declare global {
       MIGRATION_FIXTURE: DurableObjectNamespace<MigrationFixture>;
       ACCOUNTS: DurableObjectNamespace<Accounts>;
       TEST_CONTROL_MIGRATIONS: D1Migration[];
+      TRANSPORT_SECRET_KEY?: string;
     }
   }
 }
