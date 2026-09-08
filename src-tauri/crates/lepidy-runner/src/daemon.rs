@@ -75,6 +75,7 @@ impl RunOutcome {
 #[derive(Clone, Debug)]
 pub struct HarnessSession {
     pub agent_id: String,
+    pub delegation_id: String,
     pub session_id: String,
     pub token: String,
     pub mcp_url: String,
@@ -482,6 +483,7 @@ pub fn start_session(
     let mcp_path = text("mcpPath")?;
     Ok(HarnessSession {
         agent_id: text("agentId")?,
+        delegation_id: text("delegationId")?,
         session_id: text("sessionId")?,
         token: text("token")?,
         mcp_url: format!("{}{mcp_path}", client.base_url()),
@@ -612,6 +614,7 @@ mod tests {
         let mut runner = Runner::new(presets, "workspace-1".to_string());
         runner.remember_session(HarnessSession {
             agent_id: "agent-1".to_string(),
+            delegation_id: "delegation-1".to_string(),
             session_id: "session-1".to_string(),
             token: "lpd_st_test_token".to_string(),
             mcp_url: "http://127.0.0.1:1/w/test/mcp".to_string(),
@@ -619,6 +622,7 @@ mod tests {
         });
         runner.remember_session(HarnessSession {
             agent_id: "agent-2".to_string(),
+            delegation_id: "delegation-2".to_string(),
             session_id: "session-2".to_string(),
             token: "lpd_st_test_token_2".to_string(),
             mcp_url: "http://127.0.0.1:1/w/test/mcp".to_string(),
@@ -846,6 +850,7 @@ mod tests {
         let mut runner = Runner::new(presets, "workspace-1".to_string());
         runner.remember_session(HarnessSession {
             agent_id: "agent-1".to_string(),
+            delegation_id: "delegation-1".to_string(),
             session_id: "session-1".to_string(),
             token: "lpd_st_expired".to_string(),
             mcp_url: "http://127.0.0.1:1/w/test/mcp".to_string(),

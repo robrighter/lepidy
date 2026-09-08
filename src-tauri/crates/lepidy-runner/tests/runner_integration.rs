@@ -512,6 +512,7 @@ fn runner_cli_int_011_refuses_an_unsigned_socket() {
     // TCP connection to the workspace.
     let stranger = enrol(&TempHome::create("stranger"), "http://127.0.0.1:1");
     let double = Double::start(stranger);
+    double.with_state(|state| state.accept_unsigned_registration = true);
     enrol(&home, &double.url());
     set_marker_preset(&home, "p1", "started", 60);
 

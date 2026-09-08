@@ -90,6 +90,14 @@ pub struct PresetStore {
     /// preset edited on this machine can be told apart from the one a session
     /// was started under.
     pub revision: u64,
+    /// The last runner assignment this machine registered. Agent and preset
+    /// ids are not launch configuration or secrets; retaining them lets a new
+    /// daemon epoch re-register before opening its socket, fencing an older
+    /// process instead of relying on two commands landing in the same second.
+    #[serde(default)]
+    pub runner_agents: BTreeMap<String, String>,
+    #[serde(default)]
+    pub runner_epoch: u64,
     pub presets: Vec<Preset>,
 }
 
@@ -98,6 +106,8 @@ impl Default for PresetStore {
         Self {
             version: PRESET_VERSION,
             revision: 1,
+            runner_agents: BTreeMap::new(),
+            runner_epoch: 0,
             presets: Vec::new(),
         }
     }

@@ -18,6 +18,7 @@ Through its **environment**, never through `argv`:
 | `LEPIDY_SESSION_TOKEN` | A scoped session token, used as `Authorization: Bearer …` |
 | `LEPIDY_SESSION_ID` | The session's id, required by every queue tool |
 | `LEPIDY_AGENT_ID` | The agent this run answers for |
+| `LEPIDY_DELEGATION_ID` | The exact delegation the session is bounded by |
 | `LEPIDY_WORKSPACE_ID` | The workspace, for logging and for nothing else |
 | `LEPIDY_REQUEST_ID` | This particular run |
 | `LEPIDY_PRESET_ID` | The preset that started it |
@@ -55,7 +56,9 @@ The loop is:
    token must be presented on every later call about that lease.
 2. `agent_start` — say work has begun. After this, a lost lease becomes
    `needs_attention` rather than being retried.
-3. Do the work. Answer with `agent_post` in the channel the item names.
+3. Do the work. Answer with `agent_post` in the channel the item names, using
+   the item's `message_id` as `parent_id` so the answer stays in the originating
+   thread.
 4. `agent_complete` — with a stable `completion_id` and an `output_digest`.
 5. Back to 1 until `agent_next` answers with no item.
 
@@ -102,6 +105,13 @@ expires, is revoked, or a run fails.
 
 The ceiling is A04's and unchanged: the delegation's lifetime, the eight-hour
 session cap, and exact-tuple token binding.
+
+A harness that invokes `lepidy run` inherits the agent and delegation ids. The
+injector signs them into the device request and includes them in the release
+request, so vault policy re-checks the exact unattended authority rather than
+treating the nested command as an unrelated person action. An incomplete pair
+is refused. Neither identifier is authority on its own; the live delegation,
+runner device and signed request still have to agree in the workspace.
 
 ## 6. The reference harness
 

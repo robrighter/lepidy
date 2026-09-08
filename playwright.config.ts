@@ -34,7 +34,7 @@ export default defineConfig({
     {
       name: "mobile-chromium",
       use: { ...devices["iPhone 13"], browserName: "chromium" },
-      grepInvert: /DESKTOP-INT/,
+      grepInvert: /DESKTOP-INT|GATE-INT/,
     },
   ],
   webServer: [

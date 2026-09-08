@@ -70,11 +70,24 @@ export class Workspace extends ProductionWorkspace {
    * capabilities; the waiting spike needs the queue tools as well, and it needs
    * mentions already enqueued so a harness has something to come back for.
    */
-  async seedRunnerQueue(actor: { memberId: string; authorizationEpoch: number }, mentions: number) {
+  async seedRunnerQueue(
+    actor: { memberId: string; authorizationEpoch: number },
+    mentions: number,
+    credentialIds: readonly string[] = [],
+  ) {
     const now = Date.now();
     const channel = await this.createChannel({ actor, idempotencyKey: `browser-wait:channel:${now}`, kind: "public", slug: `waiting-${String(now).slice(-6)}`, now });
     const agent = await this.createAgent({ actor, idempotencyKey: `browser-wait:agent:${now}`, handle: `waiter${String(now).slice(-6)}`, now });
-    const delegation = await this.createAgentDelegation({ actor, agent: agent.agentId, channelIds: [channel.channelId], expiresAt: now + 60 * 60 * 1000, now });
+    const delegation = await this.createAgentDelegation({
+      actor,
+      agent: agent.agentId,
+      channelIds: [channel.channelId],
+      credentialIds,
+      deliveryModes: ["inject"],
+      projectIds: ["cli-project"],
+      expiresAt: now + 60 * 60 * 1000,
+      now,
+    });
     const session = await this.startAgentSession({
       actor,
       delegationId: delegation.id,
@@ -206,8 +219,14 @@ export default {
         return Response.json(await stub.seedBrowserVault({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch }));
       }
       if (url.pathname.endsWith("runner-queue")) {
-        const body = (await request.json()) as { mentions: number };
-        return Response.json(await stub.seedRunnerQueue({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch }, body.mentions));
+        const body = (await request.json()) as { mentions: number; credentialIds?: string[] };
+        return Response.json(
+          await stub.seedRunnerQueue(
+            { memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch },
+            body.mentions,
+            body.credentialIds ?? [],
+          ),
+        );
       }
       if (url.pathname.endsWith("runner-enqueue")) {
         const body = (await request.json()) as { channelId: string; agentHandle: string; count: number };

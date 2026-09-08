@@ -5,7 +5,7 @@
 //! this process runs. Nothing is cached on disk and there is no agent holding
 //! an unlocked key between invocations — a second command asks again.
 
-use crate::client::Client;
+use crate::client::{Client, Provenance};
 use crate::crypto::DeviceSigningKey;
 use crate::error::CliResult;
 use crate::profile::{load_profile, unseal, Profile, Secrets};
@@ -50,5 +50,31 @@ impl Session {
         override_value
             .unwrap_or(&self.profile.project_id)
             .to_string()
+    }
+
+    /// Bind a nested `lepidy run` to the unattended session that launched it.
+    ///
+    /// The runner supplies these identifiers in the environment, never argv.
+    /// The workspace re-checks the exact live delegation, so locally inventing
+    /// identifiers cannot widen authority. A half-present pair is refused
+    /// instead of quietly falling back to person authority.
+    pub fn provenance(&self, project: &str) -> CliResult<Provenance> {
+        let agent_id = std::env::var("LEPIDY_AGENT_ID").ok();
+        let delegation_id = std::env::var("LEPIDY_DELEGATION_ID").ok();
+        match (agent_id, delegation_id) {
+            (None, None) => Ok(Provenance::project(project)),
+            (Some(agent_id), Some(delegation_id))
+                if !agent_id.is_empty() && !delegation_id.is_empty() =>
+            {
+                Ok(Provenance::project(project).for_agent(
+                    &agent_id,
+                    &delegation_id,
+                    std::env::var("LEPIDY_ORIGIN_ID").ok().as_deref(),
+                ))
+            }
+            _ => Err(crate::error::CliError::failure(
+                "the runner supplied incomplete agent provenance",
+            )),
+        }
     }
 }

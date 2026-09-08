@@ -104,6 +104,7 @@ pub fn spawn_preset(
     // is not given, anything the workspace wrote as prose.
     command
         .env("LEPIDY_AGENT_ID", &session.agent_id)
+        .env("LEPIDY_DELEGATION_ID", &session.delegation_id)
         .env("LEPIDY_REQUEST_ID", request_id)
         .env("LEPIDY_WORKSPACE_ID", workspace_id)
         .env("LEPIDY_PRESET_ID", &preset.id)
@@ -178,6 +179,7 @@ mod tests {
     fn session() -> HarnessSession {
         HarnessSession {
             agent_id: "agent-1".to_string(),
+            delegation_id: "delegation-1".to_string(),
             session_id: "session-1".to_string(),
             token: "lpd_st_test_token".to_string(),
             mcp_url: "http://127.0.0.1:1/w/test/mcp".to_string(),

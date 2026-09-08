@@ -41,6 +41,7 @@ struct Environment {
     token: String,
     agent_id: String,
     session_id: String,
+    request_id: String,
     mode: String,
 }
 
@@ -57,6 +58,7 @@ fn environment() -> Result<Environment, String> {
         token: required("LEPIDY_SESSION_TOKEN")?,
         agent_id: required("LEPIDY_AGENT_ID")?,
         session_id: required("LEPIDY_SESSION_ID")?,
+        request_id: required("LEPIDY_REQUEST_ID")?,
         // A preset's own switch, set locally, never by the workspace. It is how
         // a scenario asks this harness to behave like one that hits its
         // permission wall, without pretending the workspace can ask for that.
@@ -78,8 +80,9 @@ fn run() -> Result<u8, String> {
     // its slot or reports its outcome.
     for turn in 0..8 {
         let lease_token = format!(
-            "reference-lease-{}-{turn}-{}",
+            "reference-lease-{}-{}-{turn}-{}",
             env.session_id,
+            env.request_id,
             "x".repeat(40)
         );
         let claimed = call(
@@ -88,7 +91,7 @@ fn run() -> Result<u8, String> {
             "agent_next",
             json!({
                 "agent": env.agent_id,
-                "claim_id": format!("reference-claim-{}-{turn}", env.session_id),
+                "claim_id": format!("reference-claim-{}-{}-{turn}", env.session_id, env.request_id),
                 "lease_token": lease_token,
                 "session_id": env.session_id,
             }),
@@ -97,6 +100,7 @@ fn run() -> Result<u8, String> {
             break;
         };
         let item_id = string(item, "item_id")?;
+        let message_id = string(item, "message_id")?;
         let channel_id = string(item, "channel_id")?;
         let lease_generation = claimed
             .get("lease")
@@ -133,8 +137,9 @@ fn run() -> Result<u8, String> {
             json!({
                 "agent": env.agent_id,
                 "channel_id": channel_id,
+                "parent_id": message_id,
                 "content": format!("Worked item {item_id} from the reference harness."),
-                "idempotency_key": format!("reference-post-{}-{turn}", env.session_id),
+                "idempotency_key": format!("reference-post-{}-{turn}", env.request_id),
             }),
         )?;
         call(
@@ -144,8 +149,8 @@ fn run() -> Result<u8, String> {
             merge(
                 proof,
                 json!({
-                    "completion_id": format!("reference-completion-{}-{turn}", env.session_id),
-                    "output_digest": format!("reference-digest-{turn}"),
+                    "completion_id": format!("reference-completion-{}-{turn}", env.request_id),
+                    "output_digest": format!("reference-digest-{}-{turn}", env.request_id),
                 }),
             ),
         )?;

@@ -84,7 +84,12 @@ agent it lost.
 The runner epoch identifies one run of the daemon. A registration with an epoch
 lower than the stored one is refused, so a process that restarted with a stale
 epoch cannot reclaim agents a newer one took; and a socket held by an older
-epoch is closed when a newer registration lands.
+epoch is closed when a newer registration lands. The local preset store retains
+the last agent-to-preset assignments and epoch (identifiers only, never launch
+configuration or secrets). Every new daemon run advances the epoch and
+re-registers those assignments before opening its socket. It therefore does not
+depend on a separate `register` and `run` command happening inside the same
+wall-clock second, and a restarted process fences its predecessor immediately.
 
 ## 5. Wakes cannot be lost, only delayed
 

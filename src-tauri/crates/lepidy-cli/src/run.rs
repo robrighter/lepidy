@@ -23,7 +23,6 @@ use serde_json::json;
 use zeroize::Zeroize;
 
 use crate::args::Args;
-use crate::client::Provenance;
 use crate::crypto::{aes_gcm_decrypt, credential_aad, decode, wrap_aad};
 use crate::error::{CliError, CliResult};
 use crate::scrub::Scrubber;
@@ -460,7 +459,7 @@ pub fn catalogue(session: &Session, project: &str) -> CliResult<HashMap<String, 
         session.device_credential(),
         "/api/device/vault/list",
         &json!({}),
-        Provenance::project(project),
+        session.provenance(project)?,
     )?;
     if response.status != 200 {
         return Err(CliError::failure(format!(
@@ -558,18 +557,22 @@ fn release_batch(
         entries.push((name.clone(), entry));
     }
 
+    let provenance = session.provenance(request.project)?;
+    let body = json!({
+        "credentialIds": entries.iter().map(|(_, entry)| entry.id.clone()).collect::<Vec<_>>(),
+        "delivery": delivery,
+        "reason": request.reason,
+        "origin": { "channelId": request.origin_channel, "messageId": request.origin_message },
+        "agentId": provenance.agent_id,
+        "delegationId": provenance.delegation_id,
+    });
     let response = session.client.post_signed(
         &session.profile,
         &session.signing,
         session.device_credential(),
         "/api/device/vault/release",
-        &json!({
-            "credentialIds": entries.iter().map(|(_, entry)| entry.id.clone()).collect::<Vec<_>>(),
-            "delivery": delivery,
-            "reason": request.reason,
-            "origin": { "channelId": request.origin_channel, "messageId": request.origin_message },
-        }),
-        Provenance::project(request.project),
+        &body,
+        provenance,
     )?;
     if response.status != 200 {
         return Err(CliError::denied(

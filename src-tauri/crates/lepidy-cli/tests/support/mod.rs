@@ -370,7 +370,17 @@ pub fn cli(home: &TempHome, arguments: &[&str], stdin: &[&str]) -> Output {
     {
         let mut handle = child.stdin.take().expect("stdin was piped");
         for line in stdin {
-            writeln!(handle, "{line}").expect("write to the CLI");
+            if let Err(error) = writeln!(handle, "{line}") {
+                // A command that rejects its arguments before reading standard
+                // input may close the pipe immediately. That early refusal is
+                // the behavior the caller is about to assert, not a harness
+                // failure caused by whether the scheduler let this write race
+                // the process exit.
+                if error.kind() == std::io::ErrorKind::BrokenPipe {
+                    break;
+                }
+                panic!("write to the CLI: {error}");
+            }
         }
     }
     child.wait_with_output().expect("the CLI to finish")

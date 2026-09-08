@@ -189,6 +189,18 @@ impl Provenance {
         self.config_revision = config_revision;
         self
     }
+
+    pub fn for_agent(
+        mut self,
+        agent_id: &str,
+        delegation_id: &str,
+        origin_id: Option<&str>,
+    ) -> Self {
+        self.agent_id = Some(agent_id.to_string());
+        self.delegation_id = Some(delegation_id.to_string());
+        self.origin_id = origin_id.map(str::to_string);
+        self
+    }
 }
 
 /// The three headers an F05 signed request carries.

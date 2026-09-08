@@ -55,6 +55,10 @@ pub struct Recorded {
 pub struct DoubleState {
     pub requests: Vec<Recorded>,
     pub signing_key: Option<VerifyingKey>,
+    /// One socket-authentication scenario needs the preceding registration to
+    /// succeed under a deliberately different key so the failure is observed
+    /// at the upgrade boundary it is testing.
+    pub accept_unsigned_registration: bool,
     /// What a depth check answers with. A scenario sets exactly the queue it
     /// wants to test rather than the double modelling one.
     pub depth: Vec<Value>,
@@ -210,7 +214,9 @@ fn serve(mut stream: TcpStream, state: &Arc<Mutex<DoubleState>>) {
                 .and_then(|parsed| parsed.get("runnerEpoch").and_then(Value::as_u64))
                 .unwrap_or(0),
         });
-        respond(&mut locked, &path, verified)
+        let accepted = verified
+            || (path == "/api/device/runner/register" && locked.accept_unsigned_registration);
+        respond(&mut locked, &path, accepted)
     };
     let (status, payload) = response;
     let body = payload.to_string();
@@ -278,7 +284,7 @@ fn mcp_result(state: &mut DoubleState, name: &str, arguments: &Value) -> (u16, V
                 let item_id = state.queue.remove(0);
                 state.claimed.push(item_id.clone());
                 json!({
-                    "item": { "item_id": item_id, "channel_id": "channel-runner" },
+                    "item": { "item_id": item_id, "message_id": format!("message-{item_id}"), "channel_id": "channel-runner" },
                     "lease": { "leaseGeneration": 1 },
                 })
             }
@@ -729,6 +735,23 @@ impl Daemon {
 /// Start `lepidy-agentd` and leave it running, unlocked with the right
 /// passphrase — on standard input, never in argv.
 pub fn spawn_agentd(home: &TempHome, arguments: &[&str]) -> Daemon {
+    // A production `register` persists this assignment so every new daemon
+    // epoch can fence its predecessor before opening a socket. Most daemon
+    // scenarios intentionally begin at the socket boundary rather than
+    // exercising the registration command again, so seed the same local fact.
+    let preset_path = home.path.join("presets.json");
+    if preset_path.exists() {
+        let mut store: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&preset_path).expect("the preset store"))
+                .expect("preset json");
+        store["runnerAgents"] = json!({ AGENT_ID: "p1" });
+        store["runnerEpoch"] = json!(0);
+        std::fs::write(
+            &preset_path,
+            serde_json::to_vec_pretty(&store).expect("preset json"),
+        )
+        .expect("the preset store is writable");
+    }
     let mut child = command(home, arguments);
     if let Some(handle) = child.stdin.as_mut() {
         let _ = writeln!(handle, "{PASSPHRASE}");

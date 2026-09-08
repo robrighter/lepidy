@@ -14,7 +14,7 @@
     "test": "npm run test:workers",
     "test:workers": "vitest run",
     "test:watch": "vitest",
-    "test:browser": "opennextjs-cloudflare build && playwright test",
+    "test:browser": "cargo build --manifest-path src-tauri/Cargo.toml -p lepidy-cli -p lepidy-runner --bins && opennextjs-cloudflare build && playwright test",
     "test:browser:ui": "playwright test --ui",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tests/tsconfig.json",
     "cf:build": "opennextjs-cloudflare build",

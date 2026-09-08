@@ -272,7 +272,7 @@ fn open_session() -> CliResult<Session> {
 }
 
 fn register_command(args: &Args) -> CliResult<i32> {
-    let session = open_session()?;
+    let mut session = open_session()?;
     let mut agents = Vec::new();
     for mapping in args.options("agent") {
         let (agent_id, preset_id) = mapping
@@ -302,6 +302,9 @@ fn register_command(args: &Args) -> CliResult<i32> {
         session.presets.revision,
         &agents,
     )?;
+    session.presets.runner_agents = agents.iter().cloned().collect();
+    session.presets.runner_epoch = epoch;
+    save_presets_at(&preset_path(), &session.presets)?;
     let displaced = body
         .get("displacedDeviceIds")
         .and_then(serde_json::Value::as_array)
@@ -392,7 +395,7 @@ fn runner_epoch() -> u64 {
 /* -------------------------------------------------------------------------- */
 
 fn run_command(args: &Args) -> CliResult<i32> {
-    let session = open_session()?;
+    let mut session = open_session()?;
     if session.presets.presets.is_empty() {
         return Err(CliError::usage(
             "there are no local presets, so nothing would run: define one with `lepidy-agentd preset set`",
@@ -432,9 +435,31 @@ fn run_command(args: &Args) -> CliResult<i32> {
         args.option("idle-check"),
         DEFAULT_IDLE_CHECK.as_secs(),
     )?));
-    let epoch = runner_epoch();
+    if session.presets.runner_agents.is_empty() {
+        return Err(CliError::usage(
+            "this machine has no saved agent assignments; run `lepidy-agentd register --agent AGENT_ID=PRESET_ID` first",
+        ));
+    }
+    let epoch = runner_epoch().max(session.presets.runner_epoch.saturating_add(1));
     let revision = session.presets.revision;
     let signing = session.secrets.signing_key()?;
+    let agents: Vec<(String, String)> = session
+        .presets
+        .runner_agents
+        .iter()
+        .map(|(agent, preset)| (agent.clone(), preset.clone()))
+        .collect();
+    daemon::register(
+        &session.client,
+        &session.profile,
+        &signing,
+        &session.secrets.device_credential,
+        epoch,
+        revision,
+        &agents,
+    )?;
+    session.presets.runner_epoch = epoch;
+    save_presets_at(&preset_path(), &session.presets)?;
 
     let mut runner = Runner::new(
         session.presets.clone(),
