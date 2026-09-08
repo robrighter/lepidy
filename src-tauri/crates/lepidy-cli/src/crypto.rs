@@ -215,6 +215,25 @@ impl VaultKeyPair {
         }
         Ok(dek)
     }
+
+    /// Open an arbitrary short-lived relay payload sealed to this device's
+    /// vault public key. The caller supplies the canonical operation context;
+    /// a payload moved to another request therefore fails authentication.
+    pub fn open_relay(
+        &self,
+        ephemeral_public_key: &[u8],
+        iv: &[u8],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        let ephemeral = public_key_from_bytes(ephemeral_public_key)?;
+        let shared =
+            p256::ecdh::diffie_hellman(self.secret.to_nonzero_scalar(), ephemeral.as_affine());
+        let mut key = wrap_key(shared.raw_secret_bytes().as_slice(), aad)?;
+        let opened = aes_gcm_decrypt(&key, iv, aad, ciphertext);
+        key.zeroize();
+        opened
+    }
 }
 
 pub struct SealedDek {

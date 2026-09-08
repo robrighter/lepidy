@@ -957,6 +957,43 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `ALTER TABLE runner_agents ADD COLUMN preset_id TEXT NOT NULL DEFAULT ''`,
     ],
   },
+  {
+    version: 24,
+    name: "Device-mediated vault proxy requests",
+    statements: [
+      `CREATE TABLE vault_proxy_requests (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        requester_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        delegation_id TEXT NOT NULL REFERENCES agent_delegations(id) ON DELETE CASCADE,
+        release_device_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        origin_channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        origin_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        credential_id TEXT NOT NULL REFERENCES vault_credentials(id) ON DELETE CASCADE,
+        credential_version INTEGER NOT NULL,
+        policy_epoch INTEGER NOT NULL,
+        access_epoch INTEGER NOT NULL,
+        relay_suite TEXT NOT NULL,
+        relay_ephemeral_public_key TEXT NOT NULL,
+        relay_iv TEXT NOT NULL,
+        relay_ciphertext TEXT NOT NULL,
+        response_key TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'refused', 'uncertain')),
+        delivered_at INTEGER,
+        completed_at INTEGER,
+        result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE INDEX vault_proxy_requests_device_state_idx
+       ON vault_proxy_requests(release_device_id, state, created_at)`,
+      `CREATE INDEX vault_proxy_requests_expiry_idx
+       ON vault_proxy_requests(state, expires_at)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

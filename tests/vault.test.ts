@@ -5,7 +5,8 @@ import { describe, expect, it } from "vitest";
 import type { Actor, Workspace } from "../src/cloudflare/workspace";
 import { decryptVaultValue, encryptVaultValue, unwrapVaultDek, wrapVaultDek } from "../src/domain/vault-client-crypto";
 import { VAULT_APPROVAL_TTL_MS, canonicalApprovalDigest } from "../src/domain/vault-approval";
-import { VAULT_WRAP_SUITE, encodeVaultBytes, type VaultKeyWrap } from "../src/domain/vault-envelope";
+import { VAULT_WRAP_SUITE, decodeVaultBytes, encodeVaultBytes, type VaultKeyWrap } from "../src/domain/vault-envelope";
+import { sealVaultProxyResponse, type VaultProxyResponseEnvelope } from "../src/domain/vault-proxy";
 
 const NOW = 1_800_000_000_000;
 const encoder = new TextEncoder();
@@ -82,6 +83,63 @@ async function sharedCredential(seeded: Awaited<ReturnType<typeof seed>>, suffix
     freshUserVerification: true, localVaultUnlocked: true, now: NOW + 2,
   });
   return { credentialId, encrypted };
+}
+
+async function proxyFixture(name: string) {
+  const seeded = await seed(name);
+  const custodian = await custodianKey();
+  await seeded.stub.registerRunner({
+    actor: seeded.owner, deviceId: "device-proxy", runnerEpoch: 1, presetRevision: 1, agents: [], now: NOW + 2,
+  });
+  await seeded.stub.publishVaultMemberKey({
+    actor: seeded.owner, publicKey: custodian.encoded, deviceId: "device-proxy",
+    freshUserVerification: true, now: NOW + 3,
+  });
+  const agent = await seeded.stub.createAgent({
+    actor: seeded.owner, idempotencyKey: `vault:proxy:${name}:agent`, handle: "proxy-runner", now: NOW + 3,
+  });
+  const credentialId = `credential-proxy-${name}`;
+  const workspaceId = seeded.stub.id.toString();
+  const encrypted = await encryptVaultValue({
+    workspaceId, credentialId, version: 1, keyEpoch: 1, plaintext: encoder.encode("proxy-secret-canary"),
+  });
+  const sealed = await wrapVaultDek({
+    workspaceId, credentialId, version: 1, custodianMemberId: "owner", recipientKeyEpoch: 1,
+    recipientPublicKey: custodian.raw, dek: encrypted.dek,
+  });
+  await seeded.stub.createVaultCredential({
+    actor: seeded.owner, idempotencyKey: `vault:proxy:${name}:credential`, credentialId,
+    metadata: {
+      name: "PROXY_TOKEN", description: "Release-device proxy token", envVar: "PROXY_TOKEN",
+      tags: ["proxy"], commands: [], proxyHosts: ["api.example.test"],
+    },
+    policy: {
+      mode: "auto", allowedDeliveries: ["device_proxy"], projectIds: ["project-a"], highRisk: false,
+    },
+    envelope: encrypted.envelope, wraps: [sealed],
+    acl: [
+      { subjectType: "member", subjectId: "owner", verb: "manage" },
+      { subjectType: "member", subjectId: "owner", verb: "use" },
+    ],
+    freshUserVerification: true, localVaultUnlocked: true, now: NOW + 4,
+  });
+  const delegation = await seeded.stub.createAgentDelegation({
+    actor: seeded.owner, agent: agent.agentId, channelIds: [seeded.channelId], credentialIds: [credentialId],
+    deliveryModes: ["device_proxy"], projectIds: ["project-a"], rateLimitPerHour: 30,
+    expiresAt: NOW + 60_000, now: NOW + 5,
+  });
+  const request = {
+    actor: seeded.owner, credentialId, agentId: agent.agentId, delegationId: delegation.id,
+    projectId: "project-a", origin: { channelId: seeded.channelId, messageId: seeded.messageId },
+    idempotencyKey: `vault:proxy:${name}:request`, reason: "fetch the deployment state",
+    request: {
+      url: "https://api.example.test/v1/deployments?canary=relay-url-canary", method: "POST",
+      headers: { accept: "application/json", "idempotency-key": "upstream-operation-0001" },
+      body: "relay-body-canary",
+    },
+    now: NOW + 6,
+  } as const;
+  return { ...seeded, custodian, workspaceId, credentialId, agent: agent.agentId, delegation: delegation.id, request };
 }
 
 function requestApproval(seeded: Awaited<ReturnType<typeof seed>>, credentialIds: readonly string[], now: number) {
@@ -927,5 +985,108 @@ describe("encrypted credential vault", () => {
     const listed = await seeded.stub.listVaultCredentials({ actor: seeded.owner, now: NOW + 4 });
     expect(listed.credentials[0]).toMatchObject({ kind: "structured", fields: ["HOST", "PASSWORD"] });
     expect(JSON.stringify(listed)).not.toContain("structured-plaintext-canary");
+  });
+
+  it("VAULT-INT-021 relays only ciphertext to the exact online release device and accounts once on completion", async () => {
+    const seeded = await proxyFixture("vault-proxy-complete");
+    await expect(seeded.stub.requestVaultProxy(seeded.request)).resolves.toEqual({
+      state: "refused", error: "vault_device_unavailable",
+    });
+
+    const observed = await runInDurableObject<Workspace, {
+      frame: string; replay: unknown; requests: number; uses: number; accessCount: number; durableDump: string;
+    }>(seeded.stub, async (instance, state) => {
+      const upgrade = await instance.fetch(new Request(
+        "https://workspace.invalid/_internal/runner-socket?runner_epoch=1",
+        { headers: {
+          upgrade: "websocket", "x-lepidy-member-id": "owner",
+          "x-lepidy-authorization-epoch": "1", "x-lepidy-device-id": "device-proxy",
+        } },
+      ));
+      expect(upgrade.status).toBe(101);
+      const client = upgrade.webSocket!;
+      const frames: string[] = [];
+      client.accept();
+      client.addEventListener("message", (event) => { frames.push(String(event.data)); });
+
+      const first = await instance.requestVaultProxy(seeded.request);
+      expect(first).toMatchObject({ state: "pending" });
+      await scheduler.wait(10);
+      const frame = frames.find((raw) => (JSON.parse(raw) as { type: string }).type === "proxy_request");
+      expect(frame).toBeDefined();
+      const parsed = JSON.parse(frame!) as { requestId: string };
+      const stored = state.storage.sql.exec<{ response_key: string }>(
+        "SELECT response_key FROM vault_proxy_requests WHERE id = ?", parsed.requestId,
+      ).one();
+      const response: VaultProxyResponseEnvelope = await sealVaultProxyResponse({
+        workspaceId: seeded.workspaceId, requestId: parsed.requestId,
+        responseKey: decodeVaultBytes(stored.response_key, "proxy response key"),
+        result: { status: 200, headers: { "content-type": "application/json" }, body: '{"ok":true}', truncated: false },
+      });
+      await expect(instance.completeVaultProxy({
+        actor: seeded.owner, deviceId: "device-proxy", requestId: parsed.requestId,
+        response, now: NOW + 7,
+      })).resolves.toEqual({ accepted: true, state: "completed" });
+      const replay = await instance.requestVaultProxy({ ...seeded.request, now: NOW + 8 });
+      const tables = state.storage.sql.exec<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '_cf_%'",
+      ).toArray();
+      return {
+        frame: frame!, replay,
+        requests: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_proxy_requests").one().count,
+        uses: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_usage_events WHERE delivery = 'device_proxy'").one().count,
+        accessCount: state.storage.sql.exec<{ access_count: number }>("SELECT access_count FROM vault_credentials WHERE id = ?", seeded.credentialId).one().access_count,
+        durableDump: tables.map(({ name }) => JSON.stringify(state.storage.sql.exec(`SELECT * FROM ${name}`).toArray())).join("\n"),
+      };
+    });
+
+    expect(observed.frame).not.toContain("relay-url-canary");
+    expect(observed.frame).not.toContain("relay-body-canary");
+    expect(observed.frame).not.toContain("proxy-secret-canary");
+    expect(observed.durableDump).not.toContain("relay-url-canary");
+    expect(observed.durableDump).not.toContain("relay-body-canary");
+    expect(observed.durableDump).not.toContain("proxy-secret-canary");
+    expect(observed.replay).toMatchObject({
+      state: "completed", result: { status: 200, body: '{"ok":true}', truncated: false },
+    });
+    expect(observed).toMatchObject({ requests: 1, uses: 1, accessCount: 1 });
+  });
+
+  it("VAULT-INT-022 rechecks authority before consuming a device result", async () => {
+    const seeded = await proxyFixture("vault-proxy-recheck");
+    const checked = await runInDurableObject<Workspace, { completion: unknown; uses: number; accessCount: number }>(
+      seeded.stub, async (instance, state) => {
+        const upgrade = await instance.fetch(new Request(
+          "https://workspace.invalid/_internal/runner-socket?runner_epoch=1",
+          { headers: {
+            upgrade: "websocket", "x-lepidy-member-id": "owner",
+            "x-lepidy-authorization-epoch": "1", "x-lepidy-device-id": "device-proxy",
+          } },
+        ));
+        upgrade.webSocket!.accept();
+        const pending = await instance.requestVaultProxy(seeded.request);
+        expect(pending).toMatchObject({ state: "pending" });
+        const row = state.storage.sql.exec<{ id: string; response_key: string }>(
+          "SELECT id, response_key FROM vault_proxy_requests",
+        ).one();
+        const response = await sealVaultProxyResponse({
+          workspaceId: seeded.workspaceId, requestId: row.id,
+          responseKey: decodeVaultBytes(row.response_key, "proxy response key"),
+          result: { status: 204, headers: {}, body: "", truncated: false },
+        });
+        await instance.setVaultAgentAccess({
+          actor: seeded.owner, enabled: false, freshUserVerification: false, now: NOW + 7,
+        });
+        const completion = await instance.completeVaultProxy({
+          actor: seeded.owner, deviceId: "device-proxy", requestId: row.id, response, now: NOW + 8,
+        });
+        return {
+          completion,
+          uses: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_usage_events WHERE delivery = 'device_proxy'").one().count,
+          accessCount: state.storage.sql.exec<{ access_count: number }>("SELECT access_count FROM vault_credentials WHERE id = ?", seeded.credentialId).one().access_count,
+        };
+      },
+    );
+    expect(checked).toEqual({ completion: { accepted: false, state: "refused" }, uses: 0, accessCount: 0 });
   });
 });

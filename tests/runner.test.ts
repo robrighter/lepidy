@@ -515,12 +515,13 @@ describe("R02 the harness workflow", () => {
     // so a runner cannot ask for authority nobody gave it.
     expect(grant.mcpPath).toBe(`/w/${seeded.slug}/mcp`);
     expect(grant.token).toMatch(new RegExp(`^lpd_st_${seeded.slug}_`));
-    // Exactly the tools a harness needs to work an item and answer in the room
-    // it came from. Nothing that posts as a person, administers an agent or
-    // touches the vault.
+    // Exactly the tools a harness needs to work an item, answer in the room it
+    // came from, and ask an unlocked release device to make an authorized
+    // credential-bearing request. Nothing posts as a person, administers an
+    // agent, or releases credential plaintext to the harness.
     expect([...grant.capabilities].sort()).toEqual([
       "agent_complete", "agent_inbox", "agent_next", "agent_post", "agent_renew", "agent_start",
-      "list_channels", "read_channel", "read_thread", "whoami",
+      "list_channels", "proxy_request", "read_channel", "read_thread", "whoami",
     ]);
 
     await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {

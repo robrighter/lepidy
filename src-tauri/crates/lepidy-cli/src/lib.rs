@@ -21,6 +21,7 @@ pub mod list;
 pub mod login;
 pub mod profile;
 pub mod prompt;
+pub mod proxy;
 pub mod rotate;
 pub mod run;
 pub mod scrub;

@@ -14,13 +14,14 @@
 
 use std::time::Duration;
 
+use lepidy_cli::proxy::ProxyFrame;
 use serde::Deserialize;
 
 /// What the workspace may say. Anything else is a protocol error and closes the
 /// connection rather than being ignored, because a frame this side does not
 /// understand is a version skew worth noticing.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerFrame {
     Welcome {
         #[serde(rename = "deviceId")]
@@ -39,6 +40,10 @@ pub enum ServerFrame {
         #[serde(rename = "agentId")]
         agent_id: String,
         reason: String,
+    },
+    ProxyRequest {
+        #[serde(flatten)]
+        request: ProxyFrame,
     },
     Pong,
 }
@@ -103,6 +108,29 @@ mod tests {
                 reason: "agent_paused".to_string(),
             },
         );
+
+        let proxy = json!({
+            "type": "proxy_request",
+            "requestId": "request-1",
+            "workspaceId": "workspace-1",
+            "credentialId": "credential-1",
+            "credentialVersion": 2,
+            "credentialKeyEpoch": 3,
+            "allowedHosts": ["api.example.com"],
+            "relay": { "suite": "P256-HKDF-SHA256-AES256GCM", "ephemeralPublicKey": "public", "iv": "iv", "ciphertext": "relay" },
+            "envelope": { "cipherSuite": "AES-256-GCM", "aadVersion": 1, "version": 2, "keyEpoch": 3, "iv": "iv", "ciphertext": "credential" },
+            "wrap": { "custodianMemberId": "member-1", "recipientKeyEpoch": 1, "wrapSuite": "P256-HKDF-SHA256-AES256GCM", "ephemeralPublicKey": "public", "iv": "iv", "wrappedDek": "wrapped" },
+        });
+        assert!(matches!(
+            serde_json::from_value::<ServerFrame>(proxy.clone()).expect("a proxy request parses"),
+            ServerFrame::ProxyRequest { request } if request.request_id == "request-1"
+        ));
+        let mut widened = proxy;
+        widened
+            .as_object_mut()
+            .unwrap()
+            .insert("command".to_string(), json!("curl"));
+        assert!(serde_json::from_value::<ServerFrame>(widened).is_err());
     }
 
     #[test]

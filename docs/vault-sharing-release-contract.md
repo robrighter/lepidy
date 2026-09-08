@@ -50,6 +50,34 @@ An unlocked custodian/release device encrypts a one-operation secret package to 
 
 The release device decrypts locally, validates scheme/host/port and every redirect against credential policy, blocks private destinations, attaches the credential, performs the bounded request, redacts the response and returns authenticated ciphertext. The Worker and cloud agent see only allowed response content. No available release device returns `vault_device_unavailable`.
 
+The V06 implementation deliberately follows **no redirects** rather than
+trying to approve a changing destination chain. It accepts HTTPS on port 443,
+an exact policy host, and only `GET`, `POST`, `PUT`, `PATCH`, `DELETE` or
+`HEAD`; caller headers are limited to `Accept`, `Content-Type` and
+`Idempotency-Key`. The device resolves the whole DNS answer, refuses it if any
+address is private or special-use, pins that answer for the connection, and
+adds the credential only as `Authorization: Bearer …`. Request bodies are
+bounded to 64 KiB, responses to 256 KiB, and the fetch to twenty seconds.
+
+`proxy_request` is an idempotent asynchronous MCP operation. The first call
+returns `pending`, the same key later returns the encrypted device result, and
+the workspace never sends a second external request for that key. A request
+expires after sixty seconds as `uncertain`, because absence of a response does
+not prove absence of an upstream side effect. An enrolled release device must
+both hold the current custodian wrap and have its authenticated outbound runner
+socket open; otherwise the call immediately returns
+`vault_device_unavailable`. Authorization is re-evaluated when the signed
+device result arrives, and grant consumption, usage count, access count, result
+state and audit append commit together. A refusal before that commit consumes
+nothing.
+
+The normalized URL, body and caller headers are encrypted to the release
+device before durable storage or socket delivery. The credential envelope and
+recipient wrap remain server-held ciphertext. The device returns only a small
+response-header allowlist and an exact-secret-redacted body, encrypted under a
+one-operation response key; audit carries identifiers, method, status and byte
+count, never request or response bodies or authorization values.
+
 ### Reveal
 
 Reveal and reveal-once render only in the signed native client after fresh initiating-human WebAuthn UV and local unlock. An agent cannot initiate reveal-once. Web/PWA pages may request that the native client open the flow but never receive plaintext.

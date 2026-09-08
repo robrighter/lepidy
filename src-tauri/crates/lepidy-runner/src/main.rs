@@ -610,6 +610,14 @@ fn hold_socket(
         })?;
         let report = runner.apply_frame(&frame, Instant::now(), now_ms());
         announce(&report);
+        for request in &report.proxy_requests {
+            if let Err(error) = complete_proxy(session, signing, revision, request) {
+                eprintln!(
+                    "lepidy-agentd: proxy request {} could not be completed ({}).",
+                    request.request_id, error.message
+                );
+            }
+        }
         // Short while anything is running and the idle check otherwise: a child
         // that exits has to be noticed promptly, because its slot stays taken
         // and its outcome unreported until it is, while a machine with nothing
@@ -647,6 +655,31 @@ fn hold_socket(
             );
         }
     }
+}
+
+fn complete_proxy(
+    session: &Session,
+    signing: &lepidy_cli::crypto::DeviceSigningKey,
+    revision: u64,
+    request: &lepidy_cli::proxy::ProxyFrame,
+) -> CliResult<()> {
+    let vault = session.secrets.vault_key()?;
+    let response = lepidy_cli::proxy::perform_proxy(request, &session.profile.member_id, &vault)?;
+    let reply = session.client.post_signed(
+        &session.profile,
+        signing,
+        &session.secrets.device_credential,
+        lepidy_cli::proxy::PROXY_RESULT_PATH,
+        &serde_json::json!({ "requestId": request.request_id, "response": response }),
+        Provenance::project(&session.profile.project_id).at_revision(revision),
+    )?;
+    if !(200..300).contains(&reply.status) {
+        return Err(CliError::failure(format!(
+            "workspace refused the proxy result: {}",
+            reply.error_message()
+        )));
+    }
+    Ok(())
 }
 
 /// How long the next read may block before the daemon looks around by itself.

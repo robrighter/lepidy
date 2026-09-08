@@ -219,8 +219,21 @@ import {
 } from "../domain/vault-authorization";
 import { parseRemoteLocalAgentTrigger, type LocalAgentTrigger } from "../domain/local-agent-trigger";
 import {
+  VAULT_PROXY_REQUEST_TTL_MS,
+  normalizeVaultProxyRequest,
+  openVaultProxyResponse,
+  sealVaultProxyRequest,
+  validateVaultProxyResult,
+  type VaultProxyRelayEnvelope,
+  type VaultProxyRequest as ProxyHttpRequest,
+  type VaultProxyResponseEnvelope,
+  type VaultProxyResult,
+} from "../domain/vault-proxy";
+import {
   VAULT_WRAP_SUITE,
   assertOpaqueId,
+  decodeVaultBytes,
+  encodeVaultBytes,
   validateVaultEnvelope,
   validateVaultKeyWrap,
   validateVaultPublicKey,
@@ -614,7 +627,25 @@ export function runnerSocketTag(deviceId: string): string {
 export type RunnerFrame =
   | { type: "wake"; trigger: LocalAgentTrigger }
   | { type: "stop"; agentId: string; reason: string }
-  | { type: "welcome"; deviceId: string; runnerEpoch: number; agentIds: readonly string[] };
+  | { type: "welcome"; deviceId: string; runnerEpoch: number; agentIds: readonly string[] }
+  | {
+      type: "proxy_request";
+      requestId: string;
+      workspaceId: string;
+      credentialId: string;
+      credentialVersion: number;
+      credentialKeyEpoch: number;
+      allowedHosts: readonly string[];
+      relay: VaultProxyRelayEnvelope;
+      envelope: VaultCiphertextEnvelope;
+      wrap: VaultKeyWrap;
+    };
+
+export type VaultProxyRequestResult =
+  | { state: "pending"; requestId: string; expiresAt: number }
+  | { state: "completed"; requestId: string; result: VaultProxyResult }
+  | { state: "needs_approval"; approvalId: string; expiresAt: number; hint: string }
+  | { state: "refused" | "uncertain"; requestId?: string; error: string };
 
 export type AgentSummary = {
   id: string;
@@ -837,6 +868,7 @@ const RUNNER_SESSION_CAPABILITIES = [
   "agent_renew",
   "agent_complete",
   "agent_post",
+  "proxy_request",
 ] as const;
 
 /**
@@ -856,6 +888,17 @@ type RunnerDeviceRow = {
   preset_revision: number;
   registered_at: number;
   last_seen_at: number | null;
+};
+
+type VaultProxyRequestRow = {
+  id: string; idempotency_key: string; request_hash: string; requester_member_id: string;
+  agent_id: string; delegation_id: string; release_device_id: string; project_id: string;
+  origin_channel_id: string; origin_message_id: string; credential_id: string;
+  credential_version: number; policy_epoch: number; access_epoch: number;
+  relay_suite: string; relay_ephemeral_public_key: string; relay_iv: string; relay_ciphertext: string;
+  response_key: string; state: "pending" | "completed" | "refused" | "uncertain";
+  delivered_at: number | null; completed_at: number | null; result_json: string | null;
+  created_at: number; expires_at: number;
 };
 
 /** A wake that has committed and is waiting to be handed to a socket. */
@@ -4634,6 +4677,226 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     return { decision: authorized.decision, envelope: this.vaultEnvelope(row), wrap };
   }
 
+  /**
+   * Queue one credential-bearing HTTP request for an online unlocked release
+   * device. The request is encrypted before it is persisted or put on the
+   * socket; the device is the only holder of the private key that can open it.
+   * A retry reads the durable state under the same idempotency key and never
+   * repeats an already accepted external request.
+   */
+  async requestVaultProxy(input: {
+    actor: Actor;
+    credentialId: string;
+    agentId: string;
+    delegationId: string;
+    projectId: string;
+    origin: { channelId: string; messageId: string };
+    idempotencyKey: string;
+    reason: string;
+    request: unknown;
+    now: number;
+  }): Promise<VaultProxyRequestResult> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    if (parseIdempotencyKey(input.idempotencyKey) === null) throw new Error("invalid idempotency key");
+    const reason = input.reason.trim();
+    if (reason.length === 0 || reason.length > 500) throw new Error("proxy reason is invalid");
+    const request = normalizeVaultProxyRequest(input.request);
+    const requestHash = await hashSecret(JSON.stringify({
+      actor: actor.id, item: input.credentialId, agent: input.agentId, delegation: input.delegationId,
+      project: input.projectId, origin: input.origin, reason, request,
+    }));
+    const prior = this.readVaultProxyByIdempotency(input.idempotencyKey);
+    if (prior !== null) {
+      if (!constantTimeEquals(prior.request_hash, requestHash)) throw new Error("proxy idempotency key was reused for a different request");
+      return this.vaultProxyResult(prior, input.now);
+    }
+
+    const release = this.selectVaultReleaseDevice(actor.id);
+    if (release === null) return { state: "refused", error: "vault_device_unavailable" };
+    const row = this.readVaultCredential(input.credentialId);
+    if (row === null) return { state: "refused", error: "vault credential not found" };
+    const hostname = new URL(request.url).hostname.toLowerCase();
+    if (!this.vaultSummary(row).proxyHosts.map((host) => host.toLowerCase()).includes(hostname)) {
+      return { state: "refused", error: "proxy destination is not allowlisted for this credential" };
+    }
+    const wrap = this.readVaultWraps(row.id, row.version).find((candidate) => candidate.custodianMemberId === actor.id);
+    if (wrap === undefined) return { state: "refused", error: "vault_device_unavailable" };
+
+    const access: VaultAccessRequest = {
+      actor: input.actor,
+      credentialId: row.id,
+      device: { id: release.deviceId, active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+      origin: input.origin,
+      projectId: input.projectId,
+      delivery: "device_proxy",
+      agentId: input.agentId,
+      delegationId: input.delegationId,
+      now: input.now,
+    };
+    const evaluated = this.evaluateVaultAccess(access, actor);
+    if (evaluated.decision.kind === "deny") {
+      return { state: "refused", error: vaultDenialHint(evaluated.decision.reason, row.name, evaluated.retryAfter) };
+    }
+    if (evaluated.decision.kind === "needs_approval") {
+      const asked = await this.requestVaultApproval({
+        actor: input.actor,
+        credentialIds: [row.id],
+        device: access.device,
+        origin: input.origin,
+        projectId: input.projectId,
+        delivery: "device_proxy",
+        reason,
+        agentId: input.agentId,
+        delegationId: input.delegationId,
+        now: input.now,
+      });
+      const approval = asked.approvals[0];
+      if (approval === undefined) return { state: "refused", error: "credential approval could not be created" };
+      return { state: "needs_approval", approvalId: approval.approvalId, expiresAt: approval.expiresAt, hint: approval.hint };
+    }
+
+    const requestId = crypto.randomUUID();
+    const responseKey = crypto.getRandomValues(new Uint8Array(32));
+    const relay = await sealVaultProxyRequest({
+      workspaceId: this.workspaceKey(), requestId, recipientPublicKey: release.publicKey, request, responseKey,
+    });
+    const expiresAt = input.now + VAULT_PROXY_REQUEST_TTL_MS;
+    await this.commitMutation({ scope: "vault.proxy.request", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO vault_proxy_requests(
+          id, idempotency_key, request_hash, requester_member_id, agent_id, delegation_id,
+          release_device_id, project_id, origin_channel_id, origin_message_id,
+          credential_id, credential_version, policy_epoch, access_epoch,
+          relay_suite, relay_ephemeral_public_key, relay_iv, relay_ciphertext, response_key,
+          state, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        requestId, input.idempotencyKey, requestHash, actor.id, input.agentId, input.delegationId,
+        release.deviceId, input.projectId, input.origin.channelId, input.origin.messageId,
+        row.id, row.version, row.policy_epoch, this.vaultSettings().access_epoch,
+        relay.suite, relay.ephemeralPublicKey, relay.iv, relay.ciphertext, encodeVaultBytes(responseKey),
+        input.now, expiresAt,
+      );
+      return {
+        result: null,
+        effects: this.vaultEffects("vault.proxy_requested", row.id, actor, {
+          proxy_id: requestId, agent_id: input.agentId, delivery: "device_proxy", method: request.method,
+        }),
+      };
+    });
+
+    const sent = this.sendRunnerFrame(release.deviceId, {
+      type: "proxy_request",
+      requestId,
+      workspaceId: this.workspaceKey(),
+      credentialId: row.id,
+      credentialVersion: row.version,
+      credentialKeyEpoch: row.key_epoch,
+      allowedHosts: this.vaultSummary(row).proxyHosts,
+      relay,
+      envelope: this.vaultEnvelope(row),
+      wrap,
+    });
+    if (!sent) {
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_proxy_requests SET state = 'refused', completed_at = ?, result_json = ? WHERE id = ? AND state = 'pending'",
+        input.now, JSON.stringify({ error: "vault_device_unavailable" }), requestId,
+      );
+      return { state: "refused", requestId, error: "vault_device_unavailable" };
+    }
+    this.ctx.storage.sql.exec("UPDATE vault_proxy_requests SET delivered_at = ? WHERE id = ?", input.now, requestId);
+    return { state: "pending", requestId, expiresAt };
+  }
+
+  /** Accept the one encrypted answer owed by the exact release device. */
+  async completeVaultProxy(input: {
+    actor: Actor;
+    deviceId: string;
+    requestId: string;
+    response: VaultProxyResponseEnvelope;
+    now: number;
+  }): Promise<{ accepted: boolean; state: VaultProxyRequestRow["state"] }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireRunnerDevice(input.deviceId, actor.id);
+    const row = this.readVaultProxy(input.requestId);
+    if (row === null || row.release_device_id !== input.deviceId || row.requester_member_id !== actor.id) {
+      throw new Error("proxy request not found");
+    }
+    if (row.state !== "pending") return { accepted: false, state: row.state };
+    if (row.expires_at <= input.now) {
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_proxy_requests SET state = 'uncertain', completed_at = ?, result_json = ? WHERE id = ? AND state = 'pending'",
+        input.now, JSON.stringify({ error: "proxy result arrived after its deadline" }), row.id,
+      );
+      return { accepted: false, state: "uncertain" };
+    }
+    const result = validateVaultProxyResult(await openVaultProxyResponse({
+      workspaceId: this.workspaceKey(),
+      requestId: row.id,
+      responseKey: decodeVaultBytes(row.response_key, "proxy response key"),
+      envelope: input.response,
+    }));
+
+    const outcome = await this.commitMutation<{ accepted: boolean; state: "refused" | "completed" }>(
+      { scope: "vault.proxy.complete", now: input.now }, () => {
+      const live = this.readVaultProxy(row.id);
+      if (live === null || live.state !== "pending") throw new Error("proxy request was already completed");
+      const access: VaultAccessRequest = {
+        actor: input.actor,
+        credentialId: live.credential_id,
+        device: { id: input.deviceId, active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+        origin: { channelId: live.origin_channel_id, messageId: live.origin_message_id },
+        projectId: live.project_id,
+        delivery: "device_proxy",
+        agentId: live.agent_id,
+        delegationId: live.delegation_id,
+        now: input.now,
+      };
+      const checked = this.evaluateVaultAccess(access, actor);
+      if (
+        checked.decision.kind !== "allow" || checked.row === null ||
+        checked.row.version !== live.credential_version || checked.row.policy_epoch !== live.policy_epoch ||
+        this.vaultSettings().access_epoch !== live.access_epoch
+      ) {
+        this.ctx.storage.sql.exec(
+          "UPDATE vault_proxy_requests SET state = 'refused', completed_at = ?, result_json = ? WHERE id = ?",
+          input.now, JSON.stringify({ error: "proxy authority changed before completion" }), live.id,
+        );
+        return { result: { accepted: false, state: "refused" as const } };
+      }
+      if (checked.grantId !== null) {
+        const consumed = this.ctx.storage.sql.exec(
+          `UPDATE vault_grants SET remaining_uses = CASE WHEN remaining_uses IS NULL THEN NULL ELSE remaining_uses - 1 END
+           WHERE id = ? AND revoked_at IS NULL AND (remaining_uses IS NULL OR remaining_uses > 0)`, checked.grantId,
+        );
+        if (consumed.rowsWritten !== 1) throw new Error("vault grant was already consumed");
+      }
+      const usageId = crypto.randomUUID();
+      this.ctx.storage.sql.exec(
+        `INSERT INTO vault_usage_events(id, credential_id, grant_id, member_id, device_id, project_id, agent_id, delegation_id, delivery, used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'device_proxy', ?)`,
+        usageId, live.credential_id, checked.grantId, actor.id, input.deviceId, live.project_id,
+        live.agent_id, live.delegation_id, input.now,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_credentials SET last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?",
+        input.now, live.credential_id,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_proxy_requests SET state = 'completed', completed_at = ?, result_json = ? WHERE id = ?",
+        input.now, JSON.stringify({ result }), live.id,
+      );
+      return {
+        result: { accepted: true, state: "completed" as const },
+        effects: this.vaultEffects("vault.proxy_completed", live.credential_id, actor, {
+          proxy_id: live.id, status: result.status, response_bytes: new TextEncoder().encode(result.body).byteLength,
+        }),
+      };
+      },
+    );
+    return outcome.result;
+  }
+
   async setVaultAgentAccess(input: { actor: Actor; enabled: boolean; freshUserVerification: boolean; now: number }): Promise<{ enabled: boolean; accessEpoch: number }> {
     const actor = this.authorizeActor(input.actor);
     if (actor.role !== "owner" && actor.role !== "admin") throw new Error("only an admin may change vault agent access");
@@ -5851,6 +6114,51 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       input.originMessageId, input.approverMemberId, input.now,
     );
     return grantId;
+  }
+
+  private readVaultProxy(id: string): VaultProxyRequestRow | null {
+    return this.ctx.storage.sql
+      .exec<VaultProxyRequestRow>("SELECT * FROM vault_proxy_requests WHERE id = ?", id)
+      .toArray()[0] ?? null;
+  }
+
+  private readVaultProxyByIdempotency(idempotencyKey: string): VaultProxyRequestRow | null {
+    return this.ctx.storage.sql
+      .exec<VaultProxyRequestRow>("SELECT * FROM vault_proxy_requests WHERE idempotency_key = ?", idempotencyKey)
+      .toArray()[0] ?? null;
+  }
+
+  private vaultProxyResult(row: VaultProxyRequestRow, now: number): VaultProxyRequestResult {
+    if (row.state === "pending" && row.expires_at <= now) {
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_proxy_requests SET state = 'uncertain', completed_at = ?, result_json = ? WHERE id = ? AND state = 'pending'",
+        now, JSON.stringify({ error: "proxy result was not confirmed before its deadline" }), row.id,
+      );
+      return { state: "uncertain", requestId: row.id, error: "the release device did not confirm whether the request completed" };
+    }
+    if (row.state === "pending") return { state: "pending", requestId: row.id, expiresAt: row.expires_at };
+    const stored = row.result_json === null ? {} : JSON.parse(row.result_json) as { result?: VaultProxyResult; error?: string };
+    if (row.state === "completed" && stored.result !== undefined) {
+      return { state: "completed", requestId: row.id, result: validateVaultProxyResult(stored.result) };
+    }
+    if (row.state === "completed") throw new Error("completed proxy request has no result");
+    return { state: row.state, requestId: row.id, error: stored.error ?? "the proxy request was refused" };
+  }
+
+  /**
+   * V06 initially uses the enrolled runner device that published this member's
+   * vault wrapping key. V07 may add more device wraps; until then, selecting a
+   * different online device would produce a request it cannot decrypt.
+   */
+  private selectVaultReleaseDevice(memberId: string): { deviceId: string; publicKey: string } | null {
+    const row = this.ctx.storage.sql.exec<{ device_id: string; public_key: string }>(
+      `SELECT k.device_id, k.public_key
+       FROM vault_member_keys k JOIN runner_devices d ON d.device_id = k.device_id AND d.member_id = k.member_id
+       WHERE k.member_id = ?`,
+      memberId,
+    ).toArray()[0];
+    if (row === undefined || this.ctx.getWebSockets(runnerSocketTag(row.device_id)).length === 0) return null;
+    return { deviceId: row.device_id, publicKey: row.public_key };
   }
 
   private readVaultMemberKey(memberId: string): VaultMemberKey | null {

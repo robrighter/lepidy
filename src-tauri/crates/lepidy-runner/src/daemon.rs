@@ -26,6 +26,7 @@ use crate::preset::PresetStore;
 use crate::process::RunningProcess;
 use crate::socket::ServerFrame;
 use crate::trigger::parse_remote_trigger;
+use lepidy_cli::proxy::ProxyFrame;
 
 pub const REGISTER_PATH: &str = "/api/device/runner/register";
 pub const DEPTH_PATH: &str = "/api/device/runner/depth";
@@ -108,6 +109,10 @@ pub struct TurnReport {
     /// next queue check picks the work up, rather than a harness being started
     /// with nothing to authenticate with.
     pub needs_session: Vec<String>,
+    /// Credential-bearing HTTP work is executed by the release-device loop,
+    /// outside the process-launch policy. It is still surfaced as data here so
+    /// an unknown frame can never become an implicit command.
+    pub proxy_requests: Vec<ProxyFrame>,
 }
 
 /// The daemon's live state, separated from its I/O so the decisions can be
@@ -186,6 +191,7 @@ impl Runner {
                 report.stopped.push(agent_id.clone());
             }
             ServerFrame::Pong => {}
+            ServerFrame::ProxyRequest { request } => report.proxy_requests.push(request.clone()),
             ServerFrame::Wake { trigger } => {
                 let trigger = match parse_remote_trigger(trigger) {
                     Ok(trigger) => trigger,

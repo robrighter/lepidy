@@ -590,7 +590,7 @@ POST https://<workspace>.lepidy.app/api/proxy
   { "credential": "STRIPE_KEY", "url": "https://api.stripe.com/v1/charges", ... }
 ```
 
-The service validates the request and relays it end-to-end encrypted to an enrolled, unlocked release device. That device checks the credential's host allowlist and rate limit, attaches the credential, performs the outbound request, redacts the response, and returns an encrypted result. The Worker sees neither secret nor plaintext request headers. If no approved release device is online and unlocked, the operation returns `vault_device_unavailable`; cloud availability never creates a server decryption path.
+The service validates the request, encrypts its normalized URL, safe caller headers and bounded body before durable relay, and sends it to an enrolled, unlocked release device. That device checks the credential's exact host allowlist and a pinned public DNS answer, follows no redirects, attaches the credential as a bearer authorization header, performs the bounded request, redacts the response, and returns an encrypted result. The Worker sees neither the secret nor an authorization header, and durable captures contain no request URL, header or body plaintext. If no approved release device is online and unlocked, the operation returns `vault_device_unavailable`; cloud availability never creates a server decryption path. The MCP call is idempotent and asynchronous: `pending` is polled with the same key, and an unanswered delivered request becomes `uncertain` rather than being automatically repeated.
 
 `proxy` ships in v1 for header-style credentials. It is the recommendation the create-credential form makes when it can detect the shape.
 

@@ -300,6 +300,27 @@ async function dispatchTool(
       if (!credential) throw new Error("vault credential not found");
       return { credential: credentialMetadata(credential) };
     }
+    case "proxy_request": {
+      if (principal.credentialKind !== "session") throw new Error("this tool requires an unattended agent session");
+      const result = await workspace.requestVaultProxy({
+        actor,
+        credentialId: args.credential_id as string,
+        agentId: principal.agentId,
+        delegationId: principal.delegationId,
+        projectId: args.project_id as string,
+        origin: { channelId: args.channel_id as string, messageId: args.message_id as string },
+        idempotencyKey: args.idempotency_key as string,
+        reason: args.reason as string,
+        request: {
+          url: args.url,
+          method: args.method ?? "GET",
+          headers: args.headers ?? {},
+          body: args.body ?? null,
+        },
+        now: Date.now(),
+      });
+      return result;
+    }
     default:
       throw new Error("tool is not implemented");
   }

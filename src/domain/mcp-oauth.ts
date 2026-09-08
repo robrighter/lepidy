@@ -800,7 +800,8 @@ export type McpToolName =
   | "agent_get_prompt"
   | "agent_set_prompt"
   | "list_credentials"
-  | "describe_credential";
+  | "describe_credential"
+  | "proxy_request";
 
 export type McpToolDefinition = {
   name: McpToolName;
@@ -1003,6 +1004,27 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: "describe_credential",
     description: "Describe one available credential's policy and supported use without returning its value, ciphertext, or key wraps.",
     inputSchema: objectSchema({ credential_id: string("Credential id"), channel_id: string("Optional visible origin room id") }, ["credential_id"]),
+    requiredScope: "vault",
+    sessionCapable: true,
+  },
+  {
+    name: "proxy_request",
+    description: "Ask an online unlocked release device to make one bounded HTTPS request with an allowlisted credential. Returns pending until that device confirms the encrypted result.",
+    inputSchema: objectSchema(
+      {
+        credential_id: string("Credential id"),
+        url: string("Allowlisted HTTPS URL", 4096),
+        method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] },
+        headers: { type: "object" },
+        body: { type: ["string", "null"], maxLength: 65536 },
+        project_id: string("Delegated local project id"),
+        channel_id: string("Origin room id"),
+        message_id: string("Origin message id"),
+        reason: string("Why this credential is needed", 500),
+        idempotency_key: string("Stable retry key", 200),
+      },
+      ["credential_id", "url", "project_id", "channel_id", "message_id", "reason", "idempotency_key"],
+    ),
     requiredScope: "vault",
     sessionCapable: true,
   },
