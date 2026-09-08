@@ -51,12 +51,12 @@ lives in `src-tauri/crates/lepidy-cli` and builds on its own:
 cargo run --manifest-path src-tauri/crates/lepidy-cli/Cargo.toml --bin lepidy -- --help
 ```
 
-Four commands: `login` enrols this machine and generates the device signing key
-and the vault wrapping key, whose private halves stay here sealed under a
-passphrase Lepidy never sees; `list` shows credential metadata; `add` encrypts a
-value locally and uploads only ciphertext; `run` asks the workspace to release
-one credential for one command, decrypts it here, and runs the command with the
-value in its environment or in an owner-only file that is removed afterwards.
+`login` enrols this machine and generates the device signing key and vault
+wrapping key, whose private halves stay here sealed under a passphrase Lepidy
+never sees. `list` shows credential metadata; `add`, `capture`, `import` and
+`rotate` create client-side ciphertext; `run` asks the workspace to release
+credentials for one command, decrypts them here, and injects them into its
+environment or owner-only temporary files.
 
 No option accepts a credential value, a password or a passphrase — those are
 read from the terminal, or from standard input in a documented order — because
@@ -78,6 +78,15 @@ usable. `import` seeds the vault from a `.env` and leaves the file alone unless
 a person does. `run` also takes `--all-tagged TAG` for a whole tagged group
 under one approval and `--with-template SRC:PATH` to resolve `${lepidy:NAME}`
 placeholders into an owner-only file for the life of one command.
+
+The first enrolled custodian also uploads an Argon2id/AES-GCM recovery package;
+the printable recovery code and vault key never leave the CLI. On a replacement
+device, `lepidy recover` downloads that ciphertext, opens it locally, rewraps
+every current credential to a fresh member key, rotates the recovery package
+and prints a new code. Signed device endpoints also support recipient-key-bound
+device packages, explicit custodian addition, full-rekey custodian removal and
+rekey-before-revoke device removal. Remotely served web pages receive none of
+the recovery, private-key or DEK material.
 
 ## Desktop shell
 

@@ -11,12 +11,14 @@ use serde_json::json;
 
 use crate::args::Args;
 use crate::client::Client;
+use crate::client::Provenance;
 use crate::crypto::{encode, public_jwk_from_sec1, DeviceSigningKey, VaultKeyPair};
 use crate::error::{CliError, CliResult};
 use crate::profile::{
     fresh_secrets, generate_recovery_code, save_profile, seal, Profile, PROFILE_VERSION,
 };
 use crate::prompt::{read_line_field, read_secret};
+use crate::recovery::seal_recovery_package;
 
 pub fn run(args: &Args) -> CliResult<i32> {
     let server = args.require("server")?;
@@ -109,6 +111,7 @@ pub fn run(args: &Args) -> CliResult<i32> {
     let profile = Profile {
         version: PROFILE_VERSION,
         server_url: client.base_url().to_string(),
+        account_id: text("accountId")?,
         workspace_id: workspace_id.clone(),
         workspace_slug: text("workspaceSlug")?,
         member_id: text("memberId")?,
@@ -121,6 +124,33 @@ pub fn run(args: &Args) -> CliResult<i32> {
         passphrase: seal(&secrets, &passphrase, &device_id, &workspace_id)?,
         recovery: seal(&secrets, &recovery_code, &device_id, &workspace_id)?,
     };
+    if published {
+        let recovery_package = seal_recovery_package(
+            &profile.account_id,
+            1,
+            &recovery_code,
+            &vault.scalar_bytes(),
+        )?;
+        let stored = client.post_signed(
+            &profile,
+            &signing,
+            &secrets.device_credential,
+            "/api/device/vault/recovery",
+            &json!({
+                "action": "initialize",
+                "password": password,
+                "package": recovery_package,
+                "confirmed": true,
+            }),
+            Provenance::project(&profile.project_id),
+        )?;
+        if stored.status != 200 {
+            return Err(CliError::failure(format!(
+                "vault recovery setup was refused: {}",
+                stored.error_message()
+            )));
+        }
+    }
     let path = save_profile(&profile)?;
 
     println!(

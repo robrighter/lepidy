@@ -4,6 +4,10 @@
 **Decision:** D05a  
 **Date:** 2026-09-06
 
+**Implemented:** V07, 2026-09-08. The signed CLI recovery flow, opaque D1
+recovery/device packages, client-side cryptography and epoch/rekey tests are the
+executable realization of this contract.
+
 Lepidy never stores the user's vault unlock secret or recovery code. Cloud storage may contain encrypted vault data and wrapped data keys, but no service-held secret is sufficient to decrypt them.
 
 ## Key creation

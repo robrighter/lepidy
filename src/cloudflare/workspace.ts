@@ -4765,6 +4765,170 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     return outcome.result;
   }
 
+  /**
+   * Add one cryptographic custodian without rotating the credential value.
+   * The unlocked current custodian has already opened the DEK and sealed this
+   * one additional wrap to the recipient's published current key. The server
+   * can validate that ceremony's public facts but never sees the DEK.
+   */
+  async addVaultCustodian(input: {
+    actor: Actor;
+    credentialId: string;
+    recipientMemberId: string;
+    wrap: VaultKeyWrap;
+    freshUserVerification: boolean;
+    localVaultUnlocked: boolean;
+    confirmed: boolean;
+    now: number;
+  }): Promise<{ credential: VaultCredentialSummary; added: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    this.requireVaultManager(input.credentialId, actor.id);
+    this.requireVaultStepUp(input.freshUserVerification, input.localVaultUnlocked);
+    if (!input.confirmed) throw new Error("explicit custodian confirmation is required");
+    const current = this.requireVaultCredential(input.credentialId);
+    const wrap = validateVaultKeyWrap(input.wrap);
+    if (wrap.custodianMemberId !== input.recipientMemberId) throw new Error("custodian wrap recipient does not match");
+    if (this.resolveActiveMemberIds([input.recipientMemberId]).length !== 1) throw new Error("vault custodian must be an active member");
+    const recipientKey = this.readVaultMemberKey(input.recipientMemberId);
+    if (recipientKey === null || recipientKey.keyEpoch !== wrap.recipientKeyEpoch || recipientKey.wrapSuite !== wrap.wrapSuite) {
+      throw new Error("custodian wrap does not use the recipient's current key");
+    }
+    if (this.readVaultWraps(current.id, current.version).some((candidate) => candidate.custodianMemberId === input.recipientMemberId)) {
+      return { credential: this.vaultSummary(current), added: false };
+    }
+    const outcome = await this.commitMutation({ scope: "vault.custodian.add", now: input.now }, () => {
+      const live = this.requireVaultCredential(input.credentialId);
+      if (live.version !== current.version || live.policy_epoch !== current.policy_epoch) throw new Error("vault credential changed concurrently");
+      this.ctx.storage.sql.exec(
+        `INSERT INTO vault_credential_key_wraps(
+           credential_id, credential_version, custodian_member_id, recipient_key_epoch,
+           wrap_suite, ephemeral_public_key, iv, wrapped_dek, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        live.id, live.version, input.recipientMemberId, wrap.recipientKeyEpoch,
+        wrap.wrapSuite, wrap.ephemeralPublicKey, wrap.iv, wrap.wrappedDek, input.now,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT OR IGNORE INTO vault_credential_acl(credential_id, subject_type, subject_id, verb, created_at)
+         VALUES (?, 'member', ?, 'manage', ?)`,
+        live.id, input.recipientMemberId, input.now,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_credentials SET policy_epoch = policy_epoch + 1, updated_at = ? WHERE id = ?",
+        input.now, live.id,
+      );
+      this.revokeVaultGrants("custodian_added", input.now, "credential_id = ?", live.id);
+      this.cancelPendingApprovals(
+        input.now,
+        "id IN (SELECT approval_id FROM vault_approval_items WHERE credential_id = ?)",
+        live.id,
+      );
+      return {
+        result: { credential: this.vaultSummary(this.requireVaultCredential(live.id)), added: true },
+        effects: this.vaultEffects("vault.custodian_added", live.id, actor, {
+          custodian_member_id: input.recipientMemberId,
+          item_version: live.version,
+          recipient_key_epoch: wrap.recipientKeyEpoch,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /**
+   * Remove a custodian only as a full client-side re-encryption. A fresh DEK,
+   * ciphertext version and exact wrap set for every remaining custodian arrive
+   * together and commit atomically, so an interrupted attempt leaves the old
+   * version and all of its valid user-held paths intact.
+   */
+  async removeVaultCustodian(input: {
+    actor: Actor;
+    credentialId: string;
+    removedMemberId: string;
+    envelope: VaultCiphertextEnvelope;
+    wraps: readonly VaultKeyWrap[];
+    freshUserVerification: boolean;
+    localVaultUnlocked: boolean;
+    confirmed: boolean;
+    now: number;
+  }): Promise<{ credential: VaultCredentialSummary; revokedGrants: number; expiredApprovals: number }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    this.requireVaultManager(input.credentialId, actor.id);
+    this.requireVaultStepUp(input.freshUserVerification, input.localVaultUnlocked);
+    if (!input.confirmed) throw new Error("explicit custodian confirmation is required");
+    const current = this.requireVaultCredential(input.credentialId);
+    const currentCustodians = this.readVaultWraps(current.id, current.version).map((wrap) => wrap.custodianMemberId);
+    if (!currentCustodians.includes(input.removedMemberId)) throw new Error("vault custodian not found");
+    const remaining = currentCustodians.filter((memberId) => memberId !== input.removedMemberId);
+    if (remaining.length === 0) throw new Error("the final vault custodian cannot be removed");
+    const envelope = validateVaultEnvelope(input.envelope, { version: current.version + 1, keyEpoch: current.key_epoch + 1 });
+    const wraps = input.wraps.map(validateVaultKeyWrap);
+    const wrappedMembers = [...new Set(wraps.map((wrap) => wrap.custodianMemberId))].sort();
+    if (wraps.length !== remaining.length || wrappedMembers.join("\n") !== [...remaining].sort().join("\n")) {
+      throw new Error("replacement wraps must exactly match remaining custodians");
+    }
+    for (const wrap of wraps) {
+      const memberKey = this.readVaultMemberKey(wrap.custodianMemberId);
+      if (memberKey === null || memberKey.keyEpoch !== wrap.recipientKeyEpoch || memberKey.wrapSuite !== wrap.wrapSuite) {
+        throw new Error("replacement wrap does not use the custodian's current key");
+      }
+    }
+    const outcome = await this.commitMutation({ scope: "vault.custodian.remove", now: input.now }, () => {
+      const live = this.requireVaultCredential(input.credentialId);
+      if (live.version !== current.version || live.policy_epoch !== current.policy_epoch) throw new Error("vault credential changed concurrently");
+      const revokedGrants = this.countLiveVaultGrants("credential_id = ?", live.id);
+      this.ctx.storage.sql.exec(
+        `UPDATE vault_credentials
+         SET cipher_suite = ?, aad_version = ?, ciphertext = ?, iv = ?, key_epoch = ?, version = ?,
+             policy_epoch = policy_epoch + 1, updated_at = ?
+         WHERE id = ?`,
+        envelope.cipherSuite, envelope.aadVersion, envelope.ciphertext, envelope.iv,
+        envelope.keyEpoch, envelope.version, input.now, live.id,
+      );
+      this.ctx.storage.sql.exec("DELETE FROM vault_credential_key_wraps WHERE credential_id = ?", live.id);
+      for (const wrap of wraps) this.ctx.storage.sql.exec(
+        `INSERT INTO vault_credential_key_wraps(
+           credential_id, credential_version, custodian_member_id, recipient_key_epoch,
+           wrap_suite, ephemeral_public_key, iv, wrapped_dek, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        live.id, envelope.version, wrap.custodianMemberId, wrap.recipientKeyEpoch,
+        wrap.wrapSuite, wrap.ephemeralPublicKey, wrap.iv, wrap.wrappedDek, input.now,
+      );
+      this.ctx.storage.sql.exec(
+        "DELETE FROM vault_credential_acl WHERE credential_id = ? AND subject_type = 'member' AND subject_id = ? AND verb = 'manage'",
+        live.id, input.removedMemberId,
+      );
+      this.revokeVaultGrants("custodian_removed", input.now, "credential_id = ?", live.id);
+      const expiredApprovals = this.cancelPendingApprovals(
+        input.now,
+        "id IN (SELECT approval_id FROM vault_approval_items WHERE credential_id = ?)",
+        live.id,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE vault_proxy_requests
+         SET state = 'refused', completed_at = ?, result_json = ?
+         WHERE credential_id = ? AND state = 'pending'`,
+        input.now, JSON.stringify({ error: "credential custodians changed" }), live.id,
+      );
+      return {
+        result: {
+          credential: this.vaultSummary(this.requireVaultCredential(live.id)),
+          revokedGrants,
+          expiredApprovals,
+        },
+        effects: this.vaultEffects("vault.custodian_removed", live.id, actor, {
+          removed_member_id: input.removedMemberId,
+          item_version: envelope.version,
+          key_epoch: envelope.keyEpoch,
+          revoked_grants: revokedGrants,
+          expired_approvals: expiredApprovals,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
   async deleteVaultCredential(input: { actor: Actor; credentialId: string; freshUserVerification: boolean; localVaultUnlocked: boolean; now: number }): Promise<{ deleted: boolean }> {
     const actor = this.authorizeActor(input.actor);
     this.requireCloudContentAuthority();
@@ -4862,6 +5026,117 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }
 
   /**
+   * Move a member to a new wrapping key after recovery or device loss. Every
+   * current credential wrap for that custodian must be replaced in the same
+   * transaction. A missing or stale replacement rejects before the key epoch
+   * moves, so interruption cannot strand the remaining device/recovery path.
+   */
+  async rotateVaultMemberKey(input: {
+    actor: Actor;
+    expectedKeyEpoch: number;
+    publicKey: string;
+    deviceId: string;
+    replacements: readonly { credentialId: string; credentialVersion: number; wrap: VaultKeyWrap }[];
+    freshUserVerification: boolean;
+    localVaultUnlocked: boolean;
+    confirmed: boolean;
+    now: number;
+  }): Promise<{ memberId: string; keyEpoch: number; replacedCredentials: number }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    this.requireVaultStepUp(input.freshUserVerification, input.localVaultUnlocked);
+    if (!input.confirmed) throw new Error("vault key rotation confirmation is required");
+    const publicKey = validateVaultPublicKey(input.publicKey, "vault public key");
+    const currentKey = this.readVaultMemberKey(actor.id);
+    if (
+      currentKey !== null
+      && currentKey.keyEpoch === input.expectedKeyEpoch + 1
+      && currentKey.publicKey === publicKey
+      && currentKey.wrapSuite === VAULT_WRAP_SUITE
+    ) {
+      return { memberId: actor.id, keyEpoch: currentKey.keyEpoch, replacedCredentials: input.replacements.length };
+    }
+    if (currentKey === null || currentKey.keyEpoch !== input.expectedKeyEpoch) throw new Error("vault member key epoch changed concurrently");
+    if (publicKey === currentKey.publicKey) throw new Error("vault key rotation requires a new public key");
+    const expected = this.ctx.storage.sql.exec<{ credential_id: string; version: number }>(
+      `SELECT c.id AS credential_id, c.version
+       FROM vault_credentials c
+       JOIN vault_credential_key_wraps w
+         ON w.credential_id = c.id AND w.credential_version = c.version
+       WHERE w.custodian_member_id = ?
+       ORDER BY c.id`,
+      actor.id,
+    ).toArray();
+    const replacements = input.replacements.map((replacement) => ({
+      ...replacement,
+      wrap: validateVaultKeyWrap(replacement.wrap),
+    })).sort((left, right) => left.credentialId.localeCompare(right.credentialId));
+    if (replacements.length !== expected.length) throw new Error("vault key rotation requires every current credential wrap");
+    for (let index = 0; index < expected.length; index += 1) {
+      const wanted = expected[index];
+      const replacement = replacements[index];
+      if (
+        replacement.credentialId !== wanted.credential_id
+        || replacement.credentialVersion !== wanted.version
+        || replacement.wrap.custodianMemberId !== actor.id
+        || replacement.wrap.recipientKeyEpoch !== currentKey.keyEpoch + 1
+      ) {
+        throw new Error("vault key rotation replacement set is stale or incomplete");
+      }
+    }
+    const outcome = await this.commitMutation({ scope: "vault.member_key.rotate", now: input.now }, () => {
+      const liveKey = this.readVaultMemberKey(actor.id);
+      if (liveKey === null || liveKey.keyEpoch !== currentKey.keyEpoch) throw new Error("vault member key epoch changed concurrently");
+      this.ctx.storage.sql.exec(
+        `UPDATE vault_member_keys
+         SET key_epoch = key_epoch + 1, public_key = ?, device_id = ?, updated_at = ?
+         WHERE member_id = ? AND key_epoch = ?`,
+        publicKey, input.deviceId, input.now, actor.id, currentKey.keyEpoch,
+      );
+      for (const replacement of replacements) {
+        const wrap = replacement.wrap;
+        this.ctx.storage.sql.exec(
+          `DELETE FROM vault_credential_key_wraps
+           WHERE credential_id = ? AND credential_version = ? AND custodian_member_id = ?`,
+          replacement.credentialId, replacement.credentialVersion, actor.id,
+        );
+        this.ctx.storage.sql.exec(
+          `INSERT INTO vault_credential_key_wraps(
+             credential_id, credential_version, custodian_member_id, recipient_key_epoch,
+             wrap_suite, ephemeral_public_key, iv, wrapped_dek, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          replacement.credentialId, replacement.credentialVersion, actor.id, wrap.recipientKeyEpoch,
+          wrap.wrapSuite, wrap.ephemeralPublicKey, wrap.iv, wrap.wrappedDek, input.now,
+        );
+        this.ctx.storage.sql.exec(
+          "UPDATE vault_credentials SET policy_epoch = policy_epoch + 1, updated_at = ? WHERE id = ?",
+          input.now, replacement.credentialId,
+        );
+        this.revokeVaultGrants("vault_key_rotated", input.now, "credential_id = ?", replacement.credentialId);
+        this.cancelPendingApprovals(
+          input.now,
+          "id IN (SELECT approval_id FROM vault_approval_items WHERE credential_id = ?)",
+          replacement.credentialId,
+        );
+        this.ctx.storage.sql.exec(
+          `UPDATE vault_proxy_requests SET state = 'refused', completed_at = ?, result_json = ?
+           WHERE credential_id = ? AND state = 'pending'`,
+          input.now, JSON.stringify({ error: "custodian key rotated" }), replacement.credentialId,
+        );
+      }
+      return {
+        result: { memberId: actor.id, keyEpoch: currentKey.keyEpoch + 1, replacedCredentials: replacements.length },
+        effects: this.vaultEffects("vault.member_key_rotated", "member_key", actor, {
+          key_epoch: currentKey.keyEpoch + 1,
+          item_count: replacements.length,
+          device_id: input.deviceId,
+        }),
+      };
+    });
+    return outcome.result;
+  }
+
+  /**
    * The published wrapping keys a client needs to seal a DEK for custodians.
    * Public halves only; a member with no enrolled client is simply absent, and
    * the caller must then refuse rather than invent a custodian.
@@ -4874,6 +5149,34 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       keys: [...wanted]
         .map((memberId) => this.readVaultMemberKey(memberId))
         .filter((key): key is VaultMemberKey => key !== null),
+    };
+  }
+
+  /** Ciphertext and this member's wraps needed for an all-or-nothing client rekey. */
+  getVaultMemberRekeyMaterial(input: {
+    actor: Actor;
+    freshUserVerification: boolean;
+    localVaultUnlocked: boolean;
+  }): { key: VaultMemberKey; credentials: readonly { credentialId: string; envelope: VaultCiphertextEnvelope; wrap: VaultKeyWrap }[] } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    this.requireVaultStepUp(input.freshUserVerification, input.localVaultUnlocked);
+    const key = this.readVaultMemberKey(actor.id);
+    if (key === null) throw new Error("vault member key is not registered");
+    const rows = this.ctx.storage.sql.exec<VaultCredentialRow>(
+      `SELECT c.* FROM vault_credentials c
+       JOIN vault_credential_key_wraps w
+         ON w.credential_id = c.id AND w.credential_version = c.version
+       WHERE w.custodian_member_id = ? ORDER BY c.id`,
+      actor.id,
+    ).toArray();
+    return {
+      key,
+      credentials: rows.map((row) => ({
+        credentialId: row.id,
+        envelope: this.vaultEnvelope(row),
+        wrap: this.readVaultWraps(row.id, row.version).find((candidate) => candidate.custodianMemberId === actor.id)!,
+      })),
     };
   }
 

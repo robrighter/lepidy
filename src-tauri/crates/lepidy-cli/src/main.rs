@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use lepidy_cli::args::Args;
 use lepidy_cli::error::{CliError, EXIT_USAGE};
-use lepidy_cli::{add, capture, import, list, login, rotate, run, USAGE};
+use lepidy_cli::{add, capture, import, list, login, recover, rotate, run, USAGE};
 
 /// Flags that stand alone. Everything else takes the next argument, and none of
 /// them may be a credential.
@@ -47,6 +47,7 @@ fn dispatch(raw: &[String]) -> Result<i32, CliError> {
         "capture" => capture::run(&args),
         "import" => import::run(&args),
         "rotate" => rotate::run(&args),
+        "recover" => recover::run(&args),
         "run" => run::run(&args),
         other => Err(CliError::usage(format!(
             "{other:?} is not a lepidy command"

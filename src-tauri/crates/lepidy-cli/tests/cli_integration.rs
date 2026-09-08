@@ -11,6 +11,7 @@ mod support;
 use std::path::PathBuf;
 
 use lepidy_cli::profile::{load_profile_at, unseal};
+use serde_json::Value;
 use support::*;
 
 /// VAULT-CLI-INT-001 — enrolment keeps every secret local.
@@ -66,6 +67,19 @@ fn vault_cli_int_001_login_enrols_without_sending_any_key_material() {
         by_recovery.vault_private_key
     );
     assert!(unseal(&loaded, "not the passphrase").is_err());
+
+    // The cloud recovery copy is ciphertext too. It is signed by this device,
+    // but neither the printable code nor the private key appears in the body.
+    let recovery_bodies = double.with_state(|state| state.bodies("/api/device/vault/recovery"));
+    assert_eq!(recovery_bodies.len(), 1);
+    let recovery_request = String::from_utf8_lossy(&recovery_bodies[0]).to_string();
+    assert_absent(&recovery_request, &recovery, "the recovery package request");
+    assert_absent(
+        &recovery_request,
+        &by_passphrase.vault_private_key,
+        "the recovery package request",
+    );
+    assert!(recovery_request.contains("ARGON2ID-AES256GCM"));
 }
 
 /// VAULT-CLI-INT-002 — enrolment is refused, and nothing is written.
@@ -82,6 +96,88 @@ fn vault_cli_int_002_a_refused_login_leaves_no_profile() {
         !home.path.join("profile.json").exists(),
         "a refused login wrote a profile"
     );
+}
+
+/// V07-CLI-INT-001 — a replacement device recovers and rekeys without sending
+/// either the recovery code, a private key, a DEK or the credential value.
+#[test]
+fn v07_cli_int_001_recovers_a_lost_device_and_invalidates_the_old_code() {
+    let double = Double::start();
+    let original_home = TempHome::create("v07-recovery-original");
+    let original_login = login(&original_home, &double);
+    assert!(original_login.status.success());
+    let original_code = recovery_code(&text(&original_login.stdout));
+    let original_profile = load_profile_at(&original_home.path.join("profile.json")).unwrap();
+    let original_secrets = unseal(&original_profile, PASSPHRASE).unwrap();
+
+    let added = cli(
+        &original_home,
+        &[
+            "add",
+            CREDENTIAL_NAME,
+            "--mode",
+            "auto",
+            "--delivery",
+            "inject",
+        ],
+        &[PASSPHRASE, ACCOUNT_PASSWORD, CANARY],
+    );
+    assert!(
+        added.status.success(),
+        "add failed: {}",
+        text(&added.stderr)
+    );
+
+    double.with_state(|state| state.vault_key_published = false);
+    let replacement_home = TempHome::create("v07-recovery-replacement");
+    let replacement_login = login(&replacement_home, &double);
+    assert!(replacement_login.status.success());
+    assert_eq!(replacement_home.profile_json()["vaultKeyEpoch"], 0);
+
+    let recovered = cli(
+        &replacement_home,
+        &["recover"],
+        &[PASSPHRASE, &original_code, ACCOUNT_PASSWORD],
+    );
+    assert!(
+        recovered.status.success(),
+        "recovery failed: {}",
+        text(&recovered.stderr)
+    );
+    assert_eq!(replacement_home.profile_json()["vaultKeyEpoch"], 2);
+    let output = text(&recovered.stdout);
+    assert!(output.contains("rotated the vault key to epoch 2"));
+    let new_code = output
+        .lines()
+        .find_map(|line| line.strip_prefix("New recovery code: "))
+        .expect("a rotated recovery code");
+    assert_ne!(new_code, original_code);
+
+    double.with_state(|state| {
+        for path in [
+            "/api/device/vault/recovery",
+            "/api/device/vault/member-key/material",
+            "/api/device/vault/member-key/rotate",
+        ] {
+            for body in state.bodies(path) {
+                let body = String::from_utf8_lossy(&body);
+                assert_absent(&body, &original_code, path);
+                assert_absent(&body, new_code, path);
+                assert_absent(&body, CANARY, path);
+                assert_absent(&body, &original_secrets.vault_private_key, path);
+            }
+        }
+        let rotated: Value = serde_json::from_slice(
+            state
+                .bodies("/api/device/vault/member-key/rotate")
+                .last()
+                .expect("a member key rotation"),
+        )
+        .unwrap();
+        assert_eq!(rotated["expectedKeyEpoch"], 1);
+        assert_eq!(rotated["replacements"][0]["credentialVersion"], 1);
+        assert_eq!(rotated["replacements"][0]["wrap"]["recipientKeyEpoch"], 2);
+    });
 }
 
 /// VAULT-CLI-INT-003 — listing shows metadata and signs for it.

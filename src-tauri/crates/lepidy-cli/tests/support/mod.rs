@@ -56,6 +56,8 @@ pub struct State {
     pub release: Value,
     pub enrol_status: u16,
     pub vault_key_published: bool,
+    pub recovery_package: Value,
+    pub last_credential: Value,
 }
 
 impl State {
@@ -270,6 +272,7 @@ fn respond(state: &mut State, path: &str, body: &[u8], signature_verified: bool)
         return (
             200,
             json!({
+                "accountId": "account-test",
                 "deviceId": DEVICE_ID,
                 "deviceCredential": DEVICE_CREDENTIAL,
                 "deviceKeyEpoch": 1,
@@ -298,11 +301,49 @@ fn respond(state: &mut State, path: &str, body: &[u8], signature_verified: bool)
             200,
             json!({ "workspaceId": WORKSPACE_ID, "credentials": state.credentials }),
         ),
-        "/api/device/vault/credentials" => (
-            200,
-            json!({ "credential": { "id": CREDENTIAL_ID, "name": CREDENTIAL_NAME }, "created": true }),
-        ),
+        "/api/device/vault/credentials" => {
+            state.last_credential = serde_json::from_slice(body).unwrap_or(json!({}));
+            (
+                200,
+                json!({ "credential": { "id": CREDENTIAL_ID, "name": CREDENTIAL_NAME }, "created": true }),
+            )
+        }
         "/api/device/vault/release" => (200, state.release.clone()),
+        "/api/device/vault/recovery" => {
+            let parsed: Value = serde_json::from_slice(body).unwrap_or(json!({}));
+            match parsed.get("action").and_then(Value::as_str) {
+                Some("initialize") | Some("rotate") => {
+                    state.recovery_package = parsed.get("package").cloned().unwrap_or(json!({}));
+                    (
+                        200,
+                        json!({ "vaultEpoch": state.recovery_package["vaultEpoch"] }),
+                    )
+                }
+                Some("read") => (
+                    200,
+                    json!({
+                        "vaultEpoch": state.recovery_package["vaultEpoch"],
+                        "package": state.recovery_package.clone(),
+                    }),
+                ),
+                _ => (400, json!({ "message": "bad recovery action" })),
+            }
+        }
+        "/api/device/vault/member-key/material" => (
+            200,
+            json!({
+                "key": { "keyEpoch": 1 },
+                "credentials": [{
+                    "credentialId": state.last_credential["credentialId"],
+                    "envelope": state.last_credential["envelope"],
+                    "wrap": state.last_credential["wraps"][0],
+                }],
+            }),
+        ),
+        "/api/device/vault/member-key/rotate" => (
+            200,
+            json!({ "memberId": MEMBER_ID, "keyEpoch": 2, "replacedCredentials": 1 }),
+        ),
         _ => (
             404,
             json!({ "error": "unknown", "message": "no such endpoint" }),

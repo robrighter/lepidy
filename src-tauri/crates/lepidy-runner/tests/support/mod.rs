@@ -644,6 +644,7 @@ pub fn enrol(home: &TempHome, server_url: &str) -> VerifyingKey {
     let profile = Profile {
         version: PROFILE_VERSION,
         server_url: server_url.to_string(),
+        account_id: "account-runner".to_string(),
         workspace_id: WORKSPACE_ID.to_string(),
         workspace_slug: WORKSPACE_SLUG.to_string(),
         member_id: MEMBER_ID.to_string(),

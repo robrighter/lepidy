@@ -98,6 +98,7 @@ export async function POST(request: Request) {
   }
 
   return deviceJson({
+    accountId,
     deviceId: device.deviceId,
     deviceCredential: device.credential,
     deviceKeyEpoch: device.keyEpoch,

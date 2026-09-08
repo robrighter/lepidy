@@ -22,6 +22,8 @@ pub mod login;
 pub mod profile;
 pub mod prompt;
 pub mod proxy;
+pub mod recover;
+pub mod recovery;
 pub mod rotate;
 pub mod run;
 pub mod scrub;
@@ -65,6 +67,10 @@ lepidy — local credential injection for Lepidy workspaces
       Replace a value with a new one, as a new version with a new key. Rotation
       is deliberately something only a person does: `capture` is create-only so
       that a prompt-injected agent cannot swap a token for somebody else's.
+
+  lepidy recover
+      Recover a replacement device with the user-held code, rotate every
+      custodian wrap, and print a new recovery code. All cryptography stays here.
 
   lepidy run [--with NAME] [--with-file NAME:PATH] [--with-template SRC=PATH]
              [--all-tagged TAG] --origin-channel ID --origin-message ID

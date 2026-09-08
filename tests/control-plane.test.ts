@@ -25,6 +25,8 @@ describe("D1 control-plane schema", () => {
         "invitations",
         "control_operations",
         "subscriptions",
+        "account_vault_recovery",
+        "vault_device_packages",
       ]),
     );
     expect(names).not.toEqual(

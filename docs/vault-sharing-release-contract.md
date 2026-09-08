@@ -4,6 +4,10 @@
 **Decision:** D05  
 **Date:** 2026-09-06
 
+**Implemented:** V07, 2026-09-08 for recovery, device packages and custodian
+add/remove/rekey; V02 and V06 implement the local and device-proxy release
+paths described below.
+
 This contract lets a Team share credentials and lets remote agents use them without giving Lepidy a decryption root. It extends the [vault key/recovery](./vault-key-recovery-contract.md) and [authorization/approval](./vault-authorization-contract.md) contracts.
 
 ## 1. Account keys and recovery

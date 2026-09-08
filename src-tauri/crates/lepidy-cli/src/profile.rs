@@ -25,7 +25,7 @@ use crate::crypto::{
 };
 use crate::error::{CliError, CliResult};
 
-pub const PROFILE_VERSION: u32 = 1;
+pub const PROFILE_VERSION: u32 = 2;
 /// 64 MiB, three passes. Expensive enough to matter against an offline attack
 /// on a stolen profile, cheap enough that unlocking a CLI is not a coffee break.
 pub const ARGON_MEMORY_KIB: u32 = 65_536;
@@ -49,6 +49,7 @@ pub struct SealedKeystore {
 pub struct Profile {
     pub version: u32,
     pub server_url: String,
+    pub account_id: String,
     pub workspace_id: String,
     pub workspace_slug: String,
     pub member_id: String,

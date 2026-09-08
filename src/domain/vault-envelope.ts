@@ -135,7 +135,7 @@ export function validateVaultKeyWrap(value: VaultKeyWrap): VaultKeyWrap {
   if (!Number.isSafeInteger(value.recipientKeyEpoch) || value.recipientKeyEpoch < 1) {
     throw new Error("recipient key epoch is invalid");
   }
-  if (value.wrapSuite.length === 0 || value.wrapSuite.length > 80) throw new Error("wrap suite is invalid");
+  if (value.wrapSuite !== VAULT_WRAP_SUITE) throw new Error("unsupported vault wrap suite");
   const publicKey = decodeVaultBytes(value.ephemeralPublicKey, "ephemeral public key");
   const iv = decodeVaultBytes(value.iv, "wrap iv");
   const wrappedDek = decodeVaultBytes(value.wrappedDek, "wrapped DEK");

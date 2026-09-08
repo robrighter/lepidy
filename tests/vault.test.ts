@@ -354,6 +354,196 @@ describe("encrypted credential vault", () => {
     });
   });
 
+  it("V07-INT-001 adds exactly one confirmed custodian wrap for the recipient's current key", async () => {
+    const seeded = await seed("vault-add-custodian");
+    const ownerKey = await custodianKey();
+    const memberKey = await custodianKey();
+    await seeded.stub.publishVaultMemberKey({
+      actor: seeded.owner, publicKey: ownerKey.encoded, deviceId: "device-owner",
+      freshUserVerification: true, now: NOW + 2,
+    });
+    await seeded.stub.publishVaultMemberKey({
+      actor: seeded.member, publicKey: memberKey.encoded, deviceId: "device-member",
+      freshUserVerification: true, now: NOW + 2,
+    });
+    const credentialId = "credential-shared-v07";
+    const workspaceId = seeded.stub.id.toString();
+    const encrypted = await encryptVaultValue({
+      workspaceId, credentialId, version: 1, keyEpoch: 1,
+      plaintext: encoder.encode("shared-v07-canary"),
+    });
+    const ownerWrap = await wrapVaultDek({
+      workspaceId, credentialId, version: 1, custodianMemberId: "owner",
+      recipientKeyEpoch: 1, recipientPublicKey: ownerKey.raw, dek: encrypted.dek,
+    });
+    await seeded.stub.createVaultCredential({
+      actor: seeded.owner, idempotencyKey: "vault:v07:add:create", credentialId,
+      metadata: { name: "SHARED_V07", description: "", tags: [], commands: [], proxyHosts: [] },
+      policy: { mode: "ask", allowedDeliveries: ["inject"], projectIds: ["project-a"], highRisk: false },
+      envelope: encrypted.envelope, wraps: [ownerWrap],
+      acl: [
+        { subjectType: "member", subjectId: "owner", verb: "manage" },
+        { subjectType: "member", subjectId: "owner", verb: "use" },
+      ],
+      freshUserVerification: true, localVaultUnlocked: true, now: NOW + 3,
+    });
+    const memberWrap = await wrapVaultDek({
+      workspaceId, credentialId, version: 1, custodianMemberId: "member",
+      recipientKeyEpoch: 1, recipientPublicKey: memberKey.raw, dek: encrypted.dek,
+    });
+
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      await expect(instance.addVaultCustodian({
+        actor: seeded.owner, credentialId, recipientMemberId: "member", wrap: memberWrap,
+        freshUserVerification: true, localVaultUnlocked: true, confirmed: false, now: NOW + 4,
+      })).rejects.toThrow("explicit custodian confirmation");
+      await expect(instance.addVaultCustodian({
+        actor: seeded.owner, credentialId, recipientMemberId: "member",
+        wrap: { ...memberWrap, recipientKeyEpoch: 2 },
+        freshUserVerification: true, localVaultUnlocked: true, confirmed: true, now: NOW + 4,
+      })).rejects.toThrow("current key");
+    });
+    await expect(seeded.stub.addVaultCustodian({
+      actor: seeded.owner, credentialId, recipientMemberId: "member", wrap: memberWrap,
+      freshUserVerification: true, localVaultUnlocked: true, confirmed: true, now: NOW + 5,
+    })).resolves.toMatchObject({ added: true, credential: { version: 1, keyEpoch: 1, policyEpoch: 2 } });
+
+    const released = await seeded.stub.getVaultCredentialCiphertext({
+      actor: seeded.member, credentialId, freshUserVerification: true, localVaultUnlocked: true,
+    });
+    const storedMemberWrap = released.wraps.find((candidate) => candidate.custodianMemberId === "member")!;
+    const memberDek = await unwrapVaultDek({
+      workspaceId, credentialId, version: 1, wrap: storedMemberWrap,
+      recipientPrivateKey: memberKey.privateKey,
+    });
+    expect(decoder.decode(await decryptVaultValue({
+      workspaceId, credentialId, envelope: released.envelope, dek: memberDek,
+    }))).toBe("shared-v07-canary");
+    expect(released.wraps.map((candidate) => candidate.custodianMemberId)).toEqual(["member", "owner"]);
+  });
+
+  it("V07-INT-002 removes a custodian only by atomic re-encryption and invalidates live work", async () => {
+    const seeded = await seed("vault-remove-custodian");
+    const ownerKey = await custodianKey();
+    const memberKey = await custodianKey();
+    await seeded.stub.publishVaultMemberKey({ actor: seeded.owner, publicKey: ownerKey.encoded, deviceId: "device-owner", freshUserVerification: true, now: NOW + 2 });
+    await seeded.stub.publishVaultMemberKey({ actor: seeded.member, publicKey: memberKey.encoded, deviceId: "device-member", freshUserVerification: true, now: NOW + 2 });
+    const credentialId = "credential-remove-v07";
+    const workspaceId = seeded.stub.id.toString();
+    const original = await encryptVaultValue({ workspaceId, credentialId, version: 1, keyEpoch: 1, plaintext: encoder.encode("old-v07-canary") });
+    const ownerWrap = await wrapVaultDek({ workspaceId, credentialId, version: 1, custodianMemberId: "owner", recipientKeyEpoch: 1, recipientPublicKey: ownerKey.raw, dek: original.dek });
+    const memberWrap = await wrapVaultDek({ workspaceId, credentialId, version: 1, custodianMemberId: "member", recipientKeyEpoch: 1, recipientPublicKey: memberKey.raw, dek: original.dek });
+    await seeded.stub.createVaultCredential({
+      actor: seeded.owner, idempotencyKey: "vault:v07:remove:create", credentialId,
+      metadata: { name: "REMOVE_V07", description: "", tags: [], commands: [], proxyHosts: [] },
+      policy: { mode: "ask", allowedDeliveries: ["inject"], projectIds: ["project-a"], grantTtlMs: 60_000, highRisk: false },
+      envelope: original.envelope, wraps: [ownerWrap, memberWrap],
+      acl: [
+        { subjectType: "member", subjectId: "owner", verb: "manage" },
+        { subjectType: "member", subjectId: "member", verb: "manage" },
+        { subjectType: "member", subjectId: "owner", verb: "use" },
+      ],
+      freshUserVerification: true, localVaultUnlocked: true, now: NOW + 3,
+    });
+    await seeded.stub.requestVaultApproval({
+      actor: seeded.owner, credentialIds: [credentialId],
+      device: { id: "device-owner", active: true, ownedByMember: true, signatureVerified: true, nonceFresh: true },
+      origin: { channelId: seeded.channelId, messageId: seeded.messageId },
+      projectId: "project-a", delivery: "inject", reason: "prove cancellation", now: NOW + 4,
+    });
+    await seeded.stub.issueVaultGrant({
+      actor: seeded.owner, credentialId, memberId: "owner", deviceId: "device-owner",
+      projectId: "project-a", delivery: "inject", originChannelId: seeded.channelId,
+      originMessageId: seeded.messageId, expiresAt: NOW + 50_000,
+      approvalVerified: true, freshUserVerification: true, now: NOW + 5,
+    });
+    const replacement = await encryptVaultValue({ workspaceId, credentialId, version: 2, keyEpoch: 2, plaintext: encoder.encode("new-v07-canary") });
+    const replacementOwnerWrap = await wrapVaultDek({ workspaceId, credentialId, version: 2, custodianMemberId: "owner", recipientKeyEpoch: 1, recipientPublicKey: ownerKey.raw, dek: replacement.dek });
+
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      await expect(instance.removeVaultCustodian({
+        actor: seeded.owner, credentialId, removedMemberId: "member",
+        envelope: replacement.envelope, wraps: [replacementOwnerWrap],
+        freshUserVerification: true, localVaultUnlocked: true, confirmed: false, now: NOW + 6,
+      })).rejects.toThrow("explicit custodian confirmation");
+      await expect(instance.removeVaultCustodian({
+        actor: seeded.owner, credentialId, removedMemberId: "owner",
+        envelope: replacement.envelope, wraps: [replacementOwnerWrap],
+        freshUserVerification: true, localVaultUnlocked: true, confirmed: true, now: NOW + 6,
+      })).rejects.toThrow("replacement wraps");
+    });
+    await expect(seeded.stub.removeVaultCustodian({
+      actor: seeded.owner, credentialId, removedMemberId: "member",
+      envelope: replacement.envelope, wraps: [replacementOwnerWrap],
+      freshUserVerification: true, localVaultUnlocked: true, confirmed: true, now: NOW + 7,
+    })).resolves.toMatchObject({
+      credential: { version: 2, keyEpoch: 2, policyEpoch: 2 },
+      revokedGrants: 1,
+      expiredApprovals: 1,
+    });
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      expect(() => instance.getVaultCredentialCiphertext({
+        actor: seeded.member, credentialId, freshUserVerification: true, localVaultUnlocked: true,
+      })).toThrow("vault credential not found");
+    });
+    const stored = await seeded.stub.getVaultCredentialCiphertext({
+      actor: seeded.owner, credentialId, freshUserVerification: true, localVaultUnlocked: true,
+    });
+    expect(stored.wraps.map((candidate) => candidate.custodianMemberId)).toEqual(["owner"]);
+    const openedDek = await unwrapVaultDek({ workspaceId, credentialId, version: 2, wrap: stored.wraps[0], recipientPrivateKey: ownerKey.privateKey });
+    expect(decoder.decode(await decryptVaultValue({ workspaceId, credentialId, envelope: stored.envelope, dek: openedDek }))).toBe("new-v07-canary");
+
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      await expect(instance.removeVaultCustodian({
+        actor: seeded.owner, credentialId, removedMemberId: "owner",
+        envelope: { ...replacement.envelope, version: 3, keyEpoch: 3 }, wraps: [],
+        freshUserVerification: true, localVaultUnlocked: true, confirmed: true, now: NOW + 8,
+      })).rejects.toThrow("final vault custodian");
+    });
+  });
+
+  it("V07-INT-005 rotates a recovered member key only with every current credential rewrapped", async () => {
+    const seeded = await seed("vault-member-key-rotation");
+    const oldKey = await custodianKey();
+    const recoveredKey = await custodianKey();
+    await seeded.stub.publishVaultMemberKey({
+      actor: seeded.owner, publicKey: oldKey.encoded, deviceId: "lost-device",
+      freshUserVerification: true, now: NOW + 2,
+    });
+    const credentialId = "credential-member-rekey-v07";
+    const workspaceId = seeded.stub.id.toString();
+    const encrypted = await encryptVaultValue({ workspaceId, credentialId, version: 1, keyEpoch: 1, plaintext: encoder.encode("member-rekey-canary") });
+    const oldWrap = await wrapVaultDek({ workspaceId, credentialId, version: 1, custodianMemberId: "owner", recipientKeyEpoch: 1, recipientPublicKey: oldKey.raw, dek: encrypted.dek });
+    await seeded.stub.createVaultCredential({
+      actor: seeded.owner, idempotencyKey: "vault:v07:member-rekey:create", credentialId,
+      metadata: { name: "MEMBER_REKEY_V07", description: "", tags: [], commands: [], proxyHosts: [] },
+      policy: { mode: "auto", allowedDeliveries: ["inject"], projectIds: ["project-a"], highRisk: false },
+      envelope: encrypted.envelope, wraps: [oldWrap],
+      acl: [{ subjectType: "member", subjectId: "owner", verb: "manage" }, { subjectType: "member", subjectId: "owner", verb: "use" }],
+      freshUserVerification: true, localVaultUnlocked: true, now: NOW + 3,
+    });
+    const newWrap = await wrapVaultDek({ workspaceId, credentialId, version: 1, custodianMemberId: "owner", recipientKeyEpoch: 2, recipientPublicKey: recoveredKey.raw, dek: encrypted.dek });
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      await expect(instance.rotateVaultMemberKey({
+        actor: seeded.owner, expectedKeyEpoch: 1, publicKey: recoveredKey.encoded,
+        deviceId: "recovered-device", replacements: [], freshUserVerification: true,
+        localVaultUnlocked: true, confirmed: true, now: NOW + 4,
+      })).rejects.toThrow("every current credential wrap");
+      expect(instance.getVaultMemberKeys({ actor: seeded.owner, memberIds: ["owner"] }).keys[0]).toMatchObject({ keyEpoch: 1, publicKey: oldKey.encoded });
+    });
+    await expect(seeded.stub.rotateVaultMemberKey({
+      actor: seeded.owner, expectedKeyEpoch: 1, publicKey: recoveredKey.encoded,
+      deviceId: "recovered-device",
+      replacements: [{ credentialId, credentialVersion: 1, wrap: newWrap }],
+      freshUserVerification: true, localVaultUnlocked: true, confirmed: true, now: NOW + 5,
+    })).resolves.toEqual({ memberId: "owner", keyEpoch: 2, replacedCredentials: 1 });
+    const stored = await seeded.stub.getVaultCredentialCiphertext({ actor: seeded.owner, credentialId, freshUserVerification: true, localVaultUnlocked: true });
+    expect(stored.wraps[0].recipientKeyEpoch).toBe(2);
+    await expect(unwrapVaultDek({ workspaceId, credentialId, version: 1, wrap: stored.wraps[0], recipientPrivateKey: oldKey.privateKey })).rejects.toThrow();
+    const opened = await unwrapVaultDek({ workspaceId, credentialId, version: 1, wrap: stored.wraps[0], recipientPrivateKey: recoveredKey.privateKey });
+    expect(decoder.decode(await decryptVaultValue({ workspaceId, credentialId, envelope: stored.envelope, dek: opened }))).toBe("member-rekey-canary");
+  });
+
   /* -- conversational approvals and the kill switch (V03) ---------------- */
 
   it("VAULT-INT-009 turns an ask into a card in every owner's vault DM and nothing else", async () => {
