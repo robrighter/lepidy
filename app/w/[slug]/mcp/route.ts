@@ -10,6 +10,7 @@ import {
   workspaceResourceUri,
   type SupportedScope,
 } from "@/src/domain/mcp-oauth";
+import { commandHints, mcpInstructions } from "@/src/domain/agent-onboarding";
 import { oauthEnvironment, requestOrigin, resolveWorkspaceBySlug } from "@/src/shell/oauth-server";
 
 export async function GET(request: Request, context: { params: Promise<{ slug: string }> }) {
@@ -42,11 +43,20 @@ export async function POST(request: Request, context: { params: Promise<{ slug: 
           protocolVersion: "2025-06-18",
           capabilities: { tools: {} },
           serverInfo: { name: "lepidy", version: "0.1.0" },
-          instructions: principal.credentialKind === "session"
-            ? `Running @${principal.agentHandle} under @${principal.handle}'s delegation ${principal.delegationId}. ` +
-              "Every tool is limited to this session's capabilities and delegated rooms."
-            : `Connected to Lepidy as @${principal.handle}. Agent tools act only for agents you own; ` +
-              "room reads and writes always use your current membership.",
+          // Layer 1 of the onboarding model: the only text every session pays
+          // for, carrying the authority this connection acts with and the one
+          // vault rule. Everything else is a denial hint, the skill or the
+          // hook, none of which cost anything until they are needed.
+          instructions: mcpInstructions(
+            principal.credentialKind === "session"
+              ? {
+                  kind: "session",
+                  agentHandle: principal.agentHandle,
+                  ownerHandle: principal.handle,
+                  delegationId: principal.delegationId,
+                }
+              : { kind: "oauth", handle: principal.handle },
+          ),
         });
       case "notifications/initialized":
         return new Response(null, { status: 202 });
@@ -300,6 +310,36 @@ async function dispatchTool(
       if (!credential) throw new Error("vault credential not found");
       return { credential: credentialMetadata(credential) };
     }
+    case "credential_hint": {
+      // Which credentials a command needs, and how to write it so the value
+      // never reaches the conversation. Metadata in, metadata out: this reads
+      // the same listing the connection could already read and adds no
+      // authority of its own.
+      const listed = await workspace.listVaultCredentials({ actor, now: Date.now() });
+      const hints = commandHints(
+        args.command as string,
+        listed.credentials.map((credential) => ({
+          id: credential.id,
+          name: credential.name,
+          ...(credential.envVar === undefined ? {} : { envVar: credential.envVar }),
+          commands: credential.commands,
+        })),
+      );
+      return {
+        command: args.command,
+        hints: hints.map((hint) => ({
+          segment: hint.segment,
+          program: hint.program,
+          credentials: hint.credentials,
+          run: hint.rewrite,
+          already_correct: hint.alreadyWrapped,
+        })),
+        note:
+          hints.length === 0
+            ? "No credential this member holds is associated with that command. Run it as written."
+            : "Run the suggested command. The value goes into that child's environment, not into this conversation.",
+      };
+    }
     case "proxy_request": {
       if (principal.credentialKind !== "session") throw new Error("this tool requires an unattended agent session");
       const result = await workspace.requestVaultProxy({
@@ -337,6 +377,11 @@ function credentialMetadata(credential: Awaited<ReturnType<WorkspaceStub["listVa
     proxy_hosts: credential.proxyHosts,
     policy: credential.policy,
     version: credential.version,
+    // Layer 2, in the answer rather than in a manual: the shape of the command
+    // that uses this credential correctly. An agent that has just listed the
+    // vault is exactly the agent about to write the next command.
+    use: `lepidy run --with ${credential.name} -- <command>`,
+    canary: credential.canary,
     last_accessed_at: credential.lastAccessedAt ?? null,
     access_count: credential.accessCount,
   };

@@ -90,6 +90,8 @@ pub fn run(args: &Args) -> CliResult<i32> {
                 policy_projects: Vec::new(),
                 project: &project,
                 password: &password,
+                scannable: !args.flag("no-scan"),
+                canary_marker: None,
             },
         ) {
             Ok(_) => {

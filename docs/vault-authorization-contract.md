@@ -63,7 +63,39 @@ A grant key is `(credential_id, credential_version, policy_epoch, member_id, dev
 
 All affected grants are revoked on credential value/policy/ACL change, workspace agent-access off, member/device/delegation revoke, owner/agent relationship change, project/configuration revision invalidation, vault rotation or explicit revoke. Turning access back on never restores grants.
 
-## 7. Required automated scenarios
+## 7. Leak detection and canaries
+
+**Implemented:** V08, 2026-09-08.
+
+Two detectors, with different authority and different honesty about what they
+find.
+
+A **scan target** is a digest of one credential value, plus its length, computed
+by the trusted client that sealed the value and bound to workspace, credential
+and version. It lets a client answer "does this text contain a credential"
+without the value leaving the vault. It is served only over the signed device
+transport, only to a member who already holds a verb on that credential, and
+only when that credential's client published one. Two limits are normative and
+must be stated wherever the feature is described: it detects an **exact, whole,
+unencoded** value and nothing else, and a digest is a **verifier**, so a
+low-entropy value becomes offline-guessable to anybody who obtains one. Values
+below eight characters never get a target, and a client may withhold one.
+
+A **canary** is a deliberately fake credential whose value is generated on a
+trusted client as a public marker plus a random tag. The marker is stored in
+cleartext metadata, is not a secret, and lets the workspace recognise the value
+in content it already receives without holding a key. A message, MCP tool
+argument or proxied request body carrying a canary marker is **refused before
+the write**, recorded as a durable trip, appended to the audit chain as
+`vault.canary_tripped` with outcome `denied`, and reported to that credential's
+custodians. No body, excerpt or value is stored with the trip. A trip freezes
+nothing: refusing the write is the mitigation, and a canary is never a working
+credential, so a deliberate trip costs nothing.
+
+Neither detector is authorization. Both are evidence, and the ordered decision
+in §1 is unchanged by either.
+
+## 8. Required automated scenarios
 
 1. ACL entries union within a verb, while membership, device, origin, policy and delegation failures each override a match.
 2. An agent cannot combine one owner's channel rights with another owner's credential rights.
@@ -72,3 +104,5 @@ All affected grants are revoked on credential value/policy/ACL change, workspace
 5. Approval first-answer-wins, assertion digest binding, expiry and mixed per-item batch decisions are atomic and restart-safe.
 6. Exact grant tuple matching, exclusive expiry, single-use consumption and every revocation trigger are exercised.
 7. Cloud captures contain no plaintext credential, vault/recovery key, path, command or environment value.
+8. Scan targets reach a member holding a verb on the credential and no other valid member; a rotation replaces the target or clears it; a malformed digest, an under-length value and a duplicate canary marker are refused with no partial row.
+9. A canary in a person's message, an agent's post and a proxy request body is refused before the write, leaves no message or request row, records one trip and one audit entry with no excerpt, and tells the custodians.

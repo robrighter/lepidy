@@ -79,6 +79,44 @@ a person does. `run` also takes `--all-tagged TAG` for a whole tagged group
 under one approval and `--with-template SRC:PATH` to resolve `${lepidy:NAME}`
 placeholders into an owner-only file for the life of one command.
 
+`scan`, `hint`, `hook` and `init` are the leak-prevention and onboarding half.
+`lepidy scan <path|->` reports whether text contains the value of a credential
+this machine knows about — wire it into a `pre-commit` hook. `lepidy hint
+--command "<command>"` names the credentials a command needs and the exact
+`lepidy run` rewrite. `lepidy hook pretooluse` is the Claude Code `PreToolUse`
+hook, and `lepidy init` registers this workspace's MCP server, installs the
+skill and the hook, and reports what it deliberately did not touch.
+
+Those three read a **local advice cache** (`advice.json` in `LEPIDY_HOME`,
+owner-only) written by any authenticated command and refreshed with `--refresh`.
+They have to: a commit hook has no terminal to read a passphrase from and a
+`PreToolUse` hook runs on every Bash call. So their advice can be stale, and
+none of them is a boundary — the workspace's policy engine decides every
+release, over a signed request, every time.
+
+The cache and the workspace hold a **scan target** per credential: a SHA-256
+digest of the value bound to workspace, credential and version, plus its length.
+It finds an exact, whole, unencoded value; a base64'd, escaped or split secret
+goes straight through, and nothing in the product claims otherwise. A digest is
+a verifier, so it is served only to a member who already holds a verb on that
+credential, `lepidy add --no-scan` withholds one, and a value shorter than eight
+characters never gets one.
+
+`lepidy add --canary` creates a **canary**: a deliberately fake value, generated
+locally, never typed and never printed. Its public marker is stored in cleartext
+metadata so the workspace can recognise it, and a message, MCP tool argument or
+proxied request body carrying one is refused before the write, recorded, and
+reported to the credential's custodians as a direct message from `@a.vault`.
+Nothing legitimate ever sends a canary, so one appearing means a credential left
+the injection path.
+
+**The hook is not a security boundary.** It sees only Bash tool calls, it fails
+open on every error, it reads a cache, and it is configuration the agent could
+edit. It exists to teach at the moment of the mistake and to save a wasted turn.
+`plugin/lepidy` holds the skill, the hook registration and the
+[anti-circumvention gate](plugin/lepidy/evals/agent-behavior.md) that proves
+those claims against a real harness process.
+
 The first enrolled custodian also uploads an Argon2id/AES-GCM recovery package;
 the printable recovery code and vault key never leave the CLI. On a replacement
 device, `lepidy recover` downloads that ciphertext, opens it locally, rewraps

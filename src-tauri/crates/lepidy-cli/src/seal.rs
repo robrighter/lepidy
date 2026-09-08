@@ -37,6 +37,12 @@ pub struct CreateRequest<'a> {
     pub project: &'a str,
     /// Creating a credential is a step-up, and this is the evidence for it.
     pub password: &'a str,
+    /// Publish a digest of the value so `lepidy scan` and the hook can
+    /// recognise it in text. A digest is a verifier for that exact value, so
+    /// this is a deliberate choice per credential rather than an assumption.
+    pub scannable: bool,
+    /// The public half of a canary value, when this credential is one.
+    pub canary_marker: Option<String>,
 }
 
 /// Seal the value and create the credential. Returns its id.
@@ -52,6 +58,13 @@ pub fn seal_and_create(session: &Session, request: CreateRequest<'_>) -> CliResu
 
     let credential_id = format!("cred-{}", encode(&random_bytes(16)));
     let workspace_id = session.profile.workspace_id.clone();
+    // Computed before the value is wiped, and only from what is already here:
+    // the workspace never sees a value, so it can never compute one of these.
+    let scan = if request.scannable {
+        crate::advice::scan_target_for(&workspace_id, &credential_id, 1, request.value)
+    } else {
+        None
+    };
     let mut dek = random_bytes(DEK_BYTES);
     let iv = random_bytes(IV_BYTES);
     let ciphertext = aes_gcm_encrypt(
@@ -127,6 +140,12 @@ pub fn seal_and_create(session: &Session, request: CreateRequest<'_>) -> CliResu
     });
     if let Some(captured_from) = request.captured_from {
         body["capturedFrom"] = json!(captured_from);
+    }
+    if let Some(scan) = scan {
+        body["scan"] = scan;
+    }
+    if let Some(marker) = &request.canary_marker {
+        body["canaryMarker"] = json!(marker);
     }
 
     let response = session.client.post_signed(

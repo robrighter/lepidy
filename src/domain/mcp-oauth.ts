@@ -801,6 +801,7 @@ export type McpToolName =
   | "agent_set_prompt"
   | "list_credentials"
   | "describe_credential"
+  | "credential_hint"
   | "proxy_request";
 
 export type McpToolDefinition = {
@@ -995,17 +996,31 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   },
   {
     name: "list_credentials",
-    description: "List metadata for credentials available in the current member or delegated-agent context. Values and key wraps are never returned.",
+    description:
+      "List metadata for credentials available in the current member or delegated-agent context. Values and key wraps are never returned; each entry carries the `lepidy run --with` command that uses it. Call this before assuming a credential is missing, and never ask a person to paste one.",
     inputSchema: objectSchema({ channel_id: string("Optional visible origin room id") }),
     requiredScope: "vault",
     sessionCapable: true,
   },
   {
     name: "describe_credential",
-    description: "Describe one available credential's policy and supported use without returning its value, ciphertext, or key wraps.",
+    description:
+      "Describe one available credential's policy and supported use without returning its value, ciphertext, or key wraps. A refusal here is the configured answer: report it and stop rather than looking for the value elsewhere.",
     inputSchema: objectSchema({ credential_id: string("Credential id"), channel_id: string("Optional visible origin room id") }, ["credential_id"]),
     requiredScope: "vault",
     sessionCapable: true,
+  },
+  {
+    name: "credential_hint",
+    description:
+      "Ask which stored credentials a shell command needs and how to run it so the value reaches the child process instead of this conversation. Returns names and a command to run, never a value.",
+    inputSchema: objectSchema({ command: string("The shell command you are about to run", 2000) }, ["command"]),
+    requiredScope: "vault",
+    // Not a session capability. An unattended harness gets the same advice from
+    // `lepidy hint` and the PreToolUse hook on the machine it runs on, and a
+    // session that could enumerate the vault would be a wider session than the
+    // harness contract describes.
+    sessionCapable: false,
   },
   {
     name: "proxy_request",

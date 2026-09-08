@@ -10,7 +10,9 @@
 //! else. Adding a second custodian means an existing unlocked client sealing the
 //! DEK for them, which is V07's device and sharing work.
 
+use crate::advice::CANARY_PREFIX;
 use crate::args::Args;
+use crate::crypto::random_bytes;
 use crate::error::{CliError, CliResult};
 use crate::login::assert_identifier;
 use crate::prompt::read_secret;
@@ -77,8 +79,24 @@ pub fn run(args: &Args) -> CliResult<i32> {
         Some(value) => Some(parse_rotate_at(value)?),
     };
 
+    let canary = args.flag("canary");
+    if canary && kind == "structured" {
+        return Err(CliError::usage(
+            "a canary is one opaque value, not a structured record",
+        ));
+    }
+
     let password = read_secret("account password")?;
-    let mut value = read_secret(&format!("value for {name}"))?;
+    // A canary is generated here and never asked for, because a canary somebody
+    // typed is a canary somebody has a copy of. It is never printed either: its
+    // whole purpose is to sit in the vault looking real until something steals
+    // it, and a value on a terminal is a value in a scrollback buffer.
+    let (mut value, canary_marker) = if canary {
+        let tag = canary_tag();
+        (canary_value(&tag), Some(format!("{CANARY_PREFIX}{tag}")))
+    } else {
+        (read_secret(&format!("value for {name}"))?, None)
+    };
     if kind == "structured" {
         // A structured value is one JSON object carrying every field, so the
         // five parts of a database credential rotate together instead of four
@@ -115,10 +133,20 @@ pub fn run(args: &Args) -> CliResult<i32> {
             policy_projects: project_ids,
             project: &project,
             password: &password,
+            // A canary is always scannable: recognising it is the entire point,
+            // and it is worthless, so a verifier for it discloses nothing.
+            scannable: canary || !args.flag("no-scan"),
+            canary_marker: canary_marker.clone(),
         },
     )?;
 
     println!("Added {name} as {credential_id}.");
+    if canary {
+        println!("This is a canary: a deliberately fake value that exists to be stolen.");
+        println!("It was not printed, and nothing legitimate will ever use it. If it turns up");
+        println!("in a message, a tool argument or a proxied request, that write is refused");
+        println!("and its custodians are told.");
+    }
     println!("Policy: {mode}; deliveries: {}.", deliveries.join(", "));
     if kind == "structured" {
         println!(
@@ -132,6 +160,39 @@ pub fn run(args: &Args) -> CliResult<i32> {
     }
     println!("You are its only custodian: no other member's client can open it yet.");
     Ok(0)
+}
+
+/// The alphabet a canary uses: lowercase alphanumerics, so the value survives a
+/// shell, a URL and a JSON document unchanged and is found wherever it lands.
+const CANARY_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+fn canary_chars(count: usize) -> String {
+    // Rejection sampling: 36 does not divide 256, so a plain modulo would make
+    // the first sixteen characters of the alphabet slightly likelier. Bytes at
+    // or above the largest multiple of 36 are discarded and drawn again, which
+    // keeps every character uniform.
+    let mut out = String::with_capacity(count);
+    let limit = 252u8; // 36 * 7
+    while out.len() < count {
+        for byte in random_bytes(count) {
+            if byte >= limit {
+                continue;
+            }
+            out.push(CANARY_ALPHABET[(byte % 36) as usize] as char);
+            if out.len() == count {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn canary_tag() -> String {
+    canary_chars(12)
+}
+
+fn canary_value(tag: &str) -> String {
+    format!("{CANARY_PREFIX}{tag}-{}", canary_chars(32))
 }
 
 /// An ISO date, because a rotation nag people cannot read is one they ignore.
@@ -170,7 +231,7 @@ fn is_credential_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_credential_name;
+    use super::*;
 
     /// VAULT-CLI-RULE-023
     #[test]
@@ -181,5 +242,26 @@ mod tests {
         assert!(!is_credential_name("1TOKEN"));
         assert!(!is_credential_name("API-TOKEN"));
         assert!(!is_credential_name(""));
+    }
+
+    /// VAULT-CLI-RULE-070
+    #[test]
+    fn a_canary_is_the_exact_shape_the_workspace_recognises() {
+        let tag = canary_tag();
+        assert_eq!(tag.len(), 12);
+        assert!(tag
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        let value = canary_value(&tag);
+        assert_eq!(
+            value,
+            format!(
+                "{CANARY_PREFIX}{tag}-{}",
+                &value[CANARY_PREFIX.len() + 13..]
+            )
+        );
+        assert_eq!(value.len(), CANARY_PREFIX.len() + 12 + 1 + 32);
+        // Two canaries are never the same one.
+        assert_ne!(canary_tag(), canary_tag());
     }
 }

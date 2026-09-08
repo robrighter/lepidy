@@ -56,6 +56,11 @@ export async function POST(request: Request) {
       // workspace stores it switched off until a custodian has seen it, which
       // is what makes a write path an agent can reach safe to have.
       ...(typeof body.capturedFrom === "string" ? { capturedFrom: body.capturedFrom } : {}),
+      // Seal-time leak-detection facts, both computed by the client that
+      // encrypted the value. The workspace validates their shape and stores
+      // them; it cannot produce either, because producing one needs the value.
+      ...(body.scan === undefined ? {} : { scan: body.scan as { digest: string; length: number } }),
+      ...(typeof body.canaryMarker === "string" ? { canaryMarker: body.canaryMarker } : {}),
       freshUserVerification: true,
       localVaultUnlocked: true,
       now: Date.now(),

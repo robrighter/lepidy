@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lepidy hook pretooluse",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

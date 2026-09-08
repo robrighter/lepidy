@@ -1273,3 +1273,442 @@ fn vault_cli_int_020_a_structured_credential_expands_into_its_fields() {
     );
     assert!(text(&unscrubbed.stdout).contains("PROBE_TOKEN_HOST=db.example.test"));
 }
+
+/// VAULT-CLI-INT-024 — `scan` finds a whole value through the compiled binary,
+/// says what it cannot find, and needs no passphrase once a cache exists.
+#[test]
+fn vault_cli_int_024_scan_finds_a_seeded_value_and_is_honest_about_its_limits() {
+    let double = Double::start();
+    let home = TempHome::create("scan");
+    assert!(login(&home, &double).status.success());
+    double.with_state(|state| {
+        state.credentials = vec![credential_metadata()];
+        state.scan_targets = vec![scan_target(CREDENTIAL_ID, CREDENTIAL_NAME, CANARY)];
+    });
+
+    // The refresh is the one step that authenticates. Everything after it reads
+    // the cache, because a `pre-commit` hook has no terminal to read from.
+    let refreshed = cli(
+        &home,
+        &["hint", "--refresh", "--command", "true"],
+        &[PASSPHRASE],
+    );
+    assert!(
+        refreshed.status.success(),
+        "refresh failed: {}",
+        text(&refreshed.stderr)
+    );
+
+    let dirty = home.path.join("leak.txt");
+    std::fs::write(&dirty, format!("export TOKEN={CANARY}\n")).expect("a file");
+    let found = cli(&home, &["scan", dirty.to_str().unwrap()], &[]);
+    assert_eq!(found.status.code(), Some(1));
+    let reported = text(&found.stderr);
+    assert!(reported.contains("STOP"), "{reported}");
+    assert!(reported.contains(CREDENTIAL_NAME), "{reported}");
+    assert!(reported.contains("lepidy run --with"), "{reported}");
+    // The scanner names the credential; it never quotes what it found.
+    assert_absent(&reported, CANARY, "the scan report");
+    assert_absent(&text(&found.stdout), CANARY, "the scan report");
+
+    // Standard input, which is how a commit hook actually calls it.
+    let piped = cli(
+        &home,
+        &["scan", "-", "--quiet"],
+        &[&format!("prefix {CANARY} suffix")],
+    );
+    assert_eq!(piped.status.code(), Some(1));
+    assert_eq!(text(&piped.stdout).trim(), CREDENTIAL_NAME);
+
+    // Clean text passes, and the message states the documented limit rather
+    // than implying the file has been proved safe.
+    let clean = home.path.join("clean.txt");
+    std::fs::write(&clean, "nothing interesting at all\n").expect("a file");
+    let ok = cli(&home, &["scan", clean.to_str().unwrap()], &[]);
+    assert_eq!(ok.status.code(), Some(0));
+    assert!(text(&ok.stdout).contains("clean:"));
+    assert!(
+        text(&ok.stdout).contains("not detected"),
+        "{}",
+        text(&ok.stdout)
+    );
+
+    // An encoded value is the limit, asserted rather than assumed.
+    let encoded = home.path.join("encoded.txt");
+    let base64ish: String = CANARY.bytes().map(|byte| format!("{byte:02x}")).collect();
+    std::fs::write(&encoded, base64ish).expect("a file");
+    assert_eq!(
+        cli(&home, &["scan", encoded.to_str().unwrap()], &[])
+            .status
+            .code(),
+        Some(0)
+    );
+
+    // The cache holds the facts advice needs and nothing that opens a value.
+    let cached = std::fs::read_to_string(home.path.join("advice.json")).expect("a cache");
+    assert_absent(&cached, CANARY, "the advice cache");
+    assert_absent(&cached, PASSPHRASE, "the advice cache");
+    assert!(!cached.contains("wrappedDek"));
+    assert!(!cached.contains("ciphertext"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(home.path.join("advice.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the advice cache must be owner-only");
+    }
+}
+
+/// VAULT-CLI-INT-025 — with no cache at all, `scan` fails open and says so.
+#[test]
+fn vault_cli_int_025_scan_without_a_cache_fails_open() {
+    let home = TempHome::create("scan-empty");
+    let output = cli(&home, &["scan", "-"], &["anything at all"]);
+    // A commit hook that refused every commit because a cache was missing would
+    // be deleted within a day, and then it protects nothing.
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        text(&output.stderr).contains("nothing was checked"),
+        "{}",
+        text(&output.stderr)
+    );
+}
+
+/// VAULT-CLI-INT-026 — `hint` names the credentials a command needs and the
+/// exact rewrite, from the cache, with no value anywhere.
+#[test]
+fn vault_cli_int_026_hint_answers_from_the_cache() {
+    let double = Double::start();
+    let home = TempHome::create("hint");
+    assert!(login(&home, &double).status.success());
+    let mut metadata = credential_metadata();
+    metadata["commands"] = serde_json::json!(["housectl"]);
+    double.with_state(|state| {
+        state.credentials = vec![metadata];
+        state.scan_targets = vec![scan_target(CREDENTIAL_ID, CREDENTIAL_NAME, CANARY)];
+    });
+    assert!(cli(
+        &home,
+        &["hint", "--refresh", "--command", "true"],
+        &[PASSPHRASE]
+    )
+    .status
+    .success());
+
+    let hinted = cli(&home, &["hint", "--command", "housectl deploy"], &[]);
+    assert_eq!(hinted.status.code(), Some(0));
+    let printed = text(&hinted.stdout);
+    assert!(
+        printed.contains(&format!(
+            "lepidy run --with {CREDENTIAL_NAME} -- housectl deploy"
+        )),
+        "{printed}"
+    );
+    assert_absent(&printed, CANARY, "the hint output");
+
+    let json = cli(
+        &home,
+        &["hint", "--command", "housectl deploy", "--json"],
+        &[],
+    );
+    let parsed: Value = serde_json::from_str(&text(&json.stdout)).expect("JSON");
+    assert_eq!(parsed["hints"][0]["credentials"][0], CREDENTIAL_NAME);
+    assert_eq!(parsed["hints"][0]["alreadyCorrect"], false);
+
+    // A command needing nothing gets no advice, which is what keeps this
+    // surface bearable.
+    let quiet = cli(&home, &["hint", "--command", "cargo test"], &[]);
+    assert!(text(&quiet.stdout).contains("No credential"));
+
+    // A correct command is reported as correct rather than coached.
+    let correct = cli(
+        &home,
+        &[
+            "hint",
+            "--command",
+            &format!("lepidy run --with {CREDENTIAL_NAME} -- housectl deploy"),
+            "--json",
+        ],
+        &[],
+    );
+    let parsed: Value = serde_json::from_str(&text(&correct.stdout)).expect("JSON");
+    assert_eq!(parsed["hints"][0]["alreadyCorrect"], true);
+}
+
+/// VAULT-CLI-INT-027 — the `PreToolUse` hook, through the compiled binary:
+/// paired allow and block for every rule, and fail-open on anything odd.
+#[test]
+fn vault_cli_int_027_the_hook_blocks_and_allows_the_documented_cases() {
+    let double = Double::start();
+    let home = TempHome::create("hook");
+    assert!(login(&home, &double).status.success());
+    let mut metadata = credential_metadata();
+    metadata["commands"] = serde_json::json!(["housectl"]);
+    double.with_state(|state| {
+        state.credentials = vec![metadata];
+        state.scan_targets = vec![scan_target(CREDENTIAL_ID, CREDENTIAL_NAME, CANARY)];
+    });
+    assert!(cli(
+        &home,
+        &["hint", "--refresh", "--command", "true"],
+        &[PASSPHRASE]
+    )
+    .status
+    .success());
+
+    let hook = |command: &str| {
+        let payload =
+            serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": command } });
+        cli(&home, &["hook", "pretooluse"], &[&payload.to_string()])
+    };
+
+    // Blocked: a value in argv, printing an injected variable, a bare env dump,
+    // a credential file, and a command that needs a credential.
+    for (command, expected) in [
+        (
+            format!("curl -H 'Authorization: {CANARY}'"),
+            "argv is readable",
+        ),
+        (format!("echo ${CREDENTIAL_NAME}"), "transcript"),
+        ("env".to_string(), "Dumping the environment"),
+        (
+            "cat ~/.aws/credentials".to_string(),
+            "do not read them from",
+        ),
+        ("housectl deploy".to_string(), "lepidy run --with"),
+    ] {
+        let output = hook(&command);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{command} should have been blocked"
+        );
+        let said = text(&output.stderr);
+        assert!(said.contains(expected), "{command}: {said}");
+        // The coaching never repeats the value it is complaining about.
+        assert_absent(&said, CANARY, "the hook's message");
+    }
+
+    // Allowed: the correct command, ordinary work, and a template file that
+    // exists to be read. False coaching is what makes somebody switch this off.
+    for command in [
+        format!("lepidy run --with {CREDENTIAL_NAME} -- housectl deploy"),
+        "cargo test".to_string(),
+        "cat README.md".to_string(),
+        "cat .env.example".to_string(),
+        "env FOO=1 ls".to_string(),
+    ] {
+        let output = hook(&command);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{command} should have been allowed: {}",
+            text(&output.stderr)
+        );
+    }
+
+    // Fails open on anything it does not understand, including another tool.
+    for raw in [
+        "not json".to_string(),
+        serde_json::json!({ "tool_name": "Read", "tool_input": { "file_path": ".env" } })
+            .to_string(),
+        "{}".to_string(),
+    ] {
+        let output = cli(&home, &["hook", "pretooluse"], &[&raw]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{raw} should have been allowed"
+        );
+    }
+
+    // With no cache at all every rule that depends on one is silent, and the
+    // hook still allows. That is the fail-open path a wedged machine takes.
+    let bare = TempHome::create("hook-bare");
+    let payload =
+        serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "housectl deploy" } });
+    assert_eq!(
+        cli(&bare, &["hook", "pretooluse"], &[&payload.to_string()])
+            .status
+            .code(),
+        Some(0),
+    );
+}
+
+/// VAULT-CLI-INT-028 — `add --canary` generates the value locally, never prints
+/// or transmits it, and publishes only the public marker.
+#[test]
+fn vault_cli_int_028_a_canary_is_generated_locally_and_never_shown() {
+    let double = Double::start();
+    let home = TempHome::create("canary");
+    assert!(login(&home, &double).status.success());
+
+    let output = cli(
+        &home,
+        &[
+            "add",
+            "TRAP_TOKEN",
+            "--canary",
+            "--description",
+            "A tripwire",
+        ],
+        // Only the passphrase and the account password: a canary is never typed.
+        &[PASSPHRASE, ACCOUNT_PASSWORD],
+    );
+    assert!(
+        output.status.success(),
+        "add failed: {}",
+        text(&output.stderr)
+    );
+    let printed = text(&output.stdout);
+    assert!(printed.contains("This is a canary"), "{printed}");
+    assert!(
+        !printed.contains("lpdy-canary-"),
+        "the value must never be printed: {printed}"
+    );
+
+    let sent = double.with_state(|state| state.bodies("/api/device/vault/credentials"));
+    let body: Value = serde_json::from_slice(&sent[0]).expect("a JSON body");
+    let marker = body["canaryMarker"].as_str().expect("a canary marker");
+    assert!(marker.starts_with("lpdy-canary-"));
+    assert_eq!(marker.len(), "lpdy-canary-".len() + 12);
+    // The marker is public; the value it belongs to is inside the ciphertext
+    // and nowhere else in the request.
+    let raw = String::from_utf8_lossy(&sent[0]).to_string();
+    assert_eq!(raw.matches(marker).count(), 1);
+    assert!(
+        body["scan"]["digest"].is_string(),
+        "a canary is always scannable"
+    );
+
+    // Two canaries are never the same one.
+    let second = cli(
+        &home,
+        &["add", "OTHER_TRAP", "--canary"],
+        &[PASSPHRASE, ACCOUNT_PASSWORD],
+    );
+    assert!(second.status.success());
+    let bodies = double.with_state(|state| state.bodies("/api/device/vault/credentials"));
+    let other: Value = serde_json::from_slice(&bodies[1]).expect("a JSON body");
+    assert_ne!(body["canaryMarker"], other["canaryMarker"]);
+}
+
+/// VAULT-CLI-INT-029 — a canary is recognised by `scan` and by the hook from
+/// its public marker alone, wherever it turns up.
+#[test]
+fn vault_cli_int_029_a_canary_is_found_by_its_marker() {
+    let double = Double::start();
+    let home = TempHome::create("canary-scan");
+    assert!(login(&home, &double).status.success());
+    let marker = "lpdy-canary-abcdefabcdef";
+    let value = format!("{marker}-0123456789abcdef0123456789abcdef");
+    let mut metadata = credential_metadata();
+    metadata["id"] = serde_json::json!("cred-trap");
+    metadata["name"] = serde_json::json!("TRAP_TOKEN");
+    double.with_state(|state| {
+        state.credentials = vec![metadata];
+        state.scan_targets = vec![canary_target("cred-trap", "TRAP_TOKEN", marker)];
+    });
+    assert!(cli(
+        &home,
+        &["hint", "--refresh", "--command", "true"],
+        &[PASSPHRASE]
+    )
+    .status
+    .success());
+
+    let found = cli(
+        &home,
+        &["scan", "-", "--quiet"],
+        &[&format!("Authorization: Bearer {value}")],
+    );
+    assert_eq!(found.status.code(), Some(1));
+    assert_eq!(text(&found.stdout).trim(), "TRAP_TOKEN");
+
+    // No canary, no report — the marker is what makes this exact rather than a
+    // guess, and it does not occur by accident.
+    let clean = cli(
+        &home,
+        &["scan", "-", "--quiet"],
+        &["Authorization: Bearer ghp_something_else"],
+    );
+    assert_eq!(clean.status.code(), Some(0));
+}
+
+/// VAULT-CLI-INT-030 — `init` writes only what it understands and reports the
+/// rest, and never rewrites configuration somebody else owns.
+#[test]
+fn vault_cli_int_030_init_writes_what_it_understands_and_says_the_rest() {
+    let double = Double::start();
+    let home = TempHome::create("init");
+    assert!(login(&home, &double).status.success());
+
+    let project = TempHome::create("init-project");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lepidy"))
+        .args(["init"])
+        .env("LEPIDY_HOME", &home.path)
+        .current_dir(&project.path)
+        .output()
+        .expect("the lepidy binary");
+    let printed = text(&output.stdout);
+    assert!(printed.contains(WORKSPACE_SLUG), "{printed}");
+
+    // The MCP entry names this workspace's endpoint, and only that.
+    let mcp = std::fs::read_to_string(project.path.join(".mcp.json")).expect("an mcp config");
+    assert!(mcp.contains(&format!("/w/{WORKSPACE_SLUG}/mcp")), "{mcp}");
+    assert!(mcp.contains("\"type\": \"http\""), "{mcp}");
+
+    // The skill and the hook are installed from the binary itself, so they can
+    // never be a different version from the CLI they document.
+    let skill = std::fs::read_to_string(project.path.join(".claude/skills/lepidy/SKILL.md"))
+        .expect("a skill");
+    assert!(skill.contains("Never ask for a credential's value"));
+    assert!(skill.contains("A denial is an answer"));
+    let hooks =
+        std::fs::read_to_string(project.path.join(".claude/settings.json")).expect("hook settings");
+    assert!(hooks.contains("lepidy hook pretooluse"));
+
+    // Re-running is safe and boring.
+    let again = std::process::Command::new(env!("CARGO_BIN_EXE_lepidy"))
+        .args(["init"])
+        .env("LEPIDY_HOME", &home.path)
+        .current_dir(&project.path)
+        .output()
+        .expect("the lepidy binary");
+    let repeated = text(&again.stdout);
+    assert!(repeated.contains("already lists lepidy"), "{repeated}");
+    assert!(repeated.contains("already current"), "{repeated}");
+    assert!(repeated.contains("already registered"), "{repeated}");
+
+    // Somebody else's settings are described, never replaced.
+    let other = TempHome::create("init-other");
+    std::fs::create_dir_all(other.path.join(".claude")).expect("a directory");
+    std::fs::write(
+        other.path.join(".claude/settings.json"),
+        "{\"permissions\":{}}",
+    )
+    .expect("a file");
+    std::fs::write(
+        other.path.join(".mcp.json"),
+        "{\"mcpServers\":{\"other\":{}}}",
+    )
+    .expect("a file");
+    let cautious = std::process::Command::new(env!("CARGO_BIN_EXE_lepidy"))
+        .args(["init"])
+        .env("LEPIDY_HOME", &home.path)
+        .current_dir(&other.path)
+        .output()
+        .expect("the lepidy binary");
+    let said = text(&cautious.stdout);
+    assert!(said.contains("left alone"), "{said}");
+    assert_eq!(
+        std::fs::read_to_string(other.path.join(".claude/settings.json")).unwrap(),
+        "{\"permissions\":{}}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(other.path.join(".mcp.json")).unwrap(),
+        "{\"mcpServers\":{\"other\":{}}}"
+    );
+}

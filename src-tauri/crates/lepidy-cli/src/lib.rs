@@ -10,13 +10,17 @@
 //! disposable local double.
 
 pub mod add;
+pub mod advice;
 pub mod args;
 pub mod capture;
 pub mod client;
 pub mod crypto;
 pub mod envfile;
 pub mod error;
+pub mod hint;
+pub mod hook;
 pub mod import;
+pub mod init;
 pub mod list;
 pub mod login;
 pub mod profile;
@@ -26,6 +30,7 @@ pub mod recover;
 pub mod recovery;
 pub mod rotate;
 pub mod run;
+pub mod scan;
 pub mod scrub;
 pub mod seal;
 pub mod session;
@@ -43,7 +48,7 @@ lepidy — local credential injection for Lepidy workspaces
   lepidy list [--json] [--project ID]
       Credential metadata this member can see. Never a value.
 
-  lepidy add NAME [--description TEXT] [--env-var VAR] [--mode ask|auto|never]
+  lepidy add NAME [--canary] [--no-scan] [--description TEXT] [--env-var VAR] [--mode ask|auto|never]
              [--delivery inject,file] [--tag T] [--command C] [--proxy-host H]
              [--policy-project ID] [--high-risk] [--kind opaque|structured]
              [--field NAME] [--rotate-at YYYY-MM-DD]
@@ -51,6 +56,11 @@ lepidy — local credential injection for Lepidy workspaces
       password and the value, in that order. The value is encrypted here.
       A structured credential's value is one JSON object carrying every named
       field, and injects as NAME_FIELD for each of them.
+      --canary generates a deliberately fake value that exists to be stolen: it
+      is never asked for, never printed, and sending it anywhere Lepidy can see
+      is refused and reported to its custodians.
+      --no-scan withholds the digest that lets `lepidy scan` recognise the value
+      in text. A digest is a verifier, so a low-entropy value is safer without.
 
   lepidy capture NAME [--description TEXT] [--tag T] -- COMMAND...
       Run a command and store its standard output as a new credential, without
@@ -82,8 +92,28 @@ lepidy — local credential injection for Lepidy workspaces
       --with-template renders ${lepidy:NAME} placeholders from SRC into an
       owner-only PATH that is removed when the command exits.
 
+  lepidy scan PATH|- [--refresh] [--quiet]
+      Report whether text contains the value of a credential this machine knows
+      about. Compares digests, never values, and finds a whole unencoded value
+      only. Wire it into a `pre-commit` hook. Reads a local cache, so it needs
+      no passphrase; --refresh rebuilds that cache and does.
+
+  lepidy hint --command \"<command>\" [--json] [--refresh]
+      Which credentials that command needs, and how to run it so the value goes
+      to the child process instead of an agent's context.
+
+  lepidy hook pretooluse
+      The Claude Code PreToolUse hook, reading its JSON on standard input. It is
+      advice and never a boundary: it sees Bash calls only, it fails open, and
+      the workspace's policy engine is what actually decides.
+
+  lepidy init [--global] [--force]
+      Register this workspace's MCP server with Claude Code, install the skill
+      and the hook, and report what it deliberately did not touch.
+
 Exit codes: 0 or the command's own; 77 refused; 78 needs a human's approval;
-2 usage; 1 failure.
+2 usage; 1 failure. `lepidy scan` exits 1 when it finds something, and `lepidy
+hook` exits 2 to stop a command, which is what Claude Code reads.
 
 No option anywhere accepts a credential value, a password or a passphrase:
 command lines are readable by other processes and are captured by harness logs.

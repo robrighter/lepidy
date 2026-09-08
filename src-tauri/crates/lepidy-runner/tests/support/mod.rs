@@ -85,6 +85,13 @@ pub struct DoubleState {
     /// Bearer tokens seen on MCP calls, so a scenario can prove one session
     /// served many runs rather than several that merely look alike.
     pub bearers: Vec<String>,
+    /// Content the workspace refuses to post. Set by the scenario rather than
+    /// modelled here: this double implements the transport, and the rule that
+    /// decides a canary has its own suite against a real Durable Object.
+    pub refuse_post_containing: Option<String>,
+    /// What `list_credentials` answers with, so a scenario can prove a listing
+    /// carries metadata and never a value.
+    pub credentials: Vec<Value>,
 }
 
 impl DoubleState {
@@ -291,15 +298,33 @@ fn mcp_result(state: &mut DoubleState, name: &str, arguments: &Value) -> (u16, V
         }
         "agent_start" => json!({ "started": true }),
         "agent_post" => {
-            state.posts.push(
-                arguments
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            );
+            let content = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if let Some(refused) = state.refuse_post_containing.clone() {
+                if content.contains(&refused) {
+                    // Refused before anything is recorded, which is what the
+                    // workspace's own tripwire does: the write never happens,
+                    // so `posts` stays clean and a scenario can assert on it.
+                    return (
+                        200,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": {
+                                "isError": true,
+                                "content": [{ "type": "text", "text": "This write contains TRAP_TOKEN, which is a canary credential. It was refused." }],
+                            },
+                        }),
+                    );
+                }
+            }
+            state.posts.push(content);
             json!({ "messageId": "message-1" })
         }
+        "list_credentials" => json!({ "credentials": state.credentials }),
         "agent_complete" => {
             if let Some(item_id) = arguments.get("item_id").and_then(Value::as_str) {
                 state.claimed.retain(|claimed| claimed != item_id);
@@ -307,7 +332,19 @@ fn mcp_result(state: &mut DoubleState, name: &str, arguments: &Value) -> (u16, V
             }
             json!({ "completed": true })
         }
-        _ => json!({}),
+        // A tool nobody defined is refused at the protocol level, the way the
+        // real endpoint refuses one: there is no configuration that turns an
+        // invented `request_secret` into a working call.
+        other => {
+            return (
+                200,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": { "code": -32602, "message": format!("unknown tool {other}") },
+                }),
+            )
+        }
     };
     (
         200,
@@ -786,6 +823,44 @@ fn command(home: &TempHome, arguments: &[&str]) -> Child {
 /// The reference harness a preset points at.
 pub fn harness_binary() -> &'static str {
     env!("CARGO_BIN_EXE_lepidy-harness-reference")
+}
+
+/// The harness that tries every documented circumvention move instead of doing
+/// the work. Compiled by the same build, launched by the same daemon.
+pub fn adversary_binary() -> &'static str {
+    env!("CARGO_BIN_EXE_lepidy-harness-adversary")
+}
+
+/// The credential CLI, which the adversary invokes for the hook and the
+/// scanner exactly as a real harness on a real machine would.
+///
+/// `CARGO_BIN_EXE_*` only covers this package's own binaries, and `lepidy`
+/// belongs to the CLI crate, so it is found next to this test binary instead —
+/// and built if a narrower `cargo test -p lepidy-runner` did not build it. The
+/// workspace-wide run the gate uses always has it already.
+pub fn cli_binary() -> PathBuf {
+    let name = if cfg!(windows) {
+        "lepidy.exe"
+    } else {
+        "lepidy"
+    };
+    let mut path = std::env::current_exe().expect("the test binary");
+    path.pop();
+    path.pop();
+    path.push(name);
+    if !path.exists() {
+        let built = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .args(["build", "-p", "lepidy-cli", "--bin", "lepidy"])
+            .status()
+            .expect("cargo");
+        assert!(built.success(), "the lepidy binary could not be built");
+    }
+    assert!(
+        path.exists(),
+        "the lepidy binary is missing at {}",
+        path.display()
+    );
+    path
 }
 
 pub fn text(output: &[u8]) -> String {

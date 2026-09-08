@@ -1,0 +1,9 @@
+{
+  "name": "lepidy",
+  "version": "0.1.0",
+  "description": "Use credentials held in Lepidy without putting their values into the conversation.",
+  "author": {
+    "name": "Lepidy"
+  },
+  "hooks": "./hooks/hooks.json"
+}

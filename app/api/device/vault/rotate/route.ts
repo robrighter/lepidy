@@ -47,6 +47,10 @@ export async function POST(request: Request) {
       policy: current.credential.policy,
       envelope: body.envelope as VaultCiphertextEnvelope,
       wraps: body.wraps as readonly VaultKeyWrap[],
+      // A new value is a new digest. The client sends one or the stored target
+      // is cleared: a target still describing the value this rotation replaced
+      // would report the old secret as live and miss the new one.
+      ...(body.scan === undefined ? {} : { scan: body.scan as { digest: string; length: number } }),
       // Custodianship is unchanged by a rotation: the same people manage it,
       // and the wraps the client sent must match them exactly.
       acl: [

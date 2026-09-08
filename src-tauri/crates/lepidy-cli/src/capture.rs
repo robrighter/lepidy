@@ -128,6 +128,8 @@ pub fn run(args: &Args) -> CliResult<i32> {
             policy_projects: args.list("policy-project"),
             project: &session.project(args.option("project")),
             password: &password,
+            scannable: !args.flag("no-scan"),
+            canary_marker: None,
         },
     )?;
 

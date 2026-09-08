@@ -132,6 +132,12 @@ import {
   parseAgentBrief,
   type BriefTier,
 } from "../domain/agent-preamble";
+import {
+  canaryRefusalHint,
+  findCanaryMarkers,
+  normalizeCanaryMarker,
+  normalizeScanTarget,
+} from "../domain/vault-canary";
 import { commandMessageBody, parseComposerInput } from "../domain/slash-commands";
 import { parseAgentHandle } from "../domain/mention-handle";
 import {
@@ -413,6 +419,12 @@ export type ActiveMember = {
 export type VaultCredentialSummary = VaultCredentialMetadata & {
   id: string;
   policy: VaultPolicy;
+  /**
+   * A deliberately fake value that exists to be stolen (PRD §8.8). Said out
+   * loud in every listing, because a person looking at the vault should never
+   * wonder whether a credential is the real one.
+   */
+  canary: boolean;
   version: number;
   keyEpoch: number;
   policyEpoch: number;
@@ -420,6 +432,21 @@ export type VaultCredentialSummary = VaultCredentialMetadata & {
   updatedAt: number;
   lastAccessedAt?: number;
   accessCount: number;
+};
+
+/**
+ * One credential's leak-detection facts, as a client receives them.
+ *
+ * `digest` and `length` are absent when the client that sealed the value chose
+ * not to publish a verifier, or the value was too short for one to be worth
+ * having. `canaryMarker` is present only for a canary and is not a secret.
+ */
+export type VaultScanTarget = {
+  credentialId: string;
+  name: string;
+  digest: string | null;
+  length: number | null;
+  canaryMarker: string | null;
 };
 
 export type VaultMemberKey = {
@@ -689,6 +716,7 @@ type VaultCredentialRow = {
   frozen_at: number | null; frozen_by_member_id: string | null;
   kind: VaultCredentialKind; fields_json: string; rotate_at: number | null;
   frozen_reason: "switched_off" | "awaiting_capture_review" | null; captured_from: string | null;
+  scan_digest: string | null; scan_length: number | null; canary_marker: string | null;
 };
 
 export type CreatedChannel = { channelId: string; kind: ChannelKind; created: boolean };
@@ -2210,6 +2238,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
 
     const body = parseMessageBody(input.bodyMarkdown);
     if (body === null) throw new Error("message body is empty or too long");
+    // A canary in a person's message means it already escaped: something put it
+    // in front of them, and pasting it into a room would spread it further.
+    this.refuseCanaryContent(body, {
+      surface: "message", memberId: actor.id, agentId: null, channelId: channel.id, now: input.now,
+    });
 
     const parent = input.threadParentId ? readMessage(this.ctx.storage, input.threadParentId) : null;
     if (input.threadParentId && parent === null) throw new Error("thread parent not found");
@@ -5388,6 +5421,14 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     envelope: VaultCiphertextEnvelope;
     wraps: readonly VaultKeyWrap[];
     acl: readonly VaultAclEntry[];
+    /**
+     * The seal-time facts that make leak detection possible, both computed by
+     * the client that encrypted the value. Optional: a credential with no scan
+     * target simply never matches, and a credential with no marker is not a
+     * canary.
+     */
+    scan?: { digest: string; length: number };
+    canaryMarker?: string;
     freshUserVerification: boolean;
     localVaultUnlocked: boolean;
     /**
@@ -5403,6 +5444,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     this.requireVaultStepUp(input.freshUserVerification, input.localVaultUnlocked);
     const metadata = normalizeVaultMetadata(input.metadata);
     const policy = normalizeVaultPolicy(input.policy, input.now);
+    const scan = normalizeScanTarget(input.scan);
+    const canaryMarker = input.canaryMarker === undefined ? null : normalizeCanaryMarker(input.canaryMarker);
     const envelope = validateVaultEnvelope(input.envelope, { version: 1, keyEpoch: 1 });
     const wraps = input.wraps.map(validateVaultKeyWrap);
     const acl = validateVaultAcl(input.acl, wraps);
@@ -5420,15 +5463,20 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         if (this.ctx.storage.sql.exec<{ present: number }>("SELECT 1 AS present FROM vault_credential_deletions WHERE credential_id = ?", input.credentialId).toArray()[0]) {
           throw new Error("a deleted vault credential id cannot be reused");
         }
+        if (canaryMarker !== null && this.readCanaryMarkers().some((entry) => entry.marker === canaryMarker)) {
+          throw new Error("that canary marker is already in use");
+        }
         this.insertVaultCredential(
           input.credentialId, actor.id, metadata, policy, envelope, wraps, acl, input.now,
           input.capturedFrom === undefined ? null : normalizeCapturedFrom(input.capturedFrom),
+          scan, canaryMarker,
         );
         return {
           result: { credential: this.vaultSummary(this.readVaultCredential(input.credentialId)!), created: true },
           effects: this.vaultEffects("vault.credential_created", input.credentialId, actor, {
             version: 1, policy_epoch: 1, custodian_count: wraps.length,
             captured: input.capturedFrom !== undefined, item_kind: metadata.kind ?? "opaque",
+            canary: canaryMarker !== null, scannable: scan !== null,
           }),
         };
       },
@@ -5444,6 +5492,13 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     envelope: VaultCiphertextEnvelope;
     wraps: readonly VaultKeyWrap[];
     acl: readonly VaultAclEntry[];
+    /**
+     * A new value is a new digest. Absent means the caller computed none, and
+     * the stored target is cleared rather than left pointing at the value this
+     * rotation replaced — a stale target would report the old secret as still
+     * live and miss the new one.
+     */
+    scan?: { digest: string; length: number };
     freshUserVerification: boolean;
     localVaultUnlocked: boolean;
     now: number;
@@ -5455,6 +5510,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const current = this.requireVaultCredential(input.credentialId);
     const metadata = normalizeVaultMetadata(input.metadata);
     const policy = normalizeVaultPolicy(input.policy, input.now);
+    const scan = normalizeScanTarget(input.scan);
     const envelope = validateVaultEnvelope(input.envelope, { version: current.version + 1, keyEpoch: current.key_epoch + 1 });
     const wraps = input.wraps.map(validateVaultKeyWrap);
     const acl = validateVaultAcl(input.acl, wraps);
@@ -5467,13 +5523,15 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       this.ctx.storage.sql.exec(
         `UPDATE vault_credentials SET kind = ?, fields_json = ?, rotate_at = ?, name = ?, description = ?, env_var = ?, tags_json = ?, commands_json = ?, proxy_hosts_json = ?,
           cipher_suite = ?, aad_version = ?, ciphertext = ?, iv = ?, key_epoch = ?, version = ?, policy_epoch = ?, mode = ?,
-          allowed_deliveries_json = ?, project_ids_json = ?, grant_ttl_ms = ?, available_until = ?, max_uses_per_hour = ?, high_risk = ?, updated_at = ?
+          allowed_deliveries_json = ?, project_ids_json = ?, grant_ttl_ms = ?, available_until = ?, max_uses_per_hour = ?, high_risk = ?,
+          scan_digest = ?, scan_length = ?, updated_at = ?
          WHERE id = ?`,
         metadata.kind ?? "opaque", JSON.stringify(metadata.fields ?? []), metadata.rotateAt ?? null,
         metadata.name, metadata.description, metadata.envVar ?? null, JSON.stringify(metadata.tags), JSON.stringify(metadata.commands), JSON.stringify(metadata.proxyHosts),
         envelope.cipherSuite, envelope.aadVersion, envelope.ciphertext, envelope.iv, envelope.keyEpoch, envelope.version, live.policy_epoch + 1,
         policy.mode, JSON.stringify(policy.allowedDeliveries), JSON.stringify(policy.projectIds), policy.grantTtlMs ?? null, policy.availableUntil ?? null,
-        policy.maxUsesPerHour ?? null, policy.highRisk ? 1 : 0, input.now, input.credentialId,
+        policy.maxUsesPerHour ?? null, policy.highRisk ? 1 : 0,
+        scan?.digest ?? null, scan?.length ?? null, input.now, input.credentialId,
       );
       this.ctx.storage.sql.exec("DELETE FROM vault_credential_key_wraps WHERE credential_id = ?", input.credentialId);
       this.ctx.storage.sql.exec("DELETE FROM vault_credential_acl WHERE credential_id = ?", input.credentialId);
@@ -5976,6 +6034,13 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const reason = input.reason.trim();
     if (reason.length === 0 || reason.length > 500) throw new Error("proxy reason is invalid");
     const request = normalizeVaultProxyRequest(input.request);
+    // A canary in the URL, a header or the body means the agent is sending a
+    // credential out through the one path that reaches the public internet.
+    // Refused before an idempotency row exists, so the retry is refused too.
+    this.refuseCanaryContent(JSON.stringify(request), {
+      surface: "proxy_request", memberId: actor.id, agentId: input.agentId,
+      channelId: input.origin.channelId, now: input.now,
+    });
     const requestHash = await hashSecret(JSON.stringify({
       actor: actor.id, item: input.credentialId, agent: input.agentId, delegation: input.delegationId,
       project: input.projectId, origin: input.origin, reason, request,
@@ -7348,6 +7413,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       kind: row.kind, fields: JSON.parse(row.fields_json) as string[],
       ...(row.rotate_at === null ? {} : { rotateAt: row.rotate_at }),
       policy: this.vaultPolicy(row), version: row.version, keyEpoch: row.key_epoch, policyEpoch: row.policy_epoch,
+      // Whether it is a canary, never the marker that identifies one: a listing
+      // is metadata for planning, and the marker belongs with the scan targets
+      // a device asks for deliberately.
+      canary: row.canary_marker !== null,
       createdAt: row.created_at, updatedAt: row.updated_at,
       ...(row.last_accessed_at === null ? {} : { lastAccessedAt: row.last_accessed_at }), accessCount: row.access_count,
     };
@@ -7451,13 +7520,13 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     ).toArray().map((row) => ({ custodianMemberId: row.custodian_member_id, recipientKeyEpoch: row.recipient_key_epoch, wrapSuite: row.wrap_suite, ephemeralPublicKey: row.ephemeral_public_key, iv: row.iv, wrappedDek: row.wrapped_dek }));
   }
 
-  private insertVaultCredential(id: string, creatorId: string, metadata: VaultCredentialMetadata, policy: VaultPolicy, envelope: VaultCiphertextEnvelope, wraps: readonly VaultKeyWrap[], acl: readonly VaultAclEntry[], now: number, capturedFrom: string | null = null): void {
+  private insertVaultCredential(id: string, creatorId: string, metadata: VaultCredentialMetadata, policy: VaultPolicy, envelope: VaultCiphertextEnvelope, wraps: readonly VaultKeyWrap[], acl: readonly VaultAclEntry[], now: number, capturedFrom: string | null = null, scan: { digest: string; length: number } | null = null, canaryMarker: string | null = null): void {
     this.ctx.storage.sql.exec(
       `INSERT INTO vault_credentials(id, name, description, env_var, tags_json, commands_json, proxy_hosts_json,
        cipher_suite, aad_version, ciphertext, iv, key_epoch, version, policy_epoch, mode, allowed_deliveries_json,
        project_ids_json, grant_ttl_ms, available_until, max_uses_per_hour, high_risk, created_by_member_id, created_at, updated_at,
-       kind, fields_json, rotate_at, frozen_at, frozen_reason, captured_from)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       kind, fields_json, rotate_at, frozen_at, frozen_reason, captured_from, scan_digest, scan_length, canary_marker)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id, metadata.name, metadata.description, metadata.envVar ?? null, JSON.stringify(metadata.tags), JSON.stringify(metadata.commands), JSON.stringify(metadata.proxyHosts),
       envelope.cipherSuite, envelope.aadVersion, envelope.ciphertext, envelope.iv, envelope.keyEpoch, envelope.version, policy.mode,
       JSON.stringify(policy.allowedDeliveries), JSON.stringify(policy.projectIds), policy.grantTtlMs ?? null, policy.availableUntil ?? null,
@@ -7467,6 +7536,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       // custodian has seen what produced it and turned it on, which is what
       // makes an agent-initiated write safe to have at all.
       capturedFrom === null ? null : now, capturedFrom === null ? null : "awaiting_capture_review", capturedFrom,
+      scan?.digest ?? null, scan?.length ?? null, canaryMarker,
     );
     this.insertVaultWrapsAndAcl(id, envelope.version, wraps, acl, now);
   }
@@ -7505,6 +7575,112 @@ export class Workspace extends DurableObject<CloudflareEnv> {
 
   private vaultCanDiscover(credentialId: string, memberId: string, agentId?: string, channelId?: string): boolean {
     return (["use", "reveal", "manage"] as const).some((verb) => this.vaultHasAcl(credentialId, memberId, agentId, channelId, verb));
+  }
+
+  /* -------------------------------------------------------------------- */
+  /* Scan targets and canaries (V08)                                       */
+  /* -------------------------------------------------------------------- */
+
+  /**
+   * What a device may compare its own text against — `lepidy scan` and the
+   * `PreToolUse` hook behind it.
+   *
+   * A digest and a length, never a value and never a wrap. The client walks its
+   * text a window at a time and matches locally, which is the only shape that
+   * answers "does this file contain a secret" without the secret leaving the
+   * vault.
+   *
+   * Two limits are deliberate and are stated in the product's own words rather
+   * than implied. It finds an **exact whole unencoded value**: a base64'd or
+   * line-split secret goes straight through, because one hash per value cannot
+   * detect a substring. And a digest is a **verifier**, so it is served only to
+   * a member who already holds a verb on that credential, and a credential
+   * whose client chose not to publish one simply has no target here.
+   */
+  listVaultScanTargets(input: { actor: Actor; now: number }): { targets: readonly VaultScanTarget[] } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    // Deliberately independent of the agent-access switch: refusing to say what
+    // a leak looks like because agents are switched off would disable the
+    // detector at exactly the moment somebody is investigating one.
+    return {
+      targets: this.ctx.storage.sql
+        .exec<VaultCredentialRow>("SELECT * FROM vault_credentials ORDER BY name COLLATE NOCASE, id")
+        .toArray()
+        .filter((row) => this.vaultCanDiscover(row.id, actor.id))
+        .filter((row) => row.scan_digest !== null || row.canary_marker !== null)
+        .map((row) => ({
+          credentialId: row.id,
+          name: row.name,
+          digest: row.scan_digest,
+          length: row.scan_length,
+          canaryMarker: row.canary_marker,
+        })),
+    };
+  }
+
+  /** Every canary this workspace holds, as public markers. */
+  private readCanaryMarkers(): readonly { credentialId: string; name: string; marker: string }[] {
+    return this.ctx.storage.sql
+      .exec<{ id: string; name: string; canary_marker: string }>(
+        "SELECT id, name, canary_marker FROM vault_credentials WHERE canary_marker IS NOT NULL",
+      )
+      .toArray()
+      .map((row) => ({ credentialId: row.id, name: row.name, marker: row.canary_marker }));
+  }
+
+  /**
+   * Refuse a write that carries a canary, and tell the people who own it.
+   *
+   * This runs before anything is written, so the tripwire prevents the leak it
+   * detects rather than merely recording it. The trip itself is committed in
+   * its own transaction and the refusal is thrown afterwards: an alert that
+   * disappeared because the operation it describes failed would be useless.
+   *
+   * It is not a general secret detector. It finds the fake credential that
+   * exists to be found, which is why it costs one substring search and needs no
+   * key. A real credential leaving through the same path is caught by the
+   * client-side scan, the injection scrubber, or not at all.
+   */
+  private refuseCanaryContent(
+    text: string,
+    context: { surface: "message" | "mcp_message" | "proxy_request"; memberId: string | null; agentId: string | null; channelId: string | null; now: number },
+  ): void {
+    const hits = findCanaryMarkers(text, this.readCanaryMarkers());
+    if (hits.length === 0) return;
+    this.ctx.storage.transactionSync(() => {
+      for (const hit of hits) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO vault_canary_trips(id, credential_id, surface, member_id, agent_id, channel_id, detected_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          crypto.randomUUID(), hit.credentialId, context.surface, context.memberId, context.agentId, context.channelId, context.now,
+        );
+        // Custodians, because they are the people who can rotate whatever else
+        // travelled the same route. No body and no excerpt in the message: the
+        // alert says what tripped and where, not what the text said.
+        const body =
+          `**${hit.name} tripped.** A canary credential appeared in a ${context.surface.replace("_", " ")}, so something carried ` +
+          "a credential out of the injection path. The write was refused. Nothing legitimate ever sends a canary — check the " +
+          "agent's recent activity and rotate anything that shares its route.";
+        for (const custodian of this.ctx.storage.sql.exec<{ subject_id: string }>(
+          "SELECT subject_id FROM vault_credential_acl WHERE credential_id = ? AND verb = 'manage' AND subject_type = 'member'",
+          hit.credentialId,
+        ).toArray()) {
+          this.postVaultMessage(custodian.subject_id, body, null, context.now);
+        }
+        appendAuditEntry(this.ctx.storage, this.workspaceKey(), {
+          eventType: "vault.canary_tripped",
+          outcome: "denied",
+          requesterKind: context.agentId === null ? "member" : "agent",
+          requesterId: context.agentId ?? context.memberId,
+          operatingOwnerId: context.memberId,
+          subjectKind: "vault_item",
+          subjectId: hit.credentialId,
+          metadata: { surface: context.surface, channel_id: context.channelId, agent_id: context.agentId },
+        }, context.now);
+      }
+    });
+    throw new Error(canaryRefusalHint(hits.map((hit) => hit.name)));
   }
 
   private vaultScope(credentialId: string, verb: "use" | "reveal"): VaultScope {
@@ -8033,6 +8209,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     ) {
       throw new Error("agent cannot post in this room");
     }
+    // The case the canary exists for: an agent putting a credential into a room.
+    // Refused before the write, so the tripwire prevents the leak rather than
+    // reporting it afterwards.
+    this.refuseCanaryContent(body, {
+      surface: "mcp_message", memberId: actor.id, agentId: agent?.id ?? null, channelId: channel.id, now: input.now,
+    });
     const parent = input.threadParentId ? readMessage(this.ctx.storage, input.threadParentId) : null;
     if (input.threadParentId && parent === null) throw new Error("thread parent not found");
     const placement = resolveThreadPlacement(parent, channel.id);

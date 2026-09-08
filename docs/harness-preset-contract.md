@@ -1,7 +1,7 @@
 # The harness preset contract
 
-Status: implemented 2026-09-07 (R02). Builds on the
-[local runner contract](./local-runner-contract.md) and the
+Status: implemented 2026-09-07 (R02); §8 and §9 added 2026-09-08 (V08). Builds
+on the [local runner contract](./local-runner-contract.md) and the
 [MCP waiting and harness contract](./mcp-waiting-and-harness-contract.md).
 
 A **preset** is a local launch configuration. A **harness** is whatever it
@@ -148,7 +148,56 @@ system are all untested by this task. R04 owns the harness and OS matrix, and
 until it lands, a preset like the one above is a starting point somebody must
 validate on their own machine — not a certification.
 
-## 8. Required automated scenarios
+## 8. What a harness is told, and by what
+
+A harness is given no prompt and no content at startup (§1), so everything it
+knows about the conventions arrives through four channels with very different
+costs.
+
+| Layer | Channel | Cost |
+|---|---|---|
+| 1 | the MCP server's `instructions`, in the `initialize` response | paid in every session, forever |
+| 2 | tool descriptions, `credential_hint`, `lepidy hint`, and the denial hint on every refusal | small, then free until the agent is stuck |
+| 3 | the skill in `plugin/lepidy/skills/lepidy/SKILL.md` | loads on demand |
+| 4 | the `PreToolUse` hook, `lepidy hook pretooluse` | free until it fires |
+
+Layer 1 is budgeted at eighty tokens and carries exactly one idea — run the
+command through the CLI. That budget is asserted by a test, because growing it
+into a manual is a permanent tax on every session. Layers 1 and 2 are portable
+to any MCP client; 3 and 4 are Claude Code specific, and `lepidy init` installs
+them.
+
+An unattended session's capability set is unchanged by any of this. It is the
+eleven tools in §2 plus `proxy_request`; `credential_hint` and the other vault
+verbs are deliberately not session-capable, because a session that could
+enumerate the vault would be a wider session than this document describes. A
+local harness gets the same advice from `lepidy hint` and the hook on the
+machine it is running on.
+
+## 9. The hook is not a boundary
+
+Stated here because a preset author is exactly the person who might assume
+otherwise. The `PreToolUse` hook:
+
+- sees **Bash tool calls only** — a file read, an editor, a language runtime and
+  an MCP tool on another server are all invisible to it;
+- **fails open on every error**, including malformed input and a missing cache,
+  because a hook that failed closed would block every command an agent runs;
+- reads a **local advice cache** that may be stale, since it has no terminal to
+  read a passphrase from and runs on every call;
+- is configuration on the agent's own machine, which the agent can edit;
+- deliberately does not catch a recursive read of a directory, because the rule
+  that would catch it is the rule that allows `grep -r TODO .`, and false
+  coaching is what makes somebody switch the hook off.
+
+What decides whether a credential may be released is the workspace's policy
+engine, re-evaluated per request against a signed device claim, a live
+delegation and a live ACL. `lepidy-harness-adversary` is the executable proof:
+a real harness, launched by the real daemon under a real scoped session, that
+reads a decoy `.env` and then fails to use what it found. Its gate is described
+in `plugin/lepidy/evals/agent-behavior.md`.
+
+## 10. Required automated scenarios
 
 All of these exist and pass; see `TESTING.md` for where.
 
@@ -161,3 +210,7 @@ All of these exist and pass; see `TESTING.md` for where.
 5. The session token absent from every command line, log line and preset file.
 6. A session refused for an agent the device is not the designated runner for,
    and for an agent with no live delegation.
+7. A real harness that tries every documented circumvention move obtains no
+   credential: invented value-returning tools refused, the hook blocking the
+   moves it can see and allowing the correct command, the scanner naming the
+   credential in a decoy, and the workspace refusing the exfiltrating write.

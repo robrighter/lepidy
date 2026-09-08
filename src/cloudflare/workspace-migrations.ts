@@ -1131,6 +1131,43 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX runner_preset_requests_device_idx ON runner_preset_requests(device_id, state)`,
     ],
   },
+  {
+    version: 27,
+    name: "Scan targets and canary credentials",
+    statements: [
+      // A digest of the value and its length, so a client can answer "does this
+      // text contain a credential" without the value leaving the vault. Both
+      // are computed by the trusted client that sealed the value; nothing here
+      // can produce one, and a credential may have neither.
+      //
+      // The digest is a verifier for one exact value in one workspace at one
+      // version. That is new exposure the ciphertext does not have — a
+      // low-entropy value becomes offline-guessable to anybody holding it — so
+      // it is opt-out per credential, never stored below the minimum length,
+      // and served only to a member who already holds a verb on the credential.
+      `ALTER TABLE vault_credentials ADD COLUMN scan_digest TEXT`,
+      `ALTER TABLE vault_credentials ADD COLUMN scan_length INTEGER CHECK (scan_length IS NULL OR scan_length >= 8)`,
+      // The public half of a canary value. Not a secret: it exists so the
+      // workspace can spot the fake credential in content it already receives,
+      // with no key and no window scan.
+      `ALTER TABLE vault_credentials ADD COLUMN canary_marker TEXT`,
+      `CREATE UNIQUE INDEX vault_credentials_canary_idx ON vault_credentials(canary_marker) WHERE canary_marker IS NOT NULL`,
+      // What tripped, where, and who was acting. No body and no excerpt: the
+      // point of the row is that something carried a credential out of the
+      // injection path, and storing the text that did it would be storing the
+      // leak.
+      `CREATE TABLE vault_canary_trips (
+        id TEXT PRIMARY KEY,
+        credential_id TEXT NOT NULL REFERENCES vault_credentials(id) ON DELETE CASCADE,
+        surface TEXT NOT NULL CHECK (surface IN ('message', 'mcp_message', 'proxy_request')),
+        member_id TEXT REFERENCES members(id) ON DELETE SET NULL,
+        agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+        channel_id TEXT,
+        detected_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE INDEX vault_canary_trips_credential_idx ON vault_canary_trips(credential_id, detected_at)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

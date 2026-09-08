@@ -24,6 +24,13 @@ path = "src/main.rs"
 name = "lepidy-harness-reference"
 path = "src/bin/reference_harness.rs"
 
+# The adversary harness: the same contract, driven by a process that tries every
+# documented circumvention move instead of doing the work. It is how V08's
+# anti-circumvention gate is exercised without a model provider.
+[[bin]]
+name = "lepidy-harness-adversary"
+path = "src/bin/adversary_harness.rs"
+
 [dependencies]
 lepidy-cli = { path = "../lepidy-cli" }
 serde = { version = "1", features = ["derive"] }

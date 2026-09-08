@@ -53,6 +53,9 @@ pub struct State {
     pub signing_key: Option<VerifyingKey>,
     pub vault_public_key: Option<Vec<u8>>,
     pub credentials: Vec<Value>,
+    /// What `/api/device/vault/scan-targets` answers: digests and public canary
+    /// markers, never a value.
+    pub scan_targets: Vec<Value>,
     pub release: Value,
     pub enrol_status: u16,
     pub vault_key_published: bool,
@@ -300,6 +303,10 @@ fn respond(state: &mut State, path: &str, body: &[u8], signature_verified: bool)
         "/api/device/vault/list" => (
             200,
             json!({ "workspaceId": WORKSPACE_ID, "credentials": state.credentials }),
+        ),
+        "/api/device/vault/scan-targets" => (
+            200,
+            json!({ "workspaceId": WORKSPACE_ID, "targets": state.scan_targets }),
         ),
         "/api/device/vault/credentials" => {
             state.last_credential = serde_json::from_slice(body).unwrap_or(json!({}));
@@ -624,4 +631,35 @@ pub fn allow_release_many(vault_public_key: &[u8], credential_ids: &[&str]) -> V
 
 pub fn assert_absent(haystack: &str, needle: &str, what: &str) {
     assert!(!haystack.contains(needle), "{what} contained {needle}");
+}
+
+/// The scan target a real client would have published when it sealed `value`.
+///
+/// Built with the CLI's own preimage function rather than a copy of it, because
+/// the whole point of the digest is that both sides compute the same one.
+pub fn scan_target(credential_id: &str, name: &str, value: &str) -> Value {
+    let digest = lepidy_cli::crypto::sha256_base64url(&lepidy_cli::advice::scan_digest_preimage(
+        WORKSPACE_ID,
+        credential_id,
+        1,
+        value.as_bytes(),
+    ));
+    json!({
+        "credentialId": credential_id,
+        "name": name,
+        "digest": digest,
+        "length": value.len(),
+        "canaryMarker": Value::Null,
+    })
+}
+
+/// A canary's public marker, which is all the workspace ever publishes for one.
+pub fn canary_target(credential_id: &str, name: &str, marker: &str) -> Value {
+    json!({
+        "credentialId": credential_id,
+        "name": name,
+        "digest": Value::Null,
+        "length": Value::Null,
+        "canaryMarker": marker,
+    })
 }
