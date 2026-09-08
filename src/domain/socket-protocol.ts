@@ -94,6 +94,16 @@ export type ServerFrame =
    * from a conversation they are sitting in.
    */
   | { type: "vault"; kind: string; approvalId: string; payload: unknown }
+  /**
+   * Something a member's own agent did, addressed to that member.
+   *
+   * A harness blocked by its own permission posture is the reason this exists:
+   * that is a person's decision waiting to be made, and it happens on a machine
+   * with no room to say so in. An owner has to find out where they already are,
+   * because a blocked harness that only appears in a local log is a harness
+   * nobody unblocks.
+   */
+  | { type: "agent"; kind: string; agentId: string; payload: unknown }
   /** The client's cursor is older than the replay window; refetch current state. */
   | { type: "reset"; reason: string }
   | { type: "error"; reason: string };

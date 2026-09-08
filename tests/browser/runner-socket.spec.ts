@@ -240,3 +240,123 @@ test("RUNNER-SOCKET-INT-005 stops a runner from anywhere, with the machine still
   const depth = await signedRequest(page.request, { keys, enrolment, path: "/api/device/runner/depth", body: {} });
   expect(depth.status()).toBe(409);
 });
+
+/**
+ * The harness workflow against the built Worker (R02).
+ *
+ * The daemon's own suite proves the machine side against a local double; this
+ * proves the workspace side against the real thing — that a session minted over
+ * the signed device transport actually works as an MCP credential, and that a
+ * blocked run becomes something an owner can see.
+ */
+
+async function mintSession(input: { keys: DeviceKeys; enrolment: Enrolment; agentId: string; page: Parameters<typeof signUp>[0] }) {
+  const response = await signedRequest(input.page.request, {
+    keys: input.keys,
+    enrolment: input.enrolment,
+    path: "/api/device/runner/session",
+    body: { agentId: input.agentId },
+  });
+  return { status: response.status(), body: (await response.json()) as Record<string, unknown> };
+}
+
+async function callTool(
+  page: Parameters<typeof signUp>[0],
+  input: { slug: string; token: string; name: string; arguments: Record<string, unknown> },
+) {
+  const response = await page.request.post(`${BASE}/w/${input.slug}/mcp`, {
+    headers: { authorization: `Bearer ${input.token}` },
+    data: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name, arguments: input.arguments } },
+  });
+  if (response.status() !== 200) return { refused: true, status: response.status() } as Record<string, unknown>;
+  const body = (await response.json()) as { result?: { isError?: boolean; structuredContent?: Record<string, unknown> } };
+  return { refused: body.result?.isError === true, status: 200, ...(body.result?.structuredContent ?? {}) };
+}
+
+test("RUNNER-SOCKET-INT-006 mints a session a harness can work with, and only for its own agents", async ({ page }) => {
+  const { keys, enrolment, seeded, session, account } = await seedRunner(page);
+  expect((await register(page, { keys, enrolment, agentId: seeded.agentId, runnerEpoch: 1 })).status()).toBe(200);
+
+  const minted = await mintSession({ keys, enrolment, agentId: seeded.agentId, page });
+  expect(minted.status).toBe(200);
+  expect(minted.body).toMatchObject({ agentId: seeded.agentId, mcpPath: `/w/${slugFor(account)}/mcp` });
+
+  // The token is a real MCP credential against the real Worker, and its
+  // capabilities are exactly a harness's — nothing that posts as a person.
+  const who = await callTool(page, { slug: slugFor(account), token: minted.body.token as string, name: "whoami", arguments: {} });
+  expect(who.refused).toBe(false);
+  const asPerson = await callTool(page, {
+    slug: slugFor(account),
+    token: minted.body.token as string,
+    name: "post_message",
+    arguments: { channel_id: seeded.channelId, content: "as a person", idempotency_key: `person-${Date.now()}` },
+  });
+  expect(asPerson.refused).toBe(true);
+
+  // An agent this device is not the designated runner for is refused, and the
+  // wording says nothing about whether it exists.
+  const other = (await (
+    await page.request.post(`${BASE}/__fixture/runner-queue`, { headers: { authorization: session }, data: { mentions: 0 } })
+  ).json()) as Seeded;
+  const refused = await mintSession({ keys, enrolment, agentId: other.agentId, page });
+  expect(refused.status).toBe(403);
+});
+
+test("RUNNER-SOCKET-INT-007 turns a blocked harness into something its owner can see", async ({ page }) => {
+  const { keys, enrolment, seeded, session, account } = await seedRunner(page);
+  expect((await register(page, { keys, enrolment, agentId: seeded.agentId, runnerEpoch: 1 })).status()).toBe(200);
+  const minted = await mintSession({ keys, enrolment, agentId: seeded.agentId, page });
+  expect(minted.status).toBe(200);
+
+  // Work arrives and the harness claims it, then hits its permission wall.
+  const mentioned = await page.request.post(`${BASE}/__fixture/runner-enqueue`, {
+    headers: { authorization: session },
+    data: { channelId: seeded.channelId, agentHandle: seeded.agentHandle, count: 1 },
+  });
+  expect(mentioned.status()).toBe(200);
+  const leaseToken = `browser-lease-${"x".repeat(40)}`;
+  const claimed = await callTool(page, {
+    slug: slugFor(account),
+    token: minted.body.token as string,
+    name: "agent_next",
+    arguments: {
+      agent: seeded.agentId,
+      claim_id: `browser-claim-${Date.now()}`,
+      lease_token: leaseToken,
+      session_id: minted.body.sessionId as string,
+    },
+  });
+  expect(claimed.item).not.toBeNull();
+
+  // The daemon reports what it saw. Not the harness: a harness that dies, hangs
+  // or is killed reports nothing, and those are the cases that matter.
+  const reported = await signedRequest(page.request, {
+    keys,
+    enrolment,
+    path: "/api/device/runner/outcome",
+    body: {
+      agentId: seeded.agentId,
+      sessionId: minted.body.sessionId,
+      outcome: "blocked",
+      reason: "the harness was blocked by its permission posture",
+    },
+  });
+  expect(reported.status()).toBe(200);
+  expect(await reported.json()).toMatchObject({ outcome: "blocked", itemsNeedingAttention: 1 });
+
+  // And it is not handed back. Work that a permission posture refused would be
+  // refused again, so retrying it is a loop; it waits for a person instead.
+  const again = await callTool(page, {
+    slug: slugFor(account),
+    token: minted.body.token as string,
+    name: "agent_next",
+    arguments: {
+      agent: seeded.agentId,
+      claim_id: `browser-claim-again-${Date.now()}`,
+      lease_token: `browser-lease-again-${"x".repeat(40)}`,
+      session_id: minted.body.sessionId as string,
+    },
+  });
+  expect(again.refused).toBe(false);
+  expect(again.item, "a blocked item must not be handed straight back").toBeNull();
+});

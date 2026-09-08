@@ -17,10 +17,18 @@ path = "src/lib.rs"
 name = "lepidy-agentd"
 path = "src/main.rs"
 
+# The reference harness: a real, separate process that speaks real MCP over
+# real HTTP. It exists so the workflow can be proved end to end without the
+# gate depending on a model provider, an API key or a network beyond loopback.
+[[bin]]
+name = "lepidy-harness-reference"
+path = "src/bin/reference_harness.rs"
+
 [dependencies]
 lepidy-cli = { path = "../lepidy-cli" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 tungstenite = { version = "0.30", default-features = false, features = [
   "handshake",
   "rustls-tls-webpki-roots",

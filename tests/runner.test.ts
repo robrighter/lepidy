@@ -486,3 +486,189 @@ describe("R01 stopping", () => {
     await expect(seeded.stub.verifyAuditTrail()).resolves.toMatchObject({ ok: true });
   });
 });
+
+describe("R02 the harness workflow", () => {
+  /** A runner that answers for an agent with a live delegation. */
+  async function seedWithDelegation(label: string) {
+    const seeded = await seed(label);
+    const delegation = await seeded.stub.createAgentDelegation({
+      actor: seeded.owner,
+      agent: seeded.agent,
+      channelIds: [seeded.room],
+      expiresAt: NOW + 24 * 60 * 60 * 1000,
+      now: NOW,
+    });
+    await seeded.stub.registerRunner({
+      actor: seeded.owner, deviceId: "device-a", runnerEpoch: 1, presetRevision: 5,
+      agents: [{ agentId: seeded.agent, presetId: "p1" }], now: NOW,
+    });
+    return { ...seeded, delegation };
+  }
+
+  it("RUNNER-INT-016 issues a session bound to the device, epoch and preset revision", async () => {
+    const seeded = await seedWithDelegation("runner-session");
+    const grant = await seeded.stub.startRunnerSession({
+      actor: seeded.owner, deviceId: "device-a", agentId: seeded.agent, now: NOW + 1,
+    });
+    expect(grant).toMatchObject({ agentId: seeded.agent, delegationId: seeded.delegation.id });
+    // The daemon never names a delegation: the workspace finds the agent's own,
+    // so a runner cannot ask for authority nobody gave it.
+    expect(grant.mcpPath).toBe(`/w/${seeded.slug}/mcp`);
+    expect(grant.token).toMatch(new RegExp(`^lpd_st_${seeded.slug}_`));
+    // Exactly the tools a harness needs to work an item and answer in the room
+    // it came from. Nothing that posts as a person, administers an agent or
+    // touches the vault.
+    expect([...grant.capabilities].sort()).toEqual([
+      "agent_complete", "agent_inbox", "agent_next", "agent_post", "agent_renew", "agent_start",
+      "list_channels", "read_channel", "read_thread", "whoami",
+    ]);
+
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      const row = state.storage.sql
+        .exec<{ device_id: string; runner_epoch: number; preset_revision: number; token_hash: string }>(
+          "SELECT device_id, runner_epoch, preset_revision, token_hash FROM agent_sessions WHERE id = ?", grant.sessionId,
+        )
+        .one();
+      // Bound to the configuration it was started under, so a preset edited
+      // afterwards is distinguishable from the one this session began with.
+      expect(row).toMatchObject({ device_id: "device-a", runner_epoch: 1, preset_revision: 5 });
+      expect(row.token_hash).toMatch(/^[a-f0-9]{64}$/);
+      // The token itself is never stored, and never lands in the audit chain.
+      expect(JSON.stringify(state.storage.sql.exec("SELECT * FROM audit_events").toArray())).not.toContain(grant.token);
+    });
+  });
+
+  it("RUNNER-INT-017 refuses a session for an agent this device does not answer for", async () => {
+    const seeded = await seedWithDelegation("runner-session-scope");
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      // An agent this member owns but this device is not the runner for is
+      // reported as missing, the same as one that does not exist.
+      await expect(
+        instance.startRunnerSession({ actor: seeded.owner, deviceId: "device-a", agentId: seeded.second, now: NOW + 1 }),
+      ).rejects.toThrow("agent not found");
+      await expect(
+        instance.startRunnerSession({ actor: seeded.owner, deviceId: "device-b", agentId: seeded.agent, now: NOW + 1 }),
+      ).rejects.toThrow("runner is not registered");
+      // And another member cannot mint one against this device at all.
+      await expect(
+        instance.startRunnerSession({ actor: seeded.other, deviceId: "device-a", agentId: seeded.agent, now: NOW + 1 }),
+      ).rejects.toThrow("runner is not registered");
+    });
+  });
+
+  it("RUNNER-INT-018 refuses a session for an agent with no live delegation", async () => {
+    const seeded = await seedWithDelegation("runner-session-revoked");
+    await seeded.stub.revokeAgentDelegation({ actor: seeded.owner, delegationId: seeded.delegation.id, now: NOW + 1 });
+    await runInDurableObject<Workspace, void>(seeded.stub, async (instance) => {
+      // The authority is the delegation, so removing it removes the runner's
+      // ability to work at all rather than only its current session.
+      await expect(
+        instance.startRunnerSession({ actor: seeded.owner, deviceId: "device-a", agentId: seeded.agent, now: NOW + 2 }),
+      ).rejects.toThrow("no live delegation");
+    });
+  });
+
+  it("RUNNER-INT-019 turns a blocked harness into a decision waiting for a person", async () => {
+    const seeded = await seedWithDelegation("runner-blocked");
+    const grant = await seeded.stub.startRunnerSession({
+      actor: seeded.owner, deviceId: "device-a", agentId: seeded.agent, now: NOW + 1,
+    });
+    await mention(seeded, "@a.runner please do the thing", NOW + 2);
+
+    // The harness claims an item and then hits its own permission wall.
+    const claimed = await seeded.stub.claimAgentWork({
+      actor: seeded.owner,
+      sessionToken: grant.token,
+      agent: seeded.agent,
+      claimId: "claim-blocked",
+      leaseToken: `lease-blocked-${"x".repeat(40)}`,
+      sessionId: grant.sessionId,
+      now: NOW + 3,
+    });
+    expect(claimed.item).not.toBeNull();
+
+    const reported = await seeded.stub.reportRunnerOutcome({
+      actor: seeded.owner, deviceId: "device-a", agentId: seeded.agent, sessionId: grant.sessionId,
+      outcome: "blocked", reason: "the harness was blocked by its permission posture", now: NOW + 4,
+    });
+    // Not retried and not dead-lettered. Retrying work that policy refused just
+    // refuses again; this is a person's decision, and it waits where they look.
+    expect(reported).toEqual({ agentId: seeded.agent, outcome: "blocked", itemsNeedingAttention: 1 });
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      const states = state.storage.sql
+        .exec<{ execution_state: string }>("SELECT execution_state FROM agent_queue WHERE agent_id = ?", seeded.agent)
+        .toArray();
+      expect(states).toEqual([{ execution_state: "needs_attention" }]);
+    });
+  });
+
+  it("RUNNER-INT-020 leaves another runner's work alone", async () => {
+    const seeded = await seedWithDelegation("runner-outcome-scope");
+    const grant = await seeded.stub.startRunnerSession({
+      actor: seeded.owner, deviceId: "device-a", agentId: seeded.agent, now: NOW + 1,
+    });
+    await mention(seeded, "@a.runner one", NOW + 2);
+    await seeded.stub.claimAgentWork({
+      actor: seeded.owner, sessionToken: grant.token, agent: seeded.agent, claimId: "claim-live",
+      leaseToken: `lease-live-${"x".repeat(40)}`, sessionId: grant.sessionId, now: NOW + 3,
+    });
+
+    // A report naming a session that did not claim this item must not disturb
+    // it: one machine reporting a failure cannot strand another's work.
+    const reported = await seeded.stub.reportRunnerOutcome({
+      actor: seeded.owner, deviceId: "device-a", agentId: seeded.agent, sessionId: "session-somebody-else",
+      outcome: "failed", now: NOW + 4,
+    });
+    expect(reported.itemsNeedingAttention).toBe(0);
+    await runInDurableObject<Workspace, void>(seeded.stub, (_instance, state) => {
+      expect(
+        state.storage.sql
+          .exec<{ execution_state: string }>("SELECT execution_state FROM agent_queue WHERE agent_id = ?", seeded.agent)
+          .toArray(),
+      ).toEqual([{ execution_state: "claimed" }]);
+    });
+  });
+
+  it("RUNNER-INT-021 records a run without recording what the harness said", async () => {
+    const seeded = await seedWithDelegation("runner-outcome-audit");
+    const grant = await seeded.stub.startRunnerSession({
+      actor: seeded.owner, deviceId: "device-a", agentId: seeded.agent, now: NOW + 1,
+    });
+    await seeded.stub.reportRunnerOutcome({
+      actor: seeded.owner, deviceId: "device-a", agentId: seeded.agent, sessionId: grant.sessionId,
+      outcome: "completed", reason: "the harness finished", now: NOW + 2,
+    });
+    const entry = (await seeded.stub.auditTrail(0, 100)).find((row) => row.eventType === "runner.run_reported");
+    expect(entry!.metadata).toMatchObject({
+      device_id: "device-a", run_outcome: "completed", items_needing_attention: 0,
+    });
+    await expect(seeded.stub.verifyAuditTrail()).resolves.toMatchObject({ ok: true });
+  });
+
+  it("RUNNER-INT-022 keeps work that arrives while a run is in flight", async () => {
+    const seeded = await seedWithDelegation("runner-race");
+    const grant = await seeded.stub.startRunnerSession({
+      actor: seeded.owner, deviceId: "device-a", agentId: seeded.agent, now: NOW + 1,
+    });
+    await mention(seeded, "@a.runner first", NOW + 2);
+    await seeded.stub.claimAgentWork({
+      actor: seeded.owner, sessionToken: grant.token, agent: seeded.agent, claimId: "claim-first",
+      leaseToken: `lease-first-${"x".repeat(40)}`, sessionId: grant.sessionId, now: NOW + 3,
+    });
+
+    // More work arrives while the harness is mid-run. This is the exit race:
+    // the process is about to end, the wake for this is delivered to a socket
+    // that is about to be idle, and nothing durable would notice if the depth
+    // check did not exist.
+    await mention(seeded, "@a.runner second", NOW + 4);
+    await seeded.stub.reportRunnerOutcome({
+      actor: seeded.owner, deviceId: "device-a", agentId: seeded.agent, sessionId: grant.sessionId,
+      outcome: "completed", now: NOW + 5,
+    });
+
+    // The depth a runner reads after an exit still shows the new item, so the
+    // machine finds it on its very next question.
+    const depth = await seeded.stub.runnerQueueDepth({ actor: seeded.owner, deviceId: "device-a", now: NOW + 6 });
+    expect(depth.agents[0]).toMatchObject({ agentId: seeded.agent, depth: 1 });
+  });
+});

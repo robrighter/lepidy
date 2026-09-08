@@ -42,6 +42,12 @@ pub struct Preset {
     /// release time by the CLI; nothing here is a secret.
     #[serde(default)]
     pub credentials: BTreeMap<String, String>,
+    /// Plain environment for the harness — flags it reads, a mode, a home
+    /// directory. Set locally by the person who owns the machine and never by
+    /// the workspace, which is the whole point: this is launch configuration,
+    /// and launch configuration has exactly one author.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
     /// How many of this preset may run at once on this machine.
     #[serde(default = "default_concurrency")]
     pub max_concurrent: u32,
@@ -245,6 +251,7 @@ mod tests {
             args: vec!["--non-interactive".to_string()],
             working_directory: None,
             credentials: BTreeMap::new(),
+            environment: BTreeMap::new(),
             max_concurrent: 1,
             cooldown_seconds: 15,
             timeout_seconds: 60,

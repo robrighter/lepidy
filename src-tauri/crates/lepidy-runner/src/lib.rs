@@ -29,8 +29,8 @@ pub const USAGE: &str = "\
 lepidy-agentd — the local runner for Lepidy agents
 
   lepidy-agentd preset set ID --program PATH [--arg VALUE]... [--dir PATH]
-                [--credential NAME=ENV_VAR]... [--max-concurrent N]
-                [--cooldown SECONDS] [--timeout SECONDS]
+                [--credential NAME=ENV_VAR]... [--env NAME=VALUE]...
+                [--max-concurrent N] [--cooldown SECONDS] [--timeout SECONDS]
       Define what runs locally. Reads the local vault passphrase, so a daemon
       that has been reached over the network cannot change what it runs. The
       preset file is owner-only and is refused if anybody else can read it.

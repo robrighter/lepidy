@@ -819,6 +819,36 @@ const MAX_SCHEDULE_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
  */
 const MAX_RUNNER_AGENTS = 64;
 
+/**
+ * What a runner's session may do, and nothing more.
+ *
+ * Exactly the tools a harness needs to work a queue item and answer in the
+ * room it came from. No `post_message` as a person, no agent administration,
+ * no vault verb: a session that could widen itself is not a boundary.
+ */
+const RUNNER_SESSION_CAPABILITIES = [
+  "whoami",
+  "list_channels",
+  "read_channel",
+  "read_thread",
+  "agent_inbox",
+  "agent_next",
+  "agent_start",
+  "agent_renew",
+  "agent_complete",
+  "agent_post",
+] as const;
+
+/**
+ * How a run ended, as the machine saw it.
+ *
+ * `blocked` is the one that matters: the harness refused to do something under
+ * its own safe default permission posture, which is a person's decision waiting
+ * to be made rather than an error.
+ */
+export const RUNNER_RUN_OUTCOMES = ["completed", "blocked", "failed"] as const;
+export type RunnerRunOutcome = (typeof RUNNER_RUN_OUTCOMES)[number];
+
 type RunnerDeviceRow = {
   device_id: string;
   member_id: string;
@@ -7893,6 +7923,166 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         // Already gone.
       }
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* The first local harness workflow (R02)                              */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Issue the session a harness on this device will speak MCP with.
+   *
+   * The runner asks for an agent it already answers for; the workspace finds
+   * that agent's live delegation itself. The daemon never names a delegation,
+   * so it cannot ask for authority it was not given — and because the token is
+   * bound to this device, this runner epoch and this preset revision, a session
+   * cannot outlive the configuration it was started under.
+   *
+   * A session is deliberately *reused* across runs. Starting a harness is
+   * expensive, and a workspace that forced a new session per mention would
+   * spend more on process startup than on work; the ceiling stays where A04 put
+   * it — the delegation's lifetime and the eight-hour session cap.
+   */
+  async startRunnerSession(input: {
+    actor: Actor;
+    deviceId: string;
+    agentId: string;
+    capabilities?: readonly string[];
+    now: number;
+  }): Promise<AgentSessionGrant & { mcpPath: string }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const device = this.requireRunnerDevice(input.deviceId, actor.id);
+    const assignment = this.ctx.storage.sql
+      .exec<{ agent_id: string }>(
+        "SELECT agent_id FROM runner_agents WHERE agent_id = ? AND device_id = ?",
+        input.agentId,
+        device.device_id,
+      )
+      .toArray()[0];
+    // A device may only ask for the agents it is the designated runner for.
+    // Anything else is reported the same way an unknown agent is.
+    if (assignment === undefined) throw new Error("agent not found");
+
+    const delegation = this.liveDelegationForAgent(assignment.agent_id, actor.id, input.now);
+    if (delegation === null) throw new Error("this agent has no live delegation");
+    const grant = await this.startAgentSession({
+      actor: input.actor,
+      delegationId: delegation,
+      deviceId: device.device_id,
+      runnerEpoch: device.runner_epoch,
+      presetRevision: device.preset_revision,
+      capabilities: input.capabilities ?? RUNNER_SESSION_CAPABILITIES,
+      now: input.now,
+    });
+    const slug = this.workspaceSlug();
+    if (slug === null) throw new Error("workspace is not initialized");
+    return { ...grant, mcpPath: `/w/${slug}/mcp` };
+  }
+
+  /**
+   * What happened to a run, as the machine saw it.
+   *
+   * A harness that was blocked by its own permission posture is the case this
+   * exists for. It is not a failure and it is not a refusal by the workspace:
+   * it is a person's decision waiting to be made, and it has to be visible as
+   * one. Anything the stopped run had claimed goes to `needs_attention` rather
+   * than back to `pending`, because retrying work that was blocked by policy
+   * just blocks again — and the item is where an owner will look.
+   *
+   * Reported by the daemon rather than the harness, deliberately. A harness that
+   * dies, hangs or is killed reports nothing, and those are exactly the cases
+   * where somebody needs to be told.
+   */
+  async reportRunnerOutcome(input: {
+    actor: Actor;
+    deviceId: string;
+    agentId: string;
+    sessionId: string;
+    outcome: RunnerRunOutcome;
+    reason?: string | null;
+    now: number;
+  }): Promise<{ agentId: string; outcome: RunnerRunOutcome; itemsNeedingAttention: number }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const device = this.requireRunnerDevice(input.deviceId, actor.id);
+    if (!RUNNER_RUN_OUTCOMES.includes(input.outcome)) throw new Error("unknown runner outcome");
+    const assignment = this.ctx.storage.sql
+      .exec<{ agent_id: string }>(
+        "SELECT agent_id FROM runner_agents WHERE agent_id = ? AND device_id = ?",
+        input.agentId,
+        device.device_id,
+      )
+      .toArray()[0];
+    if (assignment === undefined) throw new Error("agent not found");
+    const agent = this.requireOwnedAgent(assignment.agent_id, actor.id);
+    // Free text from the machine, and it is shown to a person, so it is bounded
+    // and never trusted to be anything but a note.
+    const reason = (input.reason ?? input.outcome).slice(0, 200);
+
+    const outcome = await this.commitMutation({ scope: "runner.outcome", now: input.now }, () => {
+      let itemsNeedingAttention = 0;
+      if (input.outcome !== "completed") {
+        // Only what *this* session had claimed. A run reporting an outcome must
+        // not be able to disturb another runner's in-flight work.
+        const stranded = this.ctx.storage.sql
+          .exec<{ id: string }>(
+            `SELECT id FROM agent_queue
+             WHERE agent_id = ? AND lease_agent_session_id = ? AND execution_state = 'claimed'`,
+            agent.id,
+            input.sessionId,
+          )
+          .toArray();
+        for (const item of stranded) {
+          this.ctx.storage.sql.exec(
+            `UPDATE agent_queue SET execution_state = 'needs_attention', lease_token_hash = NULL,
+               lease_expires_at = NULL WHERE id = ? AND execution_state = 'claimed'`,
+            item.id,
+          );
+        }
+        itemsNeedingAttention = stranded.length;
+      }
+      return {
+        result: { agentId: agent.id, outcome: input.outcome, itemsNeedingAttention },
+        effects: this.agentEffects("runner.run_reported", agent, actor, {
+          device_id: device.device_id,
+          session_id: input.sessionId,
+          run_outcome: input.outcome,
+          items_needing_attention: itemsNeedingAttention,
+          reason,
+        }),
+      };
+    });
+
+    // An owner finds out where they already are. A blocked harness that only
+    // showed up in a log is a harness nobody unblocks.
+    if (input.outcome !== "completed") {
+      for (const memberId of agentOwnerIds(this.ctx.storage, agent.id)) {
+        this.broadcastToMember(memberId, {
+          type: "agent",
+          kind: "run_reported",
+          agentId: agent.id,
+          payload: { outcome: input.outcome, reason, itemsNeedingAttention: outcome.result.itemsNeedingAttention },
+        });
+      }
+    }
+    return outcome.result;
+  }
+
+  /** The agent's one live delegation from this owner, if it has one. */
+  private liveDelegationForAgent(agentId: string, ownerMemberId: string, now: number): string | null {
+    return (
+      this.ctx.storage.sql
+        .exec<{ id: string }>(
+          `SELECT id FROM agent_delegations
+           WHERE agent_id = ? AND owner_member_id = ? AND revoked_at IS NULL AND expires_at > ?
+           ORDER BY created_at DESC LIMIT 1`,
+          agentId,
+          ownerMemberId,
+          now,
+        )
+        .toArray()[0]?.id ?? null
+    );
   }
 
   private readRunnerDevice(deviceId: string): RunnerDeviceRow | null {

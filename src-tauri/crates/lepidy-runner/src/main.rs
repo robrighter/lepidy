@@ -15,7 +15,7 @@ use lepidy_cli::client::{signed_headers, Client, Provenance};
 use lepidy_cli::error::{CliError, CliResult, EXIT_USAGE};
 use lepidy_cli::profile::{load_profile, Profile, Secrets};
 use lepidy_cli::prompt::read_secret;
-use lepidy_runner::daemon::{self, Runner, SOCKET_PATH};
+use lepidy_runner::daemon::{self, RunOutcome, Runner, SOCKET_PATH};
 use lepidy_runner::preset::{load_presets, preset_path, save_presets_at, Preset, PresetStore};
 use lepidy_runner::socket::{clamp_idle_check, reconnect_delay, ServerFrame, DEFAULT_IDLE_CHECK};
 use lepidy_runner::USAGE;
@@ -138,12 +138,20 @@ fn preset_command(args: &Args) -> CliResult<i32> {
                     .ok_or_else(|| CliError::usage("--credential takes NAME=ENV_VAR"))?;
                 credentials.insert(name.to_string(), variable.to_string());
             }
+            let mut environment = BTreeMap::new();
+            for mapping in args.options("env") {
+                let (name, value) = mapping
+                    .split_once('=')
+                    .ok_or_else(|| CliError::usage("--env takes NAME=VALUE"))?;
+                environment.insert(name.to_string(), value.to_string());
+            }
             let preset = Preset {
                 id: id.clone(),
                 program: args.require("program")?.to_string(),
                 args: args.options("arg"),
                 working_directory: args.option("dir").map(str::to_string),
                 credentials,
+                environment,
                 max_concurrent: parse_number(args.option("max-concurrent"), 1)?,
                 cooldown_seconds: parse_number(args.option("cooldown"), 15)?,
                 timeout_seconds: parse_number(args.option("timeout"), 30 * 60)?,
@@ -379,7 +387,7 @@ fn run_command(args: &Args) -> CliResult<i32> {
                 error.message
             );
         }
-        let _ = drain(&mut runner);
+        let _ = drain(&mut runner, &session, &signing, revision);
         std::thread::sleep(reconnect_delay(attempt));
     }
 }
@@ -424,18 +432,13 @@ fn hold_socket(
 
     let (mut socket, _) = tungstenite::connect(request)
         .map_err(|error| CliError::failure(format!("could not connect: {error}")))?;
-    // The read timeout *is* the idle check. Waiting for a frame that never
-    // comes and asking the queue anyway are the same act, and doing it this way
-    // means the daemon needs no second thread to hold a clock.
-    match socket.get_ref() {
-        tungstenite::stream::MaybeTlsStream::Plain(stream) => {
-            let _ = stream.set_read_timeout(Some(idle_check));
-        }
-        tungstenite::stream::MaybeTlsStream::Rustls(stream) => {
-            let _ = stream.get_ref().set_read_timeout(Some(idle_check));
-        }
-        _ => {}
-    }
+    // The read timeout *is* the clock. Waiting for a frame that never comes and
+    // asking the queue anyway are the same act, and doing it this way means the
+    // daemon needs no second thread to hold a timer.
+    set_read_deadline(
+        &mut socket,
+        daemon::next_tick(runner.running_count(), idle_check),
+    );
     eprintln!("lepidy-agentd: connected.");
     // On connect, before waiting for anything. A wake that arrived while this
     // machine was off is durable and will be replayed, but a wake that was
@@ -455,19 +458,33 @@ fn hold_socket(
             // said, so ask instead. This is the whole of what replaces a parked
             // wait, and it is why a lost wake costs one bounded call.
             Err(error) if is_idle_timeout(&error) => {
-                if let Err(error) = check_depth(session, signing, revision, runner) {
-                    eprintln!(
-                        "lepidy-agentd: could not check the queue ({}).",
-                        error.message
-                    );
+                // Reap first. A run that finished while this was waiting frees
+                // its slot and has an outcome to report, and asking the queue
+                // before noticing that would find work the daemon then refuses
+                // for being at capacity.
+                let reaped = drain(runner, session, signing, revision);
+                if reaped > 0 || runner.running_count() == 0 {
+                    if let Err(error) = check_depth(session, signing, revision, runner) {
+                        eprintln!(
+                            "lepidy-agentd: could not check the queue ({}).",
+                            error.message
+                        );
+                    }
                 }
-                let _ = drain(runner);
+                set_read_deadline(
+                    &mut socket,
+                    daemon::next_tick(runner.running_count(), idle_check),
+                );
                 // A ping doubles as a liveness check on a connection that has
                 // been silent: a socket that died quietly fails here rather
-                // than at the next wake, which could be hours away.
-                socket
-                    .send(tungstenite::Message::Text("{\"type\":\"ping\"}".into()))
-                    .map_err(|error| CliError::failure(format!("ping failed: {error}")))?;
+                // than at the next wake, which could be hours away. Only when
+                // actually idle — a busy daemon is polling its children, not
+                // sitting in silence.
+                if runner.running_count() == 0 {
+                    socket
+                        .send(tungstenite::Message::Text("{\"type\":\"ping\"}".into()))
+                        .map_err(|error| CliError::failure(format!("ping failed: {error}")))?;
+                }
                 continue;
             }
             Err(error) => return Err(CliError::failure(format!("read failed: {error}"))),
@@ -485,12 +502,22 @@ fn hold_socket(
                 "the workspace sent a frame this runner does not understand: {error}"
             ))
         })?;
-        let report = runner.apply_frame(&frame, Instant::now());
+        let report = runner.apply_frame(&frame, Instant::now(), now_ms());
         announce(&report);
-        // A finished process frees a slot, and the work it was answering may
-        // have grown while it ran. Asking after every exit is the other half of
-        // the lost-wake guarantee.
-        if drain(runner) > 0 {
+        // Short while anything is running and the idle check otherwise: a child
+        // that exits has to be noticed promptly, because its slot stays taken
+        // and its outcome unreported until it is, while a machine with nothing
+        // running should be waking twice an hour rather than four times a
+        // second.
+        set_read_deadline(
+            &mut socket,
+            daemon::next_tick(runner.running_count(), idle_check),
+        );
+        if !report.needs_session.is_empty() {
+            ensure_sessions(session, signing, revision, runner, &report.needs_session);
+            // A wake that arrived before its session did is not lost: the queue
+            // is the record, so one check picks the work up now rather than
+            // leaving it until the idle timer comes round.
             if let Err(error) = check_depth(session, signing, revision, runner) {
                 eprintln!(
                     "lepidy-agentd: could not check the queue ({}).",
@@ -498,6 +525,36 @@ fn hold_socket(
                 );
             }
         }
+        // A finished process frees a slot, and the work it was answering may
+        // have grown while it ran. Asking after every exit is the other half of
+        // the lost-wake guarantee.
+        if drain(runner, session, signing, revision) > 0 {
+            if let Err(error) = check_depth(session, signing, revision, runner) {
+                eprintln!(
+                    "lepidy-agentd: could not check the queue ({}).",
+                    error.message
+                );
+            }
+            set_read_deadline(
+                &mut socket,
+                daemon::next_tick(runner.running_count(), idle_check),
+            );
+        }
+    }
+}
+
+/// How long the next read may block before the daemon looks around by itself.
+type LiveSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>;
+
+fn set_read_deadline(socket: &mut LiveSocket, deadline: Duration) {
+    match socket.get_ref() {
+        tungstenite::stream::MaybeTlsStream::Plain(stream) => {
+            let _ = stream.set_read_timeout(Some(deadline));
+        }
+        tungstenite::stream::MaybeTlsStream::Rustls(stream) => {
+            let _ = stream.get_ref().set_read_timeout(Some(deadline));
+        }
+        _ => {}
     }
 }
 
@@ -527,20 +584,129 @@ fn check_depth(
         &session.secrets.device_credential,
         revision,
     )?;
-    let report = runner.apply_depth(&depths, Instant::now());
+    let report = runner.apply_depth(&depths, Instant::now(), now_ms());
     announce(&report);
+    if report.needs_session.is_empty() {
+        return Ok(());
+    }
+    // A session is minted here rather than at start time, so a harness is never
+    // spawned with nothing to authenticate with. The same depths are then
+    // applied again: the work was found a moment ago and is still there, and
+    // making it wait for the idle timer would turn a missing session into a
+    // ten-minute delay.
+    ensure_sessions(session, signing, revision, runner, &report.needs_session);
+    let second = runner.apply_depth(&depths, Instant::now(), now_ms());
+    announce(&second);
     Ok(())
+}
+
+/// Mint a session for each agent that has work and no usable one.
+///
+/// One session serves many runs. Starting a harness is the expensive part, and
+/// a workspace that forced a new session per mention would spend more on
+/// process startup than on work — so this only ever runs when a session is
+/// missing, expired, or has been refused.
+fn ensure_sessions(
+    session: &Session,
+    signing: &lepidy_cli::crypto::DeviceSigningKey,
+    revision: u64,
+    runner: &mut Runner,
+    agent_ids: &[String],
+) {
+    for agent_id in agent_ids {
+        match daemon::start_session(
+            &session.client,
+            &session.profile,
+            signing,
+            &session.secrets.device_credential,
+            revision,
+            agent_id,
+        ) {
+            Ok(harness) => {
+                println!("lepidy-agentd: session ready for {agent_id}.");
+                runner.remember_session(harness);
+            }
+            Err(error) => {
+                // Said out loud: an agent that cannot get a session will never
+                // start, and silence there looks identical to no work.
+                println!(
+                    "lepidy-agentd: no session for {agent_id}: {}",
+                    error.message
+                );
+                runner.forget_session(agent_id);
+            }
+        }
+    }
+    let _ = std::io::stdout().flush();
+}
+
+/// Milliseconds since the epoch, for comparing against a token's expiry.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Reap what finished and kill what has run out of time, reporting how many
 /// runs ended so the caller knows whether to ask the queue again.
-fn drain(runner: &mut Runner) -> usize {
+fn drain(
+    runner: &mut Runner,
+    session: &Session,
+    signing: &lepidy_cli::crypto::DeviceSigningKey,
+    revision: u64,
+) -> usize {
     let report = runner.reap(Instant::now());
     for (agent_id, code) in &report.exited {
-        println!("lepidy-agentd: {agent_id} finished with status {code}.");
+        let outcome = RunOutcome::from_exit_code(*code);
+        println!(
+            "lepidy-agentd: {agent_id} finished with status {code} ({}).",
+            outcome.as_str(),
+        );
+        if outcome == RunOutcome::Blocked {
+            // Not a failure and not a refusal by the workspace: the harness
+            // declined something under its own safe default permission
+            // posture, and a person now has a decision to make.
+            println!(
+                "lepidy-agentd: {agent_id} was blocked by its own permission posture; its owner has been told."
+            );
+        }
+        let Some(session_id) = runner.session_id_for(agent_id) else {
+            continue;
+        };
+        // Only a session's own work is reported, so this cannot disturb another
+        // machine's in-flight items.
+        if let Err(error) = daemon::report_outcome(
+            &session.client,
+            &session.profile,
+            signing,
+            &session.secrets.device_credential,
+            revision,
+            (agent_id, &session_id, outcome, exit_reason(*code)),
+        ) {
+            println!(
+                "lepidy-agentd: could not report {agent_id}'s run ({}).",
+                error.message,
+            );
+        }
+        // A session the workspace has stopped honouring is not reused: the next
+        // turn mints a fresh one rather than burning a process to find out.
+        if outcome == RunOutcome::Failed {
+            runner.forget_session(agent_id);
+        }
     }
     let _ = std::io::stdout().flush();
     report.exited.len()
+}
+
+/// A short note for the person who reads it, never the harness's own output.
+fn exit_reason(code: i32) -> &'static str {
+    match code {
+        0 => "the harness finished",
+        78 => "the harness was blocked by its permission posture",
+        -1 => "the harness was stopped or could not be waited on",
+        _ => "the harness exited with a failure",
+    }
 }
 
 fn announce(report: &daemon::TurnReport) {

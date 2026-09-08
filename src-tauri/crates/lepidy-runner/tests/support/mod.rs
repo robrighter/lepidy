@@ -38,6 +38,9 @@ pub const DEVICE_ID: &str = "device-runner";
 pub const DEVICE_CREDENTIAL: &str = "device-credential-runner-0001";
 pub const PASSPHRASE: &str = "correct horse battery staple";
 pub const AGENT_ID: &str = "agent-runner-0001";
+pub const SESSION_ID: &str = "session-runner-0001";
+/// Shaped like a real one, so the double can refuse anything that is not.
+pub const SESSION_TOKEN: &str = "lpd_st_runner-workspace_0123456789abcdef0123456789abcdef";
 
 #[derive(Clone, Debug)]
 pub struct Recorded {
@@ -61,6 +64,23 @@ pub struct DoubleState {
     pub outbound: Vec<String>,
     pub sockets_accepted: usize,
     pub socket_rejected_reason: Option<String>,
+    /* -- the harness workflow (R02) ---------------------------------- */
+    /// Queue items waiting to be claimed, oldest first.
+    pub queue: Vec<String>,
+    /// Items a harness has claimed and not yet completed.
+    pub claimed: Vec<String>,
+    pub completed: Vec<String>,
+    /// What was posted, so a scenario can check the agent actually answered.
+    pub posts: Vec<String>,
+    /// Every MCP tool called, in order.
+    pub tool_calls: Vec<String>,
+    /// How many sessions have been minted. Reuse means this stays at one.
+    pub sessions_minted: usize,
+    /// Every run outcome reported, as (outcome, session id).
+    pub outcomes: Vec<(String, String)>,
+    /// Bearer tokens seen on MCP calls, so a scenario can prove one session
+    /// served many runs rather than several that merely look alike.
+    pub bearers: Vec<String>,
 }
 
 impl DoubleState {
@@ -149,6 +169,10 @@ fn serve(mut stream: TcpStream, state: &Arc<Mutex<DoubleState>>) {
         serve_socket(stream, state, &path);
         return;
     }
+    if path.starts_with("/w/") {
+        serve_mcp(stream, state);
+        return;
+    }
 
     let Some((path, headers, body)) = read_request(&mut stream) else {
         return;
@@ -157,6 +181,22 @@ fn serve(mut stream: TcpStream, state: &Arc<Mutex<DoubleState>>) {
     let claims = decode_claims(&headers);
     let response = {
         let mut locked = state.lock().expect("the double's state");
+        if path == "/api/device/runner/outcome" {
+            if let Ok(parsed) = serde_json::from_slice::<Value>(&body) {
+                locked.outcomes.push((
+                    parsed
+                        .get("outcome")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    parsed
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
+            }
+        }
         locked.requests.push(Recorded {
             path: path.clone(),
             body: body.clone(),
@@ -180,6 +220,93 @@ fn serve(mut stream: TcpStream, state: &Arc<Mutex<DoubleState>>) {
         body.len(),
     );
     let _ = stream.flush();
+}
+
+/// The MCP endpoint a harness speaks, with a bearer session token.
+///
+/// Deliberately not signed. An MCP call carries its own authority in the
+/// session token, which is the boundary R02 is about: the daemon signs as a
+/// device, the harness bears a scoped session, and those are two different
+/// credentials with two different lifetimes.
+fn serve_mcp(mut stream: TcpStream, state: &Arc<Mutex<DoubleState>>) {
+    let Some((_path, headers, body)) = read_request(&mut stream) else {
+        return;
+    };
+    let bearer = headers
+        .get("authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .to_string();
+    let request: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+    let name = request
+        .pointer("/params/name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let arguments = request
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or(json!({}));
+
+    let (status, payload) = {
+        let mut locked = state.lock().expect("the double's state");
+        locked.tool_calls.push(name.clone());
+        locked.bearers.push(bearer.clone());
+        // A token nobody minted is refused at the transport, before there is a
+        // tool result to read — the way a revoked session is.
+        if bearer != SESSION_TOKEN {
+            (401, json!({ "error": { "message": "unauthorized" } }))
+        } else {
+            mcp_result(&mut locked, &name, &arguments)
+        }
+    };
+    let body = payload.to_string();
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    let _ = stream.flush();
+}
+
+fn mcp_result(state: &mut DoubleState, name: &str, arguments: &Value) -> (u16, Value) {
+    let structured = match name {
+        "agent_next" => {
+            if state.queue.is_empty() {
+                json!({ "item": null })
+            } else {
+                let item_id = state.queue.remove(0);
+                state.claimed.push(item_id.clone());
+                json!({
+                    "item": { "item_id": item_id, "channel_id": "channel-runner" },
+                    "lease": { "leaseGeneration": 1 },
+                })
+            }
+        }
+        "agent_start" => json!({ "started": true }),
+        "agent_post" => {
+            state.posts.push(
+                arguments
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            json!({ "messageId": "message-1" })
+        }
+        "agent_complete" => {
+            if let Some(item_id) = arguments.get("item_id").and_then(Value::as_str) {
+                state.claimed.retain(|claimed| claimed != item_id);
+                state.completed.push(item_id.to_string());
+            }
+            json!({ "completed": true })
+        }
+        _ => json!({}),
+    };
+    (
+        200,
+        json!({ "jsonrpc": "2.0", "id": 1, "result": { "structuredContent": structured } }),
+    )
 }
 
 /// Accept the daemon's outbound socket and push whatever the scenario staged.
@@ -217,6 +344,23 @@ fn serve_socket(stream: TcpStream, state: &Arc<Mutex<DoubleState>>, path: &str) 
     }
 
     state.lock().expect("the double's state").sockets_accepted += 1;
+    // A welcome first, the way the workspace sends one. It is what tells the
+    // daemon which agents it answers for, and therefore what it should hold a
+    // session for — so a wake arriving straight afterwards is not spent
+    // discovering there is none.
+    let welcome = json!({
+        "type": "welcome",
+        "deviceId": DEVICE_ID,
+        "runnerEpoch": 1,
+        "agentIds": [AGENT_ID],
+    })
+    .to_string();
+    if socket
+        .send(tungstenite::Message::Text(welcome.into()))
+        .is_err()
+    {
+        return;
+    }
     // A short read timeout so this thread can do both jobs: notice frames the
     // daemon sends, and notice frames the scenario stages while it is running.
     let _ = socket
@@ -400,13 +544,48 @@ fn respond(state: &mut DoubleState, path: &str, verified: bool) -> (u16, Value) 
                 "displacedDeviceIds": [],
             }),
         ),
-        "/api/device/runner/depth" => (
-            200,
-            json!({ "workspaceId": WORKSPACE_ID, "runnerEpoch": 1, "agents": state.depth }),
-        ),
+        "/api/device/runner/depth" => {
+            // Derived from the queue, the way the workspace derives it, so a
+            // scenario does not have to keep two numbers in step. A scenario
+            // that wants a specific answer sets `depth` and that wins.
+            let agents = if state.depth.is_empty() && !state.queue.is_empty() {
+                vec![json!({
+                    "agentId": AGENT_ID,
+                    "presetId": "p1",
+                    "depth": state.queue.len(),
+                    "status": "active",
+                })]
+            } else {
+                state.depth.clone()
+            };
+            (
+                200,
+                json!({ "workspaceId": WORKSPACE_ID, "runnerEpoch": 1, "agents": agents }),
+            )
+        }
         "/api/device/runner/release" => {
             (200, json!({ "workspaceId": WORKSPACE_ID, "released": 1 }))
         }
+        "/api/device/runner/session" => {
+            state.sessions_minted += 1;
+            (
+                200,
+                json!({
+                    "workspaceId": WORKSPACE_ID,
+                    "agentId": AGENT_ID,
+                    "sessionId": SESSION_ID,
+                    "delegationId": "delegation-runner",
+                    "token": SESSION_TOKEN,
+                    // Far enough away that no scenario is timing-dependent; the
+                    // expiry rule itself has its own unit scenario.
+                    "tokenExpiresAt": 4_102_444_800_000u64,
+                    "hardExpiresAt": 4_102_444_800_000u64,
+                    "capabilities": ["agent_next", "agent_start", "agent_post", "agent_complete"],
+                    "mcpPath": "/w/runner-workspace/mcp",
+                }),
+            )
+        }
+        "/api/device/runner/outcome" => (200, json!({ "workspaceId": WORKSPACE_ID })),
         _ => (
             404,
             json!({ "error": "not_found", "message": "no such endpoint" }),
@@ -578,6 +757,11 @@ fn command(home: &TempHome, arguments: &[&str]) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("the lepidy-agentd binary")
+}
+
+/// The reference harness a preset points at.
+pub fn harness_binary() -> &'static str {
+    env!("CARGO_BIN_EXE_lepidy-harness-reference")
 }
 
 pub fn text(output: &[u8]) -> String {

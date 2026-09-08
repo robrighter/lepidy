@@ -17,6 +17,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::daemon::HarnessSession;
 use crate::preset::Preset;
 
 /// How long a tree gets to exit after being asked, before it is killed.
@@ -25,6 +26,7 @@ pub const GRACE: Duration = Duration::from_secs(10);
 pub struct RunningProcess {
     pub agent_id: String,
     pub request_id: String,
+    pub session_id: String,
     pub started_at: Instant,
     pub deadline: Instant,
     child: Child,
@@ -70,29 +72,44 @@ impl RunningProcess {
 
 /// Start one run of a preset.
 ///
-/// The environment is the preset's, not the trigger's: a wake carries no
-/// environment mapping, so there is nothing here for a workspace to influence.
-/// What it does carry is which agent and which request, passed as the harness's
-/// own context, and those are ids rather than instructions.
+/// The environment is the preset's and this machine's, never the trigger's: a
+/// wake carries no environment mapping, so there is nothing here for a
+/// workspace to influence. What the child is given is which agent it is
+/// answering for, where to speak MCP, and the session token to speak it with.
+///
+/// The token goes in the environment and never in `argv`, for the same reason
+/// no credential ever does: a command line is readable by every other process
+/// on the machine and is captured verbatim by harness logs. The environment is
+/// visible to the child and its descendants — which is the point, since the
+/// harness is the thing that has to use it — and to nobody else.
 pub fn spawn_preset(
     preset: &Preset,
-    agent_id: &str,
+    session: &HarnessSession,
     request_id: &str,
     workspace_id: &str,
     now: Instant,
 ) -> io::Result<RunningProcess> {
     let mut command = Command::new(&preset.program);
     command.args(&preset.args);
+    // The preset's own environment, applied before Lepidy's, so nothing a local
+    // operator sets can quietly overwrite the session the daemon is handing over.
+    for (name, value) in &preset.environment {
+        command.env(name, value);
+    }
     if let Some(directory) = preset.working_directory.as_deref() {
         command.current_dir(Path::new(directory));
     }
-    // Ids only. A harness needs to know which agent it is answering for; it
-    // does not need, and is not given, anything the workspace wrote.
+    // Ids, an endpoint and a session token. A harness needs to know which agent
+    // it is answering for and how to reach the workspace; it does not need, and
+    // is not given, anything the workspace wrote as prose.
     command
-        .env("LEPIDY_AGENT_ID", agent_id)
+        .env("LEPIDY_AGENT_ID", &session.agent_id)
         .env("LEPIDY_REQUEST_ID", request_id)
         .env("LEPIDY_WORKSPACE_ID", workspace_id)
         .env("LEPIDY_PRESET_ID", &preset.id)
+        .env("LEPIDY_MCP_URL", &session.mcp_url)
+        .env("LEPIDY_SESSION_ID", &session.session_id)
+        .env("LEPIDY_SESSION_TOKEN", &session.token)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -107,8 +124,9 @@ pub fn spawn_preset(
 
     let child = command.spawn()?;
     Ok(RunningProcess {
-        agent_id: agent_id.to_string(),
+        agent_id: session.agent_id.clone(),
         request_id: request_id.to_string(),
+        session_id: session.session_id.clone(),
         started_at: now,
         deadline: now + Duration::from_secs(preset.timeout_seconds),
         child,
@@ -152,6 +170,17 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    /// A session, as the daemon hands one to a child.
+    fn session() -> HarnessSession {
+        HarnessSession {
+            agent_id: "agent-1".to_string(),
+            session_id: "session-1".to_string(),
+            token: "lpd_st_test_token".to_string(),
+            mcp_url: "http://127.0.0.1:1/w/test/mcp".to_string(),
+            token_expires_at: u64::MAX,
+        }
+    }
+
     fn sleeping_preset(seconds: u64, timeout_seconds: u64) -> Preset {
         // A shell is used rather than a compiled helper because the point of
         // the test is the *tree*: the shell is one process and the sleep it
@@ -175,6 +204,7 @@ mod tests {
             args,
             working_directory: None,
             credentials: BTreeMap::new(),
+            environment: BTreeMap::new(),
             max_concurrent: 1,
             cooldown_seconds: 0,
             timeout_seconds,
@@ -197,7 +227,7 @@ mod tests {
         };
         let mut running = spawn_preset(
             &preset,
-            "agent-1",
+            &session(),
             "request-1",
             "workspace-1",
             Instant::now(),
@@ -223,7 +253,7 @@ mod tests {
         let preset = sleeping_preset(120, 300);
         let mut running = spawn_preset(
             &preset,
-            "agent-1",
+            &session(),
             "request-1",
             "workspace-1",
             Instant::now(),
@@ -244,7 +274,7 @@ mod tests {
     fn a_run_past_its_deadline_is_overdue() {
         let preset = sleeping_preset(120, 0);
         let started = Instant::now();
-        let mut running = spawn_preset(&preset, "agent-1", "request-1", "workspace-1", started)
+        let mut running = spawn_preset(&preset, &session(), "request-1", "workspace-1", started)
             .expect("the preset starts");
         // A harness that hangs is the ordinary case this exists for: no error,
         // no exit, just a process that never finishes.
@@ -272,7 +302,7 @@ mod tests {
 
         let mut running = spawn_preset(
             &preset,
-            "agent-1",
+            &session(),
             "request-1",
             "workspace-1",
             Instant::now(),

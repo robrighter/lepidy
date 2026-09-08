@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use support::{
-    agentd, enrol, spawn_agentd, text, wake, Double, DoubleState, TempHome, AGENT_ID,
-    DEVICE_CREDENTIAL, PASSPHRASE,
+    agentd, enrol, harness_binary, spawn_agentd, text, wake, Double, DoubleState, TempHome,
+    AGENT_ID, DEVICE_CREDENTIAL, PASSPHRASE, SESSION_ID, SESSION_TOKEN,
 };
 
 /// Where a started run leaves its mark. A file, because the assertion has to
@@ -554,4 +554,239 @@ fn runner_cli_int_012_never_puts_a_secret_on_a_command_line() {
             "the device credential was printed",
         );
     }
+}
+
+/* -------------------------------------------------------------------------- */
+/* The first local harness workflow (R02)                                      */
+/* -------------------------------------------------------------------------- */
+
+/// A preset that runs the reference harness — a real, separate process that
+/// speaks real MCP over real HTTP.
+///
+/// Why a first-party harness rather than Claude Code or Codex: a verification
+/// gate that needs an API key, a model provider and a network is not a gate.
+/// These scenarios prove the *contract* — the environment a harness is handed,
+/// the tools it may call, the exit codes it reports with — deterministically
+/// and offline. Certifying a particular model-backed harness against a live
+/// model is R04's matrix, and nothing here claims one.
+fn set_harness_preset(home: &TempHome, id: &str, mode: &str) -> std::process::Output {
+    agentd(
+        home,
+        &[
+            "preset",
+            "set",
+            id,
+            "--program",
+            harness_binary(),
+            "--env",
+            &format!("LEPIDY_HARNESS_MODE={mode}"),
+            "--cooldown",
+            "0",
+            "--timeout",
+            "120",
+        ],
+        &[PASSPHRASE],
+    )
+}
+
+fn harness_scenario(label: &str, mode: &str, items: usize) -> (TempHome, Double) {
+    let home = TempHome::create(label);
+    let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
+    let key = enrol(&home, &double.url());
+    double.with_state(|state| {
+        state.signing_key = Some(key);
+        state.queue = (0..items).map(|index| format!("item-{index}")).collect();
+    });
+    let output = set_harness_preset(&home, "p1", mode);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    (home, double)
+}
+
+#[test]
+fn runner_cli_int_013_drains_a_claim_and_answers_in_the_room_it_came_from() {
+    let (home, double) = harness_scenario("harness-drain", "drain", 1);
+    double.with_state(|state| state.outbound = vec![wake("p1", 2)]);
+    let child = spawn_agentd(&home, &["run", "--idle-check", "3600"]);
+
+    // The whole workflow, over real HTTP: claim, start, answer, complete.
+    //
+    // Waited on the *report* rather than the completion, because a run is only
+    // over once its process has exited — reading the calls any earlier races
+    // the harness's own last question.
+    let reported = double.wait_for("the run to be reported", |state| {
+        state.outcomes.first().cloned()
+    });
+    // The machine says how it went, against the session that did the work.
+    assert_eq!(reported, ("completed".to_string(), SESSION_ID.to_string()));
+    let (calls, posts, bearers) = double.with_state(|state| {
+        (
+            state.tool_calls.clone(),
+            state.posts.clone(),
+            state.bearers.clone(),
+        )
+    });
+    assert_eq!(
+        calls,
+        vec![
+            "agent_next".to_string(),
+            "agent_start".to_string(),
+            "agent_post".to_string(),
+            "agent_complete".to_string(),
+            // The last one is the harness asking for more and being told there
+            // is none, which is how a bounded drain ends.
+            "agent_next".to_string(),
+        ],
+    );
+    assert_eq!(posts.len(), 1, "the agent did not answer");
+    assert!(posts[0].contains("item-0"), "{posts:?}");
+    // Every call carried the session the daemon minted, not something the
+    // harness invented.
+    assert!(
+        bearers.iter().all(|bearer| bearer == SESSION_TOKEN),
+        "an MCP call used an unexpected credential",
+    );
+
+    child.stop();
+}
+
+#[test]
+fn runner_cli_int_014_serves_many_runs_from_one_session() {
+    // One item at a time, so this is three separate *runs* rather than one run
+    // that drained three items — which is the thing being measured.
+    let (home, double) = harness_scenario("harness-reuse", "drain", 1);
+    double.with_state(|state| state.outbound = vec![wake("p1", 2)]);
+    let child = spawn_agentd(&home, &["run", "--idle-check", "3600"]);
+    child.wait_for_output("finished with status 0");
+    for round in 1..3 {
+        let before = double.with_state(|state| state.completed.len());
+        // Queued only once the previous run has actually ended, so this is
+        // three separate runs rather than one racing another's concurrency
+        // limit — the property under test is the *session*, not the brakes.
+        double.with_state(|state| {
+            state.queue.push(format!("item-round-{round}"));
+            state.outbound.push(wake("p1", 2));
+        });
+        double.wait_for("another item", |state| {
+            (state.completed.len() > before).then_some(())
+        });
+        child.wait_for_output(&format!("drained 1 item(s)"));
+    }
+    assert_eq!(double.with_state(|state| state.completed.len()), 3);
+
+    let (minted, bearers) =
+        double.with_state(|state| (state.sessions_minted, state.bearers.clone()));
+    // Starting a harness is the expensive part. Three runs, one session: a
+    // workspace that forced a new one per mention would spend more on process
+    // startup than on the work itself.
+    assert_eq!(
+        minted, 1,
+        "the daemon minted {minted} sessions for three runs"
+    );
+    assert!(bearers.iter().all(|bearer| bearer == SESSION_TOKEN));
+    child.stop();
+}
+
+#[test]
+fn runner_cli_int_015_reports_a_harness_blocked_by_its_own_permission_posture() {
+    let (home, double) = harness_scenario("harness-blocked", "blocked", 1);
+    double.with_state(|state| state.outbound = vec![wake("p1", 2)]);
+    let child = spawn_agentd(&home, &["run", "--idle-check", "3600"]);
+
+    let reported = double.wait_for("the run to be reported", |state| {
+        state.outcomes.first().cloned()
+    });
+    // Not a failure and not a refusal by the workspace: the harness declined
+    // something under its own safe default posture, and that is a person's
+    // decision waiting to be made.
+    assert_eq!(reported, ("blocked".to_string(), SESSION_ID.to_string()));
+
+    // The claim it was holding is left claimed here, which is what the
+    // workspace turns into `needs_attention` — proved against the real object
+    // in RUNNER-INT-019. Nothing was posted, because it never got that far.
+    let (claimed, posts, completed) = double.with_state(|state| {
+        (
+            state.claimed.clone(),
+            state.posts.clone(),
+            state.completed.clone(),
+        )
+    });
+    assert_eq!(claimed, vec!["item-0".to_string()]);
+    assert!(posts.is_empty(), "a blocked harness must not have answered");
+    assert!(completed.is_empty());
+
+    // And the operator watching the log is told in words, because a blocked
+    // harness nobody hears about is a blocked harness nobody unblocks.
+    let output = child.wait_for_output("blocked by its own permission posture");
+    assert!(output.contains(AGENT_ID), "{output}");
+    child.stop();
+}
+
+#[test]
+fn runner_cli_int_016_finds_work_that_arrived_while_the_last_run_was_ending() {
+    let (home, double) = harness_scenario("harness-exit-race", "drain", 1);
+    double.with_state(|state| state.outbound = vec![wake("p1", 2)]);
+    let child = spawn_agentd(&home, &["run", "--idle-check", "3600"]);
+    double.wait_for("the first item", |state| {
+        (!state.completed.is_empty()).then_some(())
+    });
+
+    // The race: more work exists, and the wake announcing it went to a socket
+    // whose process was already exiting. Nothing tells this machine again.
+    double.with_state(|state| {
+        state.queue.push("item-late".to_string());
+        state.depth = vec![serde_json::json!({
+            "agentId": AGENT_ID,
+            "presetId": "p1",
+            "depth": 1,
+            "status": "active",
+        })];
+    });
+
+    // The check after every exit finds it anyway, which is the whole reason
+    // that check exists rather than the design relying on a delivered wake.
+    double.wait_for("the late item to be worked", |state| {
+        state
+            .completed
+            .iter()
+            .any(|item| item == "item-late")
+            .then_some(())
+    });
+    assert_eq!(
+        double.with_state(|state| state.sessions_minted),
+        1,
+        "recovering from the race should not have cost a new session",
+    );
+    child.stop();
+}
+
+#[test]
+fn runner_cli_int_017_keeps_the_session_token_out_of_every_command_line() {
+    let (home, double) = harness_scenario("harness-argv", "drain", 1);
+    double.with_state(|state| state.outbound = vec![wake("p1", 2)]);
+    let child = spawn_agentd(&home, &["run", "--idle-check", "3600"]);
+    double.wait_for("the item to be completed", |state| {
+        (!state.completed.is_empty()).then_some(())
+    });
+    let output = child.stop();
+
+    // The token reaches the harness through its environment and nowhere else.
+    // A command line is readable by every other process on the machine and is
+    // captured verbatim by harness logs, which is exactly where a token must
+    // never be.
+    assert!(
+        !output.contains(SESSION_TOKEN),
+        "the session token was printed"
+    );
+    assert!(!output.contains(PASSPHRASE), "the passphrase was printed");
+    assert!(
+        !output.contains(DEVICE_CREDENTIAL),
+        "the device credential was printed"
+    );
+    let stored = std::fs::read_to_string(home.path.join("presets.json")).expect("the preset file");
+    // And it is never written into the launch configuration either, which
+    // outlives any one session.
+    assert!(
+        !stored.contains(SESSION_TOKEN),
+        "the preset file holds a session token"
+    );
 }
