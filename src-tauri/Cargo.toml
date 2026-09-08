@@ -13,15 +13,25 @@ rust-version = "1.77.2"
 name = "lepidy_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Windows Hello, and the ACL check on a local preset file. Both are real
+# platform questions with no portable answer; the crate wraps the unsafe calls
+# so this one does not have to.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Foundation",
+  "Security_Credentials_UI",
+] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+lepidy-runner = { path = "crates/lepidy-runner" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 thiserror = "1"
 
 # Password hashing and the vault's own primitives are deliberately expensive.

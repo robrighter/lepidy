@@ -135,8 +135,12 @@ pub fn spawn_preset(
 
 /// Signal an entire tree. Best effort: a tree that has already exited is the
 /// outcome this was asking for, and a signal to a reaped pid must not be fatal.
+///
+/// Public because the desktop shell supervises the daemon the same way the
+/// daemon supervises a harness, and two copies of this would be two chances to
+/// get a platform wrong.
 #[cfg(unix)]
-fn signal_tree(pid: u32, force: bool) {
+pub fn signal_tree(pid: u32, force: bool) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
@@ -150,7 +154,7 @@ fn signal_tree(pid: u32, force: bool) {
 }
 
 #[cfg(windows)]
-fn signal_tree(pid: u32, force: bool) {
+pub fn signal_tree(pid: u32, force: bool) {
     // `/T` is the tree; `/F` is the forceful half of the two-stage stop. There
     // is no graceful tree-wide signal on Windows, so the first pass asks
     // `taskkill` to close the process politely and the second forces it.
@@ -163,7 +167,7 @@ fn signal_tree(pid: u32, force: bool) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn signal_tree(_pid: u32, _force: bool) {}
+pub fn signal_tree(_pid: u32, _force: bool) {}
 
 #[cfg(test)]
 mod tests {

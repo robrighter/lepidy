@@ -165,9 +165,10 @@ pub fn save_presets_at(path: &Path, store: &PresetStore) -> CliResult<()> {
 
 /// Refuse a preset file that anybody but its owner can read or write.
 ///
-/// On Unix this is the permission bits and the owning uid. On Windows the
-/// equivalent check needs the ACL API, which is R03's native ground; until then
-/// this says so rather than pretending the check happened.
+/// On Unix this is the permission bits and the owning uid. On Windows it is the
+/// file's discretionary ACL: a file whose access is granted to anybody beyond
+/// its owner, `SYSTEM` and the administrators group is somebody else's launch
+/// configuration waiting to run as this user.
 pub fn assert_owner_only(path: &Path) -> CliResult<()> {
     #[cfg(unix)]
     {
@@ -197,9 +198,95 @@ pub fn assert_owner_only(path: &Path) -> CliResult<()> {
             )));
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        assert_windows_acl_is_owner_only(path)?;
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = path;
     Ok(())
+}
+
+/// The Windows half of the same question, asked through `icacls`.
+///
+/// Deliberately the documented command-line tool rather than the ACL API: this
+/// crate forbids `unsafe`, the check is a startup-time question rather than a
+/// hot path, and `icacls` output is what an administrator would look at to
+/// answer the same question by hand — so a refusal here can be reproduced by
+/// the person who has to fix it.
+///
+/// Only three principals may hold access: the file's owner, `SYSTEM`, and the
+/// local administrators group. Anybody else — `Users`, `Everyone`, another
+/// account — means this machine's launch configuration is not this user's
+/// alone.
+#[cfg(windows)]
+fn assert_windows_acl_is_owner_only(path: &Path) -> CliResult<()> {
+    use std::process::Command;
+
+    let output = Command::new("icacls").arg(path).output().map_err(|error| {
+        CliError::failure(format!("could not inspect {}: {error}", path.display()))
+    })?;
+    if !output.status.success() {
+        return Err(CliError::failure(format!(
+            "could not inspect the permissions of {}",
+            path.display()
+        )));
+    }
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let user = std::env::var("USERNAME")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for principal in acl_principals(&rendered, &path.display().to_string())? {
+        let lowered = principal.to_ascii_lowercase();
+        let allowed = lowered.ends_with("\\system")
+            || lowered == "nt authority\\system"
+            || lowered.ends_with("\\administrators")
+            || lowered == "builtin\\administrators"
+            || (!user.is_empty() && lowered.ends_with(&format!("\\{user}")))
+            || lowered == user;
+        if !allowed {
+            return Err(CliError::failure(format!(
+                "{} grants access to {principal}; launch configuration must be owner-only",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The principals named in `icacls` output, one per access-control entry.
+///
+/// Split out so the parsing has its own scenarios. `icacls` prints the path and
+/// the first entry on one line, and both a Windows path and a principal like
+/// `NT AUTHORITY\SYSTEM` contain spaces — so the path is stripped by the exact
+/// text that was passed in rather than guessed at. A line that cannot be read
+/// is an error, never a line that is skipped: a parser that silently drops
+/// entries is a check that silently passes.
+#[cfg(any(windows, test))]
+pub fn acl_principals(rendered: &str, path: &str) -> CliResult<Vec<String>> {
+    let unreadable = || CliError::failure(format!("could not read the permissions of {path}"));
+    let mut principals = Vec::new();
+    for (index, line) in rendered.lines().enumerate() {
+        let line = line.trim_end();
+        if line.trim().is_empty() || line.contains("Successfully processed") {
+            continue;
+        }
+        let entry = if index == 0 {
+            line.strip_prefix(path).ok_or_else(unreadable)?.trim_start()
+        } else {
+            line.trim()
+        };
+        let (principal, rights) = entry.split_once(':').ok_or_else(unreadable)?;
+        if !rights.trim_start().starts_with('(') {
+            return Err(unreadable());
+        }
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Err(unreadable());
+        }
+        principals.push(principal.to_string());
+    }
+    Ok(principals)
 }
 
 #[cfg(unix)]
@@ -314,6 +401,45 @@ mod tests {
             error.message,
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_the_principals_out_of_an_access_control_list() {
+        const PATH: &str = r"C:\Users\maya\my files\presets.json";
+
+        // Real `icacls` output. Both the path and the first principal contain
+        // spaces, which is why the path is stripped by the exact text passed in
+        // rather than guessed at.
+        let rendered = format!(
+            "{PATH} NT AUTHORITY\\SYSTEM:(F)\r\nBUILTIN\\Administrators:(F)\r\nDESKTOP-1\\maya:(F)\r\n\r\nSuccessfully processed 1 files; Failed processing 0 files"
+        );
+        assert_eq!(
+            acl_principals(&rendered, PATH).expect("well-formed output parses"),
+            vec![
+                r"NT AUTHORITY\SYSTEM".to_string(),
+                r"BUILTIN\Administrators".to_string(),
+                r"DESKTOP-1\maya".to_string(),
+            ],
+        );
+
+        // The entry this check exists to catch is not skipped.
+        let open = format!("{PATH} BUILTIN\\Users:(RX)\r\nDESKTOP-1\\maya:(F)");
+        assert!(acl_principals(&open, PATH)
+            .expect("parses")
+            .contains(&r"BUILTIN\Users".to_string()));
+
+        // Output this cannot read is an error, never an empty list: a parser
+        // that silently drops entries is a check that silently passes.
+        for broken in [
+            "something else entirely\r\nBUILTIN\\Users:(RX)".to_string(),
+            format!("{PATH} BUILTIN\\Users(RX)"),
+            format!("{PATH} :(RX)"),
+        ] {
+            assert!(
+                acl_principals(&broken, PATH).is_err(),
+                "unreadable output was accepted: {broken}",
+            );
+        }
     }
 
     #[test]

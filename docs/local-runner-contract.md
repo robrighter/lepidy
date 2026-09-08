@@ -181,12 +181,16 @@ Editing moves the revision, which is signed into every request afterwards, so
 the workspace can tell a session started under an edited preset from one started
 under the preset it registered — without ever learning what either preset says.
 
-**This is presence, not platform identity.** A biometric or platform credential —
-Windows Hello, Touch ID, PAM — is the stronger gesture and belongs to the native
-shell in R03. Until that exists, the passphrase is the honest version of the
-same guarantee rather than a claim that the operating system vouched for
-anybody. The owner-and-permissions check is a real OS check and is enforced on
-Unix today; the Windows ACL equivalent is R03's.
+**The passphrase is presence, not platform identity**, and the daemon keeps it
+because a headless machine has no desktop to prompt on. R03 adds the stronger
+gesture on top, through the desktop shell: Windows Hello confirms the person at
+the keyboard, bound to a digest of the exact action, single-use and short-lived.
+On a platform where no verifier is wired up the shell refuses rather than
+assuming — see the [native shell contract](./native-shell-contract.md).
+
+The owner-and-permissions check is a real OS check on both platforms now: file
+mode and owning uid on Unix, and the discretionary ACL on Windows, where any
+principal beyond the owner, `SYSTEM` and the administrators group is a refusal.
 
 ## 10. What this does not certify
 
