@@ -95,6 +95,15 @@ pub struct AgentDepth {
     pub preset_id: String,
     pub depth: u64,
     pub status: String,
+    /// What an owner has asked somebody at this computer to do about this
+    /// agent's local configuration.
+    ///
+    /// Intents from a closed server-side set and nothing else — this field can
+    /// never carry a program, a path, an argument, a limit or free text, and
+    /// the daemon does not act on it. It prints it, so the person who has to
+    /// make the change finds out here rather than in a chat message they
+    /// missed (R05).
+    pub local_reviews: Vec<String>,
 }
 
 /// What one turn of the loop did, so a test can assert on it and an operator
@@ -418,6 +427,16 @@ pub fn fetch_depth(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("active")
                     .to_string(),
+                local_reviews: entry
+                    .get("localReviews")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect())
@@ -807,6 +826,7 @@ mod tests {
                 preset_id: "preset-default".to_string(),
                 depth: 3,
                 status: "active".to_string(),
+                local_reviews: Vec::new(),
             }],
             Instant::now(),
         );
@@ -824,6 +844,7 @@ mod tests {
                 preset_id: "preset-default".to_string(),
                 depth: 0,
                 status: "active".to_string(),
+                local_reviews: Vec::new(),
             }],
             Instant::now(),
         );

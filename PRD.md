@@ -382,26 +382,42 @@ This deliberately contradicts the sibling rule in §7.4, where an out-of-scope m
 Per agent, on the agent's configuration page, and the three presets are the point:
 
 ```
-Runtime   ( ) Connected      (•) Local session      ( ) Hosted      ( ) Custom
+Runtime   ( ) Connected      (•) Local session      ( ) Claude Cloud   ( ) Custom
 
-  Runner          [ maya-mbp            ▾ ]   ● online · last seen 2s ago
-  Local preset    [ api-worktree · revision 14 ]   ✓ approved on maya-mbp
-  Harness         Claude Code             reported by the local preset
-  Launch details  Hidden remotely         [ Manage on maya-mbp ]
-  Credentials     [ GITHUB_TOKEN ×] [ SENTRY_TOKEN ×] [ + ]    injected via `lepidy run`
+  Machine         maya-mbp   80fd54f5-…              ● online · last seen 2s ago
+  Local preset    api-worktree · revision 14
+  Launch config   Stored only on maya-mbp · unavailable to remote clients
+  Waiting         2 items · 1 needs attention
 
-  Session
-    Reuse a running session                    [✓]   recommended
-    Idle timeout before the session exits      [ 10 minutes ▾ ]
-    Max concurrent sessions on this runner     [ 2 ▾ ]
-    Max starts per hour                        [ 6 ▾ ]
-    Who can start a session                    [ Anyone in scope ▾ ]  Owners only · A group
+  Who may start a session
+    Start on mention                           [✓]
+    Who may start it                           [ Anyone in the agent's rooms ▾ ]  Owners only
 
-  ⚠ This machine has not yet allowed @a.triage to start sessions.
-     Approve it in the Lepidy desktop app on maya-mbp.          [ Send reminder ]
+  Changes only that machine can make
+    ⚠ Allow this agent to start sessions — asked by @maya at revision 14.
+      Pending on the machine.                                  [ Withdraw ]
+    [ Ask that machine to … ▾ ]                                [ Send the request ]
+
+  [ Start a session now ]  [ Stop everything ]
 ```
 
+**Implemented as R05, with one correction to the sketch above.** An earlier draft
+of this screen offered idle timeout, max concurrent sessions and max starts per
+hour as remote dropdowns. Those are *resource limits*, which the security rules
+below place on the machine — so the implemented screen shows what the machine
+reported and offers an **ask** instead of an editor: an intent from a closed set,
+addressed to the device that answers for this agent, which stays visibly pending
+until that machine reports a higher preset revision. What remains a cloud
+control is who may cause a start at all, because that decides what the workspace
+*sends* rather than what the machine runs.
+
 **The launch presets are local configuration.** The desktop app and local CLI may install signed built-in defaults, but executable paths, scripts, arguments, working directories, environment references and limits are created and edited only on that computer. The cloud stores only an opaque preset id, the approved device id, a non-secret revision/hash and readiness. A remote client can request that an already-approved preset run; it cannot create, edit, reset, replace or parameterize one. Updating built-in defaults therefore ships through the signed desktop/CLI update channel, with an explicit local review before an existing preset changes.
+
+The delegation behind an unattended agent is restated on this screen as one
+English sentence — *"Runs as @maya in #billing and #support until 5 Oct 2026.
+May use STRIPE_TEST and SENTRY_TOKEN. Spend cap $20.00/day."* — with one button
+to re-affirm it for another thirty days. Below it, every session and every run
+the agent has had, including the runs that never started.
 
 Each local preset supplies a non-interactive invocation, the approved MCP connection template and a **default permission posture that is the harness's safe one**. The server may mint a short-lived session credential and deliver the agent's current brief as task data after launch; neither can change the executable, arguments, working directory, environment mapping or permission posture. Loosening the posture requires a fresh local OS-verification gesture.
 

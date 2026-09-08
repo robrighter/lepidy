@@ -200,7 +200,13 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 .rail-toggle { display: none; }
 
 .content { flex: 1; padding: 22px 20px 64px; }
-.content-inner { max-width: 980px; margin: 0 auto; display: grid; gap: 18px; }
+/* `minmax(0, 1fr)` rather than the implicit `auto` track: an auto track is
+   sized by its items' min-content, so one wide descendant — a command line, a
+   table, a code block — widens the whole column and the page scrolls sideways
+   on a phone. The explicit zero minimum pins the column to the container and
+   lets those elements scroll inside their own boxes, which is what their
+   `overflow-x` was for. */
+.content-inner { max-width: 980px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
 
 .panel { padding: 18px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--sh-1); }
 .panel h2 { font: 650 15px/1.3 var(--font-display); }
@@ -533,3 +539,135 @@ button.danger:hover:not(:disabled) { background: #fdf2f4; }
 }
 .tag.overdue { background: #fdf2f4; color: #b03a52; }
 :root[data-theme="dark"] .tag.overdue { background: var(--surface-2); color: var(--coral); }
+
+/* ---------------- runtime configuration (R05) ----------------
+   One page, one loud thing. The delegation sentence is the signature element
+   here — a permission nobody can restate is a permission nobody is supervising,
+   so it is set in the display face at reading size with a tone rule beside it,
+   and every other control on the page stays deliberately quiet around it. */
+
+.runtime-title { font: 700 20px/1.2 var(--font-display); }
+.runtime-status-line { margin: 4px 0 0; color: var(--text-2); font-size: 13px; }
+.runtime-lede { max-width: 62ch; }
+.runtime-note { max-width: 68ch; margin: 10px 0 0; color: var(--text-3); font-size: 12.5px; }
+.runtime-note code, .runtime-hidden-config code { padding: 1px 5px; border-radius: 5px; background: var(--sunken); }
+.runtime-subhead { margin: 18px 0 6px; font: 650 13px/1.3 var(--font-display); }
+.agent-links { display: inline-flex; align-items: center; gap: 14px; }
+
+/* The four runtimes, as one real radio group. */
+.runtime-choices fieldset { display: grid; gap: 10px; margin: 14px 0 0; padding: 0; border: 0; }
+@media (min-width: 760px) { .runtime-choices fieldset { grid-template-columns: 1fr 1fr; } }
+.runtime-choice {
+  display: flex; gap: 10px; padding: 13px; border: 1px solid var(--line);
+  border-radius: var(--r-md); background: var(--surface-2);
+}
+.runtime-choice[data-current="yes"] { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.runtime-choice[data-selectable="no"] { background: var(--sunken); }
+.runtime-choice input { margin: 3px 0 0; accent-color: var(--accent); }
+.runtime-choice-body { display: grid; gap: 3px; }
+.runtime-choice-title { display: inline-flex; align-items: center; gap: 7px; font: 650 13.5px/1.3 var(--font-display); }
+.runtime-attended { color: var(--text-3); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+.runtime-choice-blurb { color: var(--text-2); font-size: 12.5px; }
+.runtime-choice-note { color: var(--text-3); font-size: 11.5px; font-style: italic; }
+.runtime-choices .primary {
+  margin-top: 14px; padding: 9px 15px; border: 0; border-radius: var(--r-sm);
+  background: var(--accent); color: var(--on-accent); font-weight: 650;
+}
+.runtime-choices .primary:disabled { opacity: .55; cursor: not-allowed; }
+/* Dark mode lifts the accent to stay visible against a dark ground, which
+   leaves white label text at 3.5:1. The label takes the deep indigo instead:
+   5.2:1 on the same chip, and a brighter button rather than a duller one. */
+:root[data-theme="dark"] .runtime-choices .primary,
+:root[data-theme="dark"] .runtime-form .primary { color: #14122e; }
+
+/* The sentence. */
+.runtime-authority { border-left: 4px solid var(--line-strong); }
+.runtime-authority[data-tone="ok"] { border-left-color: var(--mint); }
+.runtime-authority[data-tone="warn"] { border-left-color: var(--amber); }
+.runtime-authority[data-tone="alert"] { border-left-color: var(--coral); }
+.runtime-sentence {
+  max-width: 56ch; margin: 10px 0 8px;
+  font: 650 17px/1.45 var(--font-display); color: var(--text); text-wrap: pretty;
+}
+.runtime-authority-note { max-width: 68ch; margin: 0; color: var(--text-2); font-size: 12.5px; }
+
+.runtime-command {
+  margin: 12px 0 0; padding: 11px 13px; overflow-x: auto;
+  border: 1px solid var(--line); border-radius: var(--r-md); background: var(--sunken);
+}
+.runtime-command code { font-size: 12.5px; }
+.runtime-hidden-config { color: var(--text-2); font-family: var(--font-mono); font-size: 12px; }
+
+.runtime-warning { border-color: color-mix(in srgb, var(--amber) 55%, var(--line)); }
+.runtime-risk { border-color: color-mix(in srgb, var(--coral) 45%, var(--line)); }
+.runtime-attention { color: #b03a52; font-weight: 600; }
+:root[data-theme="dark"] .runtime-attention { color: var(--coral); }
+
+.runtime-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.runtime-controls form, .runtime-inline-form { margin: 0; }
+.runtime-controls button, .runtime-inline-form button, .runtime-requests button, .runtime-budget-form button,
+.runtime-form button {
+  padding: 7px 13px; border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  background: var(--surface-2); color: var(--text); font-size: 13px; font-weight: 600;
+}
+.runtime-controls button:hover:not(:disabled), .runtime-inline-form button:hover:not(:disabled),
+.runtime-form button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.runtime-controls button:disabled, .runtime-inline-form button:disabled, .runtime-form button:disabled,
+.runtime-requests button:disabled, .runtime-budget-form button:disabled { opacity: .55; cursor: not-allowed; }
+.runtime-controls .danger { border-color: color-mix(in srgb, var(--coral) 60%, var(--line-strong)); color: #b03a52; }
+:root[data-theme="dark"] .runtime-controls .danger { color: var(--coral); }
+.runtime-inline-form { margin-top: 12px; }
+
+.runtime-form { display: grid; gap: 12px; margin: 14px 0 0; }
+.runtime-form .primary { border: 0; background: var(--accent); color: var(--on-accent); }
+.runtime-form .primary:hover:not(:disabled) { color: var(--on-accent); }
+.runtime-form-grid { grid-template-columns: 1fr; }
+@media (min-width: 720px) { .runtime-form-grid { grid-template-columns: 1fr 1fr; align-items: end; } }
+.runtime-form-inline { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+@media (min-width: 720px) { .runtime-form-inline { grid-template-columns: max-content max-content; align-items: end; } }
+.runtime-field { display: grid; gap: 4px; min-width: 0; }
+.runtime-field > span { font-size: 12px; font-weight: 600; }
+.runtime-field em { color: var(--text-3); font-size: 11.5px; font-style: normal; }
+.runtime-field input, .runtime-field select {
+  min-width: 0; padding: 8px 10px; border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm); background: var(--surface-2); color: var(--text);
+}
+.runtime-field input:focus-visible, .runtime-field select:focus-visible { border-color: var(--accent); }
+.runtime-form button[type="submit"] { justify-self: start; }
+.runtime-form-grid > button[type="submit"], .runtime-form-grid > .runtime-note { grid-column: 1 / -1; }
+
+.runtime-switch { display: flex; gap: 10px; align-items: flex-start; }
+.runtime-switch input { margin: 3px 0 0; accent-color: var(--accent); }
+.runtime-switch span { display: grid; gap: 2px; }
+.runtime-switch em { color: var(--text-3); font-size: 12px; font-style: normal; }
+
+.runtime-requests { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+.runtime-requests li {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 11px 13px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-2);
+}
+.runtime-requests li[data-state="pending"] { border-style: dashed; border-color: color-mix(in srgb, var(--amber) 55%, var(--line)); }
+.runtime-requests li p { margin: 3px 0 0; color: var(--text-2); font-size: 12.5px; }
+.runtime-requests form { margin: 0; }
+
+.runtime-budget-form { display: flex; align-items: center; gap: 6px; margin: 0; }
+.runtime-budget-form input { width: 84px; padding: 5px 8px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface-2); color: var(--text); }
+.runtime-budget-form button { padding: 5px 10px; font-size: 12.5px; }
+
+.runtime-result { margin: 10px 0 0; color: var(--text-2); font-size: 12.5px; }
+.runtime-details { margin-top: 4px; }
+.runtime-details > summary { padding: 12px 0; color: var(--accent); font-size: 13px; font-weight: 600; cursor: pointer; }
+.runtime-details > section { margin-top: 14px; }
+
+.tag.runtime-online { background: color-mix(in srgb, var(--mint) 22%, transparent); color: #12694c; }
+.tag.runtime-offline, .tag.runtime-pending { background: color-mix(in srgb, var(--amber) 22%, transparent); color: #8a5a06; }
+.tag.runtime-ok { background: color-mix(in srgb, var(--mint) 22%, transparent); color: #12694c; }
+.tag.runtime-warn { background: color-mix(in srgb, var(--amber) 22%, transparent); color: #8a5a06; }
+.tag.runtime-alert, .tag.runtime-failed { background: color-mix(in srgb, var(--coral) 26%, transparent); color: #b03a52; }
+.tag.runtime-quiet { background: var(--mist); color: var(--text-3); }
+:root[data-theme="dark"] .tag.runtime-online, :root[data-theme="dark"] .tag.runtime-ok { color: var(--mint); }
+:root[data-theme="dark"] .tag.runtime-offline, :root[data-theme="dark"] .tag.runtime-pending,
+:root[data-theme="dark"] .tag.runtime-warn { color: var(--amber); }
+:root[data-theme="dark"] .tag.runtime-alert, :root[data-theme="dark"] .tag.runtime-failed { color: var(--coral); }
+
+.vault-table tr[data-tone="alert"] td, .vault-table tr[data-live="yes"] td { background: color-mix(in srgb, var(--accent) 5%, transparent); }

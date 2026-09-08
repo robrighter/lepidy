@@ -88,6 +88,30 @@ device packages, explicit custodian addition, full-rekey custodian removal and
 rekey-before-revoke device removal. Remotely served web pages receive none of
 the recovery, private-key or DEK material.
 
+## The runtime screen
+
+Each agent has a runtime page at `/agents/<id>/runtime`, visible only to that
+agent's owners. It answers one question in four forms — connected, local,
+Claude Cloud, custom — and restates the delegation behind an unattended agent
+as one English sentence, because a permission nobody can repeat is a permission
+nobody is supervising.
+
+The page can start a session by hand, stop every live session at once,
+re-affirm a delegation before it expires, change a cloud run's spending cap,
+and set who may cause a process to start on the machine — an owner-only policy,
+and a switch that leaves mentions queueing without waking anything.
+
+**It is not a launch editor, and no route behind it is.** The executable,
+arguments, working directory, environment mapping, permission posture and
+resource limits live only on the machine that runs them and are changed there
+behind an operating-system verification gesture. What this page can do is ask
+that machine to look at something — one intent from a closed set, with no
+parameters — and then show that ask as pending until the machine reports a
+higher preset revision through a signed registration. That revision is the only
+evidence the cloud can have that somebody was actually at that computer, so it
+is the only thing that clears the request. `lepidy-agentd status` prints the
+same pending asks on the machine itself.
+
 ## Desktop shell
 
 Run `npm run desktop:dev` after installing the Tauri system prerequisites. The desktop window follows the current Slipchat platform pattern:

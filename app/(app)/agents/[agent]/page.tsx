@@ -32,9 +32,14 @@ export default async function AgentPage({ params }: { params: Promise<{ agent: s
       <section className="panel">
         <div className="panel-head">
           <h2>@{agent.handle}</h2>
-          <Link href="/agents" className="via">
-            Back to agents
-          </Link>
+          <span className="agent-links">
+            <Link href={`/agents/${encodeURIComponent(agent.id)}/runtime`} className="primary-link">
+              How it runs
+            </Link>
+            <Link href="/agents" className="via">
+              Back to agents
+            </Link>
+          </span>
         </div>
         <p>{agent.description || "No standing brief yet."}</p>
         <dl className="vault-facts">

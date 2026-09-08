@@ -339,6 +339,7 @@ fn status_command(args: &Args) -> CliResult<i32> {
                     "presetId": entry.preset_id,
                     "depth": entry.depth,
                     "status": entry.status,
+                    "localReviews": entry.local_reviews,
                 })
             })
             .collect();
@@ -359,6 +360,12 @@ fn status_command(args: &Args) -> CliResult<i32> {
             "  {} via {} — {} waiting ({})",
             entry.agent_id, entry.preset_id, entry.depth, entry.status,
         );
+        // An owner can ask for a local change; only somebody at this computer
+        // can make one. Printing the ask here is the whole of what the network
+        // is allowed to say about this machine's launch configuration.
+        for review in &entry.local_reviews {
+            println!("      awaiting local review: {review}");
+        }
     }
     Ok(0)
 }

@@ -1059,6 +1059,78 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       ) STRICT`,
     ],
   },
+  {
+    version: 26,
+    name: "Runtime configuration surface",
+    statements: [
+      // `connected` becomes a stored kind rather than the absence of a row.
+      // An agent whose runtime nobody ever chose and an agent somebody
+      // deliberately set to "an owner's own MCP client" are different states,
+      // and the screen has to be able to tell them apart. SQLite cannot widen
+      // a CHECK in place, so the table is rebuilt; the columns are unchanged
+      // and still carry no launch configuration.
+      `CREATE TABLE agent_runtime_configs_v26 (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('connected', 'local', 'claude_cloud', 'custom')),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'disconnected')),
+        organization_id TEXT,
+        provider_workspace_id TEXT,
+        provider_agent_id TEXT,
+        provider_environment_id TEXT,
+        provider_deployment_id TEXT,
+        wif_issuer TEXT,
+        wif_audience TEXT,
+        wif_subject TEXT,
+        service_account_id TEXT,
+        federation_rule_id TEXT,
+        callback_url TEXT,
+        secret_envelope TEXT,
+        budget_cents INTEGER CHECK (budget_cents IS NULL OR budget_cents > 0),
+        resource_proved_at INTEGER,
+        webhook_proved_at INTEGER,
+        wif_failures INTEGER NOT NULL DEFAULT 0 CHECK (wif_failures >= 0),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK ((kind = 'claude_cloud' AND budget_cents IS NOT NULL) OR kind <> 'claude_cloud')
+      ) STRICT`,
+      `INSERT INTO agent_runtime_configs_v26 SELECT * FROM agent_runtime_configs`,
+      `DROP TABLE agent_runtime_configs`,
+      `ALTER TABLE agent_runtime_configs_v26 RENAME TO agent_runtime_configs`,
+      `CREATE INDEX agent_runtime_provider_idx ON agent_runtime_configs(organization_id, provider_workspace_id)`,
+      // Who may cause a process to start on somebody's machine, and whether a
+      // mention does it at all. Cloud authority, because it decides what the
+      // workspace *sends*; nothing here describes what the machine runs, and
+      // there is deliberately no column that could.
+      `CREATE TABLE agent_local_policies (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+        start_on_mention INTEGER NOT NULL DEFAULT 1 CHECK (start_on_mention IN (0, 1)),
+        who_may_start TEXT NOT NULL DEFAULT 'scope' CHECK (who_may_start IN ('scope', 'owners')),
+        updated_at INTEGER NOT NULL
+      ) STRICT`,
+      // An owner asking a machine to look at its own launch configuration.
+      //
+      // An intent from a closed set and nothing else: no path, no argument, no
+      // limit, no note. The request is answered when the machine registers a
+      // preset revision higher than the one it had when the ask was made, which
+      // is the only evidence a cloud row can have that somebody was actually
+      // standing at that computer.
+      `CREATE TABLE runner_preset_requests (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL,
+        intent TEXT NOT NULL CHECK (intent IN ('approve_agent', 'review_preset', 'revalidate_harness', 'review_limits')),
+        requested_by_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        revision_at_request INTEGER NOT NULL CHECK (revision_at_request > 0),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'confirmed', 'withdrawn')),
+        created_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        resolved_revision INTEGER
+      ) STRICT`,
+      `CREATE UNIQUE INDEX runner_preset_requests_live_idx
+       ON runner_preset_requests(agent_id, device_id, intent) WHERE state = 'pending'`,
+      `CREATE INDEX runner_preset_requests_device_idx ON runner_preset_requests(device_id, state)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

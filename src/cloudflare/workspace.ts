@@ -234,6 +234,17 @@ import {
 } from "../domain/vault-authorization";
 import { parseRemoteLocalAgentTrigger, type LocalAgentTrigger } from "../domain/local-agent-trigger";
 import {
+  decideLocalStart,
+  delegationSentence,
+  isLocalPresetIntent,
+  isLocalStartPolicy,
+  localPresetRequestIsConfirmed,
+  type LocalPresetIntent,
+  type LocalStartPolicy,
+  type RuntimeKind,
+  type SelfServeRuntimeKind,
+} from "../domain/runtime-config";
+import {
   VAULT_PROXY_REQUEST_TTL_MS,
   normalizeVaultProxyRequest,
   openVaultProxyResponse,
@@ -554,6 +565,104 @@ export type AgentDetail = {
   scopeMode: "any" | "listed";
   scopeChannelIds: readonly string[];
   scopeChannelCount: number;
+};
+
+/**
+ * Everything the runtime screen reads, in one shape.
+ *
+ * Note what is not here, and cannot be added: no executable, no argument, no
+ * working directory, no environment mapping, no permission posture, no resource
+ * limit. A local preset appears as the opaque name and the revision number the
+ * machine itself reported, which is the whole of what the cloud is allowed to
+ * know about it (D05a).
+ */
+export type AgentRuntimeView = {
+  agentId: string;
+  handle: string;
+  agentStatus: "active" | "paused" | "archived";
+  kind: RuntimeKind;
+  /** Whether somebody chose this runtime, or it is only the default. */
+  chosen: boolean;
+  providerStatus: "pending" | "active" | "disconnected" | null;
+  local: {
+    startOnMention: boolean;
+    whoMayStart: LocalStartPolicy;
+    device: {
+      deviceId: string;
+      presetId: string;
+      presetRevision: number;
+      runnerEpoch: number;
+      connected: boolean;
+      lastSeenAt: number | null;
+      assignedAt: number;
+    } | null;
+    waiting: number;
+    needsAttention: number;
+    presetRequests: readonly {
+      id: string;
+      intent: LocalPresetIntent;
+      requestedByHandle: string;
+      revisionAtRequest: number;
+      state: "pending" | "confirmed" | "withdrawn";
+      createdAt: number;
+      resolvedAt: number | null;
+      resolvedRevision: number | null;
+    }[];
+  };
+  cloud: {
+    organizationId: string | null;
+    providerWorkspaceId: string | null;
+    providerAgentId: string | null;
+    providerEnvironmentId: string | null;
+    providerDeploymentId: string | null;
+    wifSubject: string | null;
+    wifAudience: string | null;
+    budgetCents: number | null;
+    resourceProvedAt: number | null;
+    webhookProvedAt: number | null;
+    wifFailures: number;
+  } | null;
+  custom: {
+    callbackUrl: string;
+    deliveries: readonly {
+      deliveryId: string;
+      state: "pending" | "delivered" | "dead";
+      attempts: number;
+      lastError: string | null;
+      createdAt: number;
+    }[];
+  } | null;
+  delegation: {
+    id: string;
+    ownerHandle: string;
+    channelNames: readonly string[] | null;
+    credentialNames: readonly string[];
+    expiresAt: number;
+    spendCapDailyCents: number | null;
+    deliveryModes: readonly string[];
+    sentence: string;
+  } | null;
+  sessions: readonly {
+    sessionId: string;
+    deviceId: string;
+    presetRevision: number;
+    startedAt: number;
+    hardExpiresAt: number;
+    lastUsedAt: number | null;
+    endedAt: number | null;
+    endedReason: string | null;
+    live: boolean;
+  }[];
+  runs: readonly {
+    id: string;
+    kind: "mention" | "scheduled" | "manual";
+    state: "queued" | "starting" | "running" | "idle" | "succeeded" | "failed" | "terminated";
+    failureCode: string | null;
+    budgetCents: number | null;
+    hasProviderSession: boolean;
+    createdAt: number;
+    updatedAt: number;
+  }[];
 };
 
 export type VaultAccessRequest = {
@@ -918,7 +1027,7 @@ type VaultProxyRequestRow = {
 };
 
 type AgentRuntimeConfigRow = {
-  agent_id: string; kind: "local" | "claude_cloud" | "custom"; status: "pending" | "active" | "disconnected";
+  agent_id: string; kind: RuntimeKind; status: "pending" | "active" | "disconnected";
   organization_id: string | null; provider_workspace_id: string | null; provider_agent_id: string | null;
   provider_environment_id: string | null; provider_deployment_id: string | null; wif_issuer: string | null;
   wif_audience: string | null; wif_subject: string | null; service_account_id: string | null;
@@ -3695,6 +3804,619 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       body: { budget: next === null ? null : { amount: String(next), currency: "USD" } } });
     this.ctx.storage.sql.exec("UPDATE runtime_runs SET budget_cents = ?, updated_at = ? WHERE id = ?", next, input.now, input.runId);
     return { budgetCents: next };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* The runtime configuration surface (R05)                             */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Pick a runtime that needs no provider behind it.
+   *
+   * `connected` and `local` are the two an owner can choose outright, so they
+   * are the two this method takes. `claude_cloud` and `custom` arrive through
+   * their own configure methods, because neither is a choice until the thing it
+   * points at has been proved to exist — and offering them as a radio button
+   * that silently does nothing is how a half-configured integration gets built.
+   *
+   * Moving away from a cloud or custom runtime drops that runtime's provider
+   * identifiers and its transport secret in the same write. Leaving them behind
+   * would keep a webhook route alive for a runtime nobody is using.
+   */
+  async selectAgentRuntime(input: {
+    actor: Actor;
+    agentId: string;
+    kind: SelfServeRuntimeKind;
+    now: number;
+  }): Promise<{ kind: SelfServeRuntimeKind }> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    if (input.kind !== "connected" && input.kind !== "local") throw new Error("unknown runtime");
+    const previous = this.readRuntimeConfig(agent.id);
+
+    await this.commitMutation({ scope: "agent.runtime.select", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO agent_runtime_configs(agent_id, kind, status, created_at, updated_at)
+         VALUES (?, ?, 'active', ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET kind = excluded.kind, status = 'active',
+           organization_id = NULL, provider_workspace_id = NULL, provider_agent_id = NULL,
+           provider_environment_id = NULL, provider_deployment_id = NULL, wif_issuer = NULL,
+           wif_audience = NULL, wif_subject = NULL, service_account_id = NULL,
+           federation_rule_id = NULL, callback_url = NULL, secret_envelope = NULL,
+           budget_cents = NULL, resource_proved_at = NULL, webhook_proved_at = NULL,
+           wif_failures = 0, updated_at = excluded.updated_at`,
+        agent.id, input.kind, input.now, input.now,
+      );
+      return {
+        result: undefined,
+        effects: this.agentEffects("agent.runtime_selected", agent, actor, {
+          runtime_kind: input.kind,
+          previous_kind: previous?.kind ?? "none",
+        }),
+      };
+    });
+
+    // A machine that was answering for an agent whose runtime has moved
+    // elsewhere finds out now, rather than starting a harness for work that
+    // will never be routed to it again.
+    if (input.kind !== "local" && previous?.kind === "local") {
+      this.stopRunnersForAgent(agent.id, "runtime_changed");
+    }
+    if (previous !== null && previous.kind !== input.kind && previous.kind === "claude_cloud") {
+      await this.forgetRuntimeWebhookRoute(previous);
+    }
+    return { kind: input.kind };
+  }
+
+  /**
+   * Who may cause a process to start on somebody's computer.
+   *
+   * This is cloud authority and it belongs here, because it decides what the
+   * workspace *sends*: whether a mention produces a wake at all, and whose
+   * mention counts. It is not launch configuration and it deliberately reads
+   * nothing about one — the machine still decides what runs, how often and for
+   * how long, and it can refuse a wake this setting allowed.
+   */
+  async setLocalRuntimePolicy(input: {
+    actor: Actor;
+    agentId: string;
+    startOnMention: boolean;
+    whoMayStart: LocalStartPolicy;
+    now: number;
+  }): Promise<{ startOnMention: boolean; whoMayStart: LocalStartPolicy }> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    if (typeof input.startOnMention !== "boolean") throw new Error("start on mention is invalid");
+    if (!isLocalStartPolicy(input.whoMayStart)) throw new Error("unknown start policy");
+
+    await this.commitMutation({ scope: "agent.runtime.local_policy", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO agent_local_policies(agent_id, start_on_mention, who_may_start, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET start_on_mention = excluded.start_on_mention,
+           who_may_start = excluded.who_may_start, updated_at = excluded.updated_at`,
+        agent.id, input.startOnMention ? 1 : 0, input.whoMayStart, input.now,
+      );
+      return {
+        result: undefined,
+        effects: this.agentEffects("agent.runtime_local_policy_set", agent, actor, {
+          start_on_mention: input.startOnMention,
+          who_may_start: input.whoMayStart,
+        }),
+      };
+    });
+    return { startOnMention: input.startOnMention, whoMayStart: input.whoMayStart };
+  }
+
+  /**
+   * Ask the machine to look at its own launch configuration.
+   *
+   * This is the entire remote authority over a local preset, and it is an ask
+   * rather than a change: an intent from a closed set, addressed to the device
+   * that already answers for this agent, with no field for a path, an argument,
+   * a limit or a note. It stays pending — visibly — until that machine reports
+   * a preset revision higher than the one it had when the ask was made, which
+   * is the only evidence available here that a person was physically at that
+   * computer and completed the operating-system verification the change needs.
+   */
+  async requestLocalPresetChange(input: {
+    actor: Actor;
+    agentId: string;
+    intent: LocalPresetIntent;
+    now: number;
+  }): Promise<{ requestId: string; state: "pending"; deviceId: string }> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    if (!isLocalPresetIntent(input.intent)) throw new Error("unknown local preset intent");
+    const assignment = this.ctx.storage.sql
+      .exec<{ device_id: string }>("SELECT device_id FROM runner_agents WHERE agent_id = ?", agent.id)
+      .toArray()[0];
+    if (assignment === undefined) throw new Error("no machine answers for this agent");
+    const device = this.readRunnerDevice(assignment.device_id);
+    if (device === null) throw new Error("no machine answers for this agent");
+
+    const existing = this.ctx.storage.sql
+      .exec<{ id: string }>(
+        `SELECT id FROM runner_preset_requests
+         WHERE agent_id = ? AND device_id = ? AND intent = ? AND state = 'pending'`,
+        agent.id, device.device_id, input.intent,
+      )
+      .toArray()[0];
+    // Asking twice is one ask. A second row would show the same machine two
+    // identical pending items and neither would clear before the other.
+    if (existing !== undefined) return { requestId: existing.id, state: "pending", deviceId: device.device_id };
+
+    const requestId = crypto.randomUUID();
+    await this.commitMutation({ scope: "agent.runtime.preset_request", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO runner_preset_requests(id, agent_id, device_id, intent, requested_by_member_id,
+           revision_at_request, state, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
+        requestId, agent.id, device.device_id, input.intent, actor.id, device.preset_revision, input.now,
+      );
+      return {
+        result: undefined,
+        effects: this.agentEffects("agent.local_preset_requested", agent, actor, {
+          request_id: requestId,
+          device_id: device.device_id,
+          intent: input.intent,
+          revision_at_request: device.preset_revision,
+        }),
+      };
+    });
+    return { requestId, state: "pending", deviceId: device.device_id };
+  }
+
+  /** Take an ask back. The machine may already have acted; that is fine. */
+  async withdrawLocalPresetChange(input: {
+    actor: Actor;
+    requestId: string;
+    now: number;
+  }): Promise<{ withdrawn: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const row = this.ctx.storage.sql
+      .exec<{ agent_id: string }>("SELECT agent_id FROM runner_preset_requests WHERE id = ?", input.requestId)
+      .toArray()[0];
+    if (row === undefined) throw new Error("that request does not exist");
+    const agent = this.requireOwnedAgent(row.agent_id, actor.id);
+    const outcome = await this.commitMutation({ scope: "agent.runtime.preset_withdraw", now: input.now }, () => {
+      const changed = this.ctx.storage.sql.exec(
+        `UPDATE runner_preset_requests SET state = 'withdrawn', resolved_at = ?
+         WHERE id = ? AND state = 'pending'`,
+        input.now, input.requestId,
+      );
+      return {
+        result: { withdrawn: changed.rowsWritten > 0 },
+        effects: changed.rowsWritten > 0
+          ? this.agentEffects("agent.local_preset_withdrawn", agent, actor, { request_id: input.requestId })
+          : undefined,
+      };
+    });
+    return outcome.result;
+  }
+
+  /**
+   * Start a session by hand.
+   *
+   * The wake it records is the same wake a mention produces — an agent id and
+   * nothing else — so this button cannot do anything a mention could not. It
+   * exists because "start on mention" being off has to leave a way to work, and
+   * because it is the honest test of a runner somebody has just set up.
+   */
+  async startLocalRuntimeNow(input: {
+    actor: Actor;
+    agentId: string;
+    now: number;
+  }): Promise<{ deviceId: string; delivered: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    if (agent.status !== "active") throw new Error("agent is not active");
+    const config = this.readRuntimeConfig(agent.id);
+    if (config !== null && config.kind !== "local") throw new Error("this agent does not run locally");
+    const assignment = this.ctx.storage.sql
+      .exec<{ device_id: string }>("SELECT device_id FROM runner_agents WHERE agent_id = ?", agent.id)
+      .toArray()[0];
+    if (assignment === undefined) throw new Error("no machine answers for this agent");
+
+    await this.commitMutation({ scope: "agent.runtime.start", now: input.now }, () => {
+      this.recordRunnerWake(agent.id, input.now);
+      return {
+        result: undefined,
+        effects: this.agentEffects("agent.runtime_start_requested", agent, actor, {
+          device_id: assignment.device_id,
+        }),
+      };
+    });
+    return {
+      deviceId: assignment.device_id,
+      delivered: this.ctx.getWebSockets(runnerSocketTag(assignment.device_id)).length > 0,
+    };
+  }
+
+  /**
+   * Stop whatever this agent has running, everywhere.
+   *
+   * Every live session for the agent is revoked in one transaction and the
+   * machine is told, so a harness that is mid-run finds out rather than
+   * finishing the work anyway. The durable half is the revocation: the next
+   * bounded call the harness makes is refused whether or not the frame landed,
+   * which is what makes this work when the socket is the thing that is wrong.
+   */
+  async stopAgentRuntime(input: {
+    actor: Actor;
+    agentId: string;
+    reason?: string | null;
+    now: number;
+  }): Promise<{ sessionsStopped: number }> {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    const reason = (input.reason ?? "owner_stopped").slice(0, 200);
+    const outcome = await this.commitMutation({ scope: "agent.runtime.stop", now: input.now }, () => {
+      // Counted before the write rather than from `rowsWritten`, which includes
+      // index entries and would report a number nobody could explain.
+      const live = this.ctx.storage.sql
+        .exec<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM agent_sessions WHERE agent_id = ? AND revoked_at IS NULL", agent.id,
+        )
+        .one().count;
+      this.ctx.storage.sql.exec(
+        `UPDATE agent_sessions SET revoked_at = ?, revoked_reason = ?
+         WHERE agent_id = ? AND revoked_at IS NULL`,
+        input.now, reason, agent.id,
+      );
+      // A wake nobody has collected must not outlive the stop that overtook it.
+      this.ctx.storage.sql.exec("DELETE FROM runner_wakes WHERE agent_id = ?", agent.id);
+      return {
+        result: { sessionsStopped: live },
+        effects: this.agentEffects("agent.runtime_stopped", agent, actor, {
+          sessions_stopped: live,
+          reason,
+        }),
+      };
+    });
+    this.stopRunnersForAgent(agent.id, reason);
+    return outcome.result;
+  }
+
+  /**
+   * Re-affirm a delegation that is about to expire.
+   *
+   * One click, and it is deliberately not automatic: an agent running unattended
+   * for a year on a permission somebody granted in a hurry is the failure the
+   * expiry exists to prevent, and a renewal nobody performs is the same thing
+   * with extra steps. The owner's authority is re-checked here, so a delegation
+   * made by somebody who has since lost access cannot be extended.
+   */
+  async reaffirmAgentDelegation(input: {
+    actor: Actor;
+    delegationId: string;
+    expiresAt: number;
+    now: number;
+  }): Promise<{ expiresAt: number }> {
+    const actor = this.authorizeActor(input.actor);
+    const delegation = this.requireLiveDelegation(input.delegationId, input.now);
+    if (delegation.ownerMemberId !== actor.id) throw new Error("delegation not found");
+    const agent = this.requireOwnedAgent(delegation.agentId, actor.id);
+    if (!validDelegationExpiry(input.now, input.expiresAt)) throw new Error("delegation expiry is invalid");
+    if (input.expiresAt <= delegation.expiresAt) throw new Error("that is not later than the current expiry");
+
+    await this.commitMutation({ scope: "agent.delegation.reaffirm", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE agent_delegations SET expires_at = ? WHERE id = ? AND revoked_at IS NULL",
+        input.expiresAt, delegation.id,
+      );
+      return {
+        result: undefined,
+        effects: this.agentEffects("agent.delegation_reaffirmed", agent, actor, {
+          delegation_id: delegation.id,
+          previous_expires_at: delegation.expiresAt,
+          expires_at: input.expiresAt,
+        }),
+      };
+    });
+    return { expiresAt: input.expiresAt };
+  }
+
+  /**
+   * Everything the runtime screen shows, in one authorized read.
+   *
+   * Only an owner sees it, because everything on it — which machine, which
+   * delegation, which credentials, what failed — is the configuration of
+   * somebody's own computer and somebody's own authority. What it can never
+   * carry is what that machine runs: there is no field here for an executable,
+   * an argument, a directory, an environment value or a limit, and the preset
+   * appears as the name and revision the machine itself reported.
+   */
+  describeAgentRuntime(input: { actor: Actor; agentId: string; now: number }): AgentRuntimeView {
+    const actor = this.authorizeActor(input.actor);
+    const agent = this.requireOwnedAgent(input.agentId, actor.id);
+    const config = this.readRuntimeConfig(agent.id);
+    const kind: RuntimeKind = config?.kind ?? "connected";
+
+    const policy = this.ctx.storage.sql
+      .exec<{ start_on_mention: number; who_may_start: LocalStartPolicy }>(
+        "SELECT start_on_mention, who_may_start FROM agent_local_policies WHERE agent_id = ?", agent.id,
+      )
+      .toArray()[0];
+
+    const assignment = this.ctx.storage.sql
+      .exec<{ device_id: string; preset_id: string; assigned_at: number }>(
+        "SELECT device_id, preset_id, assigned_at FROM runner_agents WHERE agent_id = ?", agent.id,
+      )
+      .toArray()[0];
+    const device = assignment === undefined ? null : this.readRunnerDevice(assignment.device_id);
+
+    const queue = this.ctx.storage.sql
+      .exec<{ waiting: number; attention: number }>(
+        `SELECT
+           SUM(CASE WHEN execution_state IN ('pending', 'claimed') THEN 1 ELSE 0 END) AS waiting,
+           SUM(CASE WHEN execution_state = 'needs_attention' THEN 1 ELSE 0 END) AS attention
+         FROM agent_queue WHERE agent_id = ?`,
+        agent.id,
+      )
+      .one();
+
+    const requests = this.ctx.storage.sql
+      .exec<{
+        id: string; intent: LocalPresetIntent; requested_by_member_id: string;
+        revision_at_request: number; state: "pending" | "confirmed" | "withdrawn";
+        created_at: number; resolved_at: number | null; resolved_revision: number | null;
+      }>(
+        `SELECT id, intent, requested_by_member_id, revision_at_request, state, created_at,
+                resolved_at, resolved_revision
+         FROM runner_preset_requests WHERE agent_id = ? ORDER BY created_at DESC LIMIT 20`,
+        agent.id,
+      )
+      .toArray()
+      .map((row) => ({
+        id: row.id,
+        intent: row.intent,
+        requestedByHandle: this.memberHandle(row.requested_by_member_id),
+        revisionAtRequest: row.revision_at_request,
+        // Pending is the honest default. A request whose machine has since
+        // moved its revision on is only reported confirmed once that machine
+        // has actually said so through a signed registration.
+        state: row.state,
+        createdAt: row.created_at,
+        resolvedAt: row.resolved_at,
+        resolvedRevision: row.resolved_revision,
+      }));
+
+    const delegationRow = this.ctx.storage.sql
+      .exec<{ id: string }>(
+        `SELECT id FROM agent_delegations
+         WHERE agent_id = ? AND revoked_at IS NULL AND expires_at > ?
+         ORDER BY created_at DESC LIMIT 1`,
+        agent.id, input.now,
+      )
+      .toArray()[0];
+    const delegation = delegationRow === undefined ? null : this.readAgentDelegation(delegationRow.id);
+
+    const sessions = this.ctx.storage.sql
+      .exec<{
+        id: string; device_id: string; preset_revision: number; created_at: number;
+        hard_expires_at: number; last_used_at: number | null; revoked_at: number | null;
+        revoked_reason: string | null;
+      }>(
+        `SELECT id, device_id, preset_revision, created_at, hard_expires_at, last_used_at,
+                revoked_at, revoked_reason
+         FROM agent_sessions WHERE agent_id = ? ORDER BY created_at DESC LIMIT 20`,
+        agent.id,
+      )
+      .toArray()
+      .map((row) => ({
+        sessionId: row.id,
+        deviceId: row.device_id,
+        presetRevision: row.preset_revision,
+        startedAt: row.created_at,
+        hardExpiresAt: row.hard_expires_at,
+        lastUsedAt: row.last_used_at,
+        endedAt: row.revoked_at,
+        endedReason: row.revoked_reason,
+        live: row.revoked_at === null && row.hard_expires_at > input.now,
+      }));
+
+    const runs = this.ctx.storage.sql
+      .exec<{
+        id: string; kind: "mention" | "scheduled" | "manual";
+        state: "queued" | "starting" | "running" | "idle" | "succeeded" | "failed" | "terminated";
+        failure_code: string | null; budget_cents: number | null;
+        provider_session_id: string | null; created_at: number; updated_at: number;
+      }>(
+        `SELECT id, kind, state, failure_code, budget_cents, provider_session_id, created_at, updated_at
+         FROM runtime_runs WHERE agent_id = ? ORDER BY created_at DESC LIMIT 20`,
+        agent.id,
+      )
+      .toArray()
+      .map((row) => ({
+        id: row.id,
+        kind: row.kind,
+        state: row.state,
+        failureCode: row.failure_code,
+        budgetCents: row.budget_cents,
+        hasProviderSession: row.provider_session_id !== null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      }));
+
+    const deliveries = this.ctx.storage.sql
+      .exec<{ delivery_id: string; state: "pending" | "delivered" | "dead"; attempts: number; last_error: string | null; created_at: number }>(
+        `SELECT delivery_id, state, attempts, last_error, created_at
+         FROM custom_runtime_deliveries WHERE agent_id = ? ORDER BY created_at DESC LIMIT 20`,
+        agent.id,
+      )
+      .toArray()
+      .map((row) => ({
+        deliveryId: row.delivery_id,
+        state: row.state,
+        attempts: row.attempts,
+        // Bounded, and it came from a remote endpoint, so it is shown as a note
+        // and never as anything the page trusts.
+        lastError: row.last_error === null ? null : row.last_error.slice(0, 200),
+        createdAt: row.created_at,
+      }));
+
+    return {
+      agentId: agent.id,
+      handle: agent.handle,
+      agentStatus: agent.status,
+      kind,
+      chosen: config !== null,
+      providerStatus: config?.status ?? null,
+      local: {
+        startOnMention: policy === undefined ? true : policy.start_on_mention === 1,
+        whoMayStart: policy?.who_may_start ?? "scope",
+        device:
+          device === null || assignment === undefined
+            ? null
+            : {
+                deviceId: device.device_id,
+                presetId: assignment.preset_id,
+                presetRevision: device.preset_revision,
+                runnerEpoch: device.runner_epoch,
+                connected: this.ctx.getWebSockets(runnerSocketTag(device.device_id)).length > 0,
+                lastSeenAt: device.last_seen_at,
+                assignedAt: assignment.assigned_at,
+              },
+        waiting: queue.waiting ?? 0,
+        needsAttention: queue.attention ?? 0,
+        presetRequests: requests,
+      },
+      cloud:
+        config === null || config.kind !== "claude_cloud"
+          ? null
+          : {
+              organizationId: config.organization_id,
+              providerWorkspaceId: config.provider_workspace_id,
+              providerAgentId: config.provider_agent_id,
+              providerEnvironmentId: config.provider_environment_id,
+              providerDeploymentId: config.provider_deployment_id,
+              wifSubject: config.wif_subject,
+              wifAudience: config.wif_audience,
+              budgetCents: config.budget_cents,
+              resourceProvedAt: config.resource_proved_at,
+              webhookProvedAt: config.webhook_proved_at,
+              wifFailures: config.wif_failures,
+            },
+      custom:
+        config === null || config.kind !== "custom" || config.callback_url === null
+          ? null
+          : { callbackUrl: config.callback_url, deliveries },
+      delegation:
+        delegation === null
+          ? null
+          : {
+              id: delegation.id,
+              ownerHandle: this.memberHandle(delegation.ownerMemberId),
+              channelNames:
+                delegation.channelIds === null
+                  ? null
+                  : delegation.channelIds.map((channelId) => readChannel(this.ctx.storage, channelId)?.slug ?? channelId),
+              credentialNames: delegation.credentialIds.map((credentialId) => this.vaultCredentialName(credentialId)),
+              expiresAt: delegation.expiresAt,
+              spendCapDailyCents: delegation.spendCapDailyCents,
+              deliveryModes: delegation.deliveryModes,
+              sentence: delegationSentence({
+                ownerHandle: this.memberHandle(delegation.ownerMemberId),
+                channelNames:
+                  delegation.channelIds === null
+                    ? null
+                    : delegation.channelIds.map((channelId) => readChannel(this.ctx.storage, channelId)?.slug ?? channelId),
+                credentialNames: delegation.credentialIds.map((credentialId) => this.vaultCredentialName(credentialId)),
+                expiresAt: delegation.expiresAt,
+                spendCapDailyCents: delegation.spendCapDailyCents,
+              }),
+            },
+      sessions,
+      runs,
+    };
+  }
+
+  /** The cloud half of "may this mention start a process on that machine". */
+  private localStartDecision(agentId: string, requesterMemberId: string) {
+    const policy = this.ctx.storage.sql
+      .exec<{ start_on_mention: number; who_may_start: LocalStartPolicy }>(
+        "SELECT start_on_mention, who_may_start FROM agent_local_policies WHERE agent_id = ?", agentId,
+      )
+      .toArray()[0];
+    return decideLocalStart({
+      startOnMention: policy === undefined ? true : policy.start_on_mention === 1,
+      whoMayStart: policy?.who_may_start ?? "scope",
+      requesterMemberId,
+      ownerMemberIds: agentOwnerIds(this.ctx.storage, agentId),
+    });
+  }
+
+  private readRuntimeConfig(agentId: string): AgentRuntimeConfigRow | null {
+    return (
+      this.ctx.storage.sql
+        .exec<AgentRuntimeConfigRow>("SELECT * FROM agent_runtime_configs WHERE agent_id = ?", agentId)
+        .toArray()[0] ?? null
+    );
+  }
+
+  private vaultCredentialName(credentialId: string): string {
+    return (
+      this.ctx.storage.sql
+        .exec<{ name: string }>("SELECT name FROM vault_credentials WHERE id = ?", credentialId)
+        .toArray()[0]?.name ?? credentialId
+    );
+  }
+
+  /** A workspace that stops using a cloud runtime stops owning its webhook route. */
+  private async forgetRuntimeWebhookRoute(config: AgentRuntimeConfigRow): Promise<void> {
+    if (!this.env.CONTROL_DB || config.organization_id === null || config.provider_workspace_id === null) return;
+    // Only if no other agent in this workspace still uses that provider pair.
+    const remaining = this.ctx.storage.sql
+      .exec<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM agent_runtime_configs
+         WHERE kind = 'claude_cloud' AND organization_id = ? AND provider_workspace_id = ?`,
+        config.organization_id, config.provider_workspace_id,
+      )
+      .one().count;
+    if (remaining > 0) return;
+    await this.env.CONTROL_DB.prepare(
+      "DELETE FROM runtime_webhook_routes WHERE organization_id = ? AND provider_workspace_id = ? AND durable_object_id = ?",
+    ).bind(config.organization_id, config.provider_workspace_id, this.workspaceKey()).run();
+  }
+
+  /**
+   * Answer the pending asks this registration confirms.
+   *
+   * Called from `registerRunner`, inside its transaction: the machine has just
+   * signed for a preset revision, and every ask made against a lower one has
+   * been answered by whatever the person at that computer did. Nothing here
+   * reads what changed, only that the machine's own counter moved.
+   */
+  private confirmLocalPresetRequests(deviceId: string, presetRevision: number, now: number): number {
+    const pending = this.ctx.storage.sql
+      .exec<{ id: string; revision_at_request: number }>(
+        "SELECT id, revision_at_request FROM runner_preset_requests WHERE device_id = ? AND state = 'pending'",
+        deviceId,
+      )
+      .toArray()
+      .filter((row) =>
+        localPresetRequestIsConfirmed({ revisionAtRequest: row.revision_at_request, currentRevision: presetRevision }),
+      );
+    for (const row of pending) {
+      this.ctx.storage.sql.exec(
+        "UPDATE runner_preset_requests SET state = 'confirmed', resolved_at = ?, resolved_revision = ? WHERE id = ?",
+        now, presetRevision, row.id,
+      );
+    }
+    return pending.length;
+  }
+
+  /** What this device still owes a person, reported where it already asks for work. */
+  private pendingLocalPresetIntents(deviceId: string, agentId: string): readonly LocalPresetIntent[] {
+    return this.ctx.storage.sql
+      .exec<{ intent: LocalPresetIntent }>(
+        `SELECT intent FROM runner_preset_requests
+         WHERE device_id = ? AND agent_id = ? AND state = 'pending' ORDER BY created_at`,
+        deviceId, agentId,
+      )
+      .toArray()
+      .map((row) => row.intent);
   }
 
   /** Owners are the agent's accountable humans, so only an owner may add one. */
@@ -7581,7 +8303,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         // The wake commits with the queue row it announces (R01). Delivery
         // happens after this transaction, and a wake nobody was listening for
         // stays pending until a runner reconnects and collects it.
-        this.recordRuntimeWake(agent.id, input.messageId, input.now);
+        this.recordRuntimeWake({
+          agentId: agent.id,
+          messageId: input.messageId,
+          requesterMemberId: input.authorKind === "member" ? input.authorId : "",
+          now: input.now,
+        });
       }
     }
     return enqueued;
@@ -8317,7 +9044,13 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     presetRevision: number;
     agents: readonly { agentId: string; presetId: string }[];
     now: number;
-  }): Promise<{ deviceId: string; runnerEpoch: number; agentIds: readonly string[]; displacedDeviceIds: readonly string[] }> {
+  }): Promise<{
+    deviceId: string;
+    runnerEpoch: number;
+    agentIds: readonly string[];
+    displacedDeviceIds: readonly string[];
+    confirmedLocalReviews: number;
+  }> {
     const actor = this.authorizeActor(input.actor);
     this.requireCloudContentAuthority();
     assertOpaqueId(input.deviceId, "device id");
@@ -8355,6 +9088,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
            last_seen_at = excluded.last_seen_at`,
         input.deviceId, actor.id, input.runnerEpoch, input.presetRevision, input.now, input.now,
       );
+
+      // A signed registration carrying a higher preset revision is the machine
+      // reporting that somebody at that computer completed a local change, so
+      // every ask made against a lower revision is answered here (R05).
+      const confirmedRequests = this.confirmLocalPresetRequests(input.deviceId, input.presetRevision, input.now);
 
       const displaced = new Set<string>();
       for (const claim of claims) {
@@ -8394,6 +9132,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           agentIds: claims.map((claim) => claim.agent.id),
           displacedDeviceIds: [...displaced].sort(),
           releasedAgentIds: released,
+          confirmedRequests,
         },
         effects: {
           audit: {
@@ -8410,6 +9149,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
               released_count: released.length,
               runner_epoch: input.runnerEpoch,
               config_revision: input.presetRevision,
+              local_reviews_confirmed: confirmedRequests,
             },
           },
         } satisfies MutationEffects,
@@ -8433,6 +9173,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       runnerEpoch: outcome.result.runnerEpoch,
       agentIds: outcome.result.agentIds,
       displacedDeviceIds: outcome.result.displacedDeviceIds,
+      confirmedLocalReviews: outcome.result.confirmedRequests,
     };
   }
 
@@ -8447,7 +9188,19 @@ export class Workspace extends DurableObject<CloudflareEnv> {
    */
   runnerQueueDepth(input: { actor: Actor; deviceId: string; now: number }): {
     runnerEpoch: number;
-    agents: readonly { agentId: string; handle: string; presetId: string; depth: number; status: AgentRow["status"] }[];
+    agents: readonly {
+      agentId: string;
+      handle: string;
+      presetId: string;
+      depth: number;
+      status: AgentRow["status"];
+      /**
+       * What an owner has asked somebody to do at this computer, so the daemon
+       * can say it out loud. Intents from a closed set and nothing else: this
+       * field can never carry an instruction, a path or a value (R05).
+       */
+      localReviews: readonly LocalPresetIntent[];
+    }[];
   } {
     const actor = this.authorizeActor(input.actor);
     this.requireCloudContentAuthority();
@@ -8456,7 +9209,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       "UPDATE runner_devices SET last_seen_at = ? WHERE device_id = ?", input.now, input.deviceId,
     );
 
-    const agents: { agentId: string; handle: string; presetId: string; depth: number; status: AgentRow["status"] }[] = [];
+    const agents: {
+      agentId: string; handle: string; presetId: string; depth: number;
+      status: AgentRow["status"]; localReviews: readonly LocalPresetIntent[];
+    }[] = [];
     const rows = this.ctx.storage.sql
       .exec<{ agent_id: string; preset_id: string }>(
         "SELECT agent_id, preset_id FROM runner_agents WHERE device_id = ? ORDER BY agent_id", input.deviceId,
@@ -8480,7 +9236,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
             )
             .one().depth
         : 0;
-      agents.push({ agentId: agent.id, handle: agent.handle, presetId: row.preset_id, depth, status: agent.status });
+      agents.push({
+        agentId: agent.id, handle: agent.handle, presetId: row.preset_id, depth, status: agent.status,
+        localReviews: this.pendingLocalPresetIntents(input.deviceId, agent.id),
+      });
     }
     return { runnerEpoch: device.runner_epoch, agents };
   }
@@ -8669,12 +9428,26 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }
 
   /** Select exactly one configured execution lane for a committed queue item. */
-  private recordRuntimeWake(agentId: string, messageId: string, now: number): void {
+  private recordRuntimeWake(input: {
+    agentId: string;
+    messageId: string;
+    requesterMemberId: string;
+    now: number;
+  }): void {
+    const { agentId, messageId, now } = input;
     const config = this.ctx.storage.sql.exec<AgentRuntimeConfigRow>(
       "SELECT * FROM agent_runtime_configs WHERE agent_id = ?", agentId,
     ).toArray()[0];
+    // An agent whose owners run it from their own MCP client has no machine to
+    // wake and no provider to call. The queue row still exists; the client
+    // reads it the next time it asks.
+    if (config?.kind === "connected") return;
     if (!config || config.kind === "local") {
-      this.recordRunnerWake(agentId, now);
+      // The work is queued either way. What this decides is only whether a
+      // process starts on somebody's computer without them asking for it, and
+      // a refusal here leaves the item for an owner to start by hand rather
+      // than dropping it (R05).
+      if (this.localStartDecision(agentId, input.requesterMemberId).start) this.recordRunnerWake(agentId, now);
       return;
     }
     if (config.status !== "active") return;

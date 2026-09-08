@@ -217,7 +217,7 @@ describe("R01 wakes", () => {
     const depth = await seeded.stub.runnerQueueDepth({ actor: seeded.owner, deviceId: "device-a", now: NOW + 10 });
     expect(depth).toMatchObject({ runnerEpoch: 1 });
     expect(depth.agents).toEqual([
-      { agentId: seeded.agent, handle: "a.runner", presetId: "p1", depth: 3, status: "active" },
+      { agentId: seeded.agent, handle: "a.runner", presetId: "p1", depth: 3, status: "active", localReviews: [] },
     ]);
   });
 
@@ -428,7 +428,7 @@ describe("R01 stopping", () => {
     // And a paused agent reports no depth, so nothing on the machine starts a
     // process for it even if the frame never arrived.
     const depth = await seeded.stub.runnerQueueDepth({ actor: seeded.owner, deviceId: "device-a", now: NOW + 3 });
-    expect(depth.agents).toEqual([{ agentId: seeded.agent, handle: "a.runner", presetId: "p1", depth: 0, status: "paused" }]);
+    expect(depth.agents).toEqual([{ agentId: seeded.agent, handle: "a.runner", presetId: "p1", depth: 0, status: "paused", localReviews: [] }]);
   });
 
   it("RUNNER-INT-014 releases a runner from anywhere, without the machine being reachable", async () => {

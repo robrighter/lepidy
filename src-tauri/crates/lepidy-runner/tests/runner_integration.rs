@@ -317,6 +317,51 @@ fn runner_cli_int_006_refuses_a_wake_naming_a_preset_it_does_not_hold() {
 }
 
 #[test]
+fn runner_cli_int_023_prints_a_local_review_the_owner_asked_for() {
+    let home = TempHome::create("local-review");
+    let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
+    let key = enrol(&home, &double.url());
+    double.with_state(|state| state.signing_key = Some(key));
+    set_marker_preset(&home, "p1", "unused", 1);
+
+    // What a remote owner is allowed to say about this machine's launch
+    // configuration: an intent from a closed set, addressed to somebody who is
+    // physically here. The daemon prints it and does nothing else with it —
+    // acting on it would be the network editing what this computer runs (R05).
+    double.with_state(|state| {
+        state.depth = vec![json!({
+            "agentId": AGENT_ID,
+            "presetId": "p1",
+            "depth": 0,
+            "status": "active",
+            "localReviews": ["approve_agent", "review_limits"],
+        })];
+    });
+
+    let output = agentd(&home, &["status"], &[PASSPHRASE]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let printed = text(&output.stdout);
+    assert!(
+        printed.contains("awaiting local review: approve_agent")
+            && printed.contains("awaiting local review: review_limits"),
+        "the pending local reviews were not reported: {printed}",
+    );
+
+    // And nothing about the preset changed because of it. The revision is the
+    // machine's own counter; only a local edit moves it, and only a moved
+    // revision answers the ask.
+    let listed = agentd(&home, &["preset", "list", "--json"], &[PASSPHRASE]);
+    assert!(listed.status.success(), "{}", text(&listed.stderr));
+    let store: serde_json::Value =
+        serde_json::from_str(&text(&listed.stdout)).expect("preset list json");
+    assert_eq!(
+        store["revision"],
+        json!(2),
+        "a report must not edit anything"
+    );
+}
+
+#[test]
 fn runner_cli_int_007_finds_work_no_wake_announced() {
     let home = TempHome::create("lost-wake");
     let double = Double::start(enrol(&home, "http://127.0.0.1:1"));
