@@ -119,6 +119,9 @@ Manual review and screenshots can supplement visual judgment, store review and h
 | Scenario | Location | Coverage |
 |---|---|---|
 | `WORKSPACE-INT-001` | `tests/workspace.test.ts` | Direct RPC to a local SQLite Durable Object and singleton schema persistence. |
+| `C06-RULE-001–006` | `src/domain/notifications.test.ts` | Human/agent delivery tiers, `nothing` versus `mute`, scheduled/manual DND, room-plus-private visibility, exact-audience broadcast authorization and deterministic Home ranking. |
+| `C06-INT-001–003` | `tests/notifications.test.ts` | Real Durable Object and SQLite notification creation, exact unread counts beyond one page, read/unread state, keywords, DND, thread subscriptions, private-item withdrawal and authorized broadcast refusal/confirmation. |
+| `C06-UI-INT-001–004` | `tests/browser/activity.spec.ts` | Built-Worker Home and Inbox parity, actionable read state, rail/topbar activity entry points, per-room/keyword/DND settings, narrow-screen accessibility and dark mode, plus exact broadcast-audience confirmation in the composer. |
 | `RUNNER-SEC-001/002` | `src/domain/local-agent-trigger.test.ts` | Exact opaque remote trigger schema and rejection of every local launch-configuration override. |
 | `VAULT-AUTH-001–006` | `src/domain/vault-authorization.test.ts` | ACL union plus mandatory intersections, complete unattended delegation, independent reveal rights, exact grants and instructive non-circumvention denials. |
 | `VAULT-ENVELOPE-RULE-001/002`, `VAULT-POLICY-RULE-001–003` | `src/domain/vault-envelope.test.ts`, `src/domain/vault-policy.test.ts` | AES-GCM AAD binds workspace/credential/version; envelope, wrap, metadata, TTL, rate and exact-custodian constraints fail closed. |

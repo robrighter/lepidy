@@ -209,12 +209,12 @@ test("MSG-INT-009 keeps focus, preserves a draft and separates Enter from Shift+
   await expect(page.getByRole("textbox", { name: /Message #eng/ })).toHaveValue("");
 });
 
-test("SHELL-INT-006 states plainly that a surface is not built yet", async ({ page }) => {
-  // The Inbox itself now carries approvals (V03) and says which of its other
-  // tiers are still to come, rather than claiming the whole surface is absent.
+test("SHELL-INT-006 keeps shipped surfaces real and marks only unfinished ones", async ({ page }) => {
+  // Inbox now composes durable message activity with approvals.
   await page.goto("/inbox");
   await expect(page.getByRole("heading", { name: "Nothing is waiting on you" })).toBeVisible();
-  await expect(page.getByText(/join them with C06/)).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Messages for you" })).toBeVisible();
+  await expect(page.getByText("0 unread · 0 mentions · 0 threads · 0 DMs")).toBeVisible();
 
   // The vault is a real surface now (V03/V04), so the unbuilt example moved to
   // one that genuinely is: profile editing, which C07 owns.

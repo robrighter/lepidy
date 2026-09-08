@@ -31,6 +31,7 @@ export async function sendChannelMessage(input: {
   bodyMarkdown: string;
   idempotencyKey: string;
   threadParentId?: string | null;
+  confirmedBroadcastRecipients?: number;
 }): Promise<SendResult> {
   const key = parseIdempotencyKey(input.idempotencyKey);
   if (key === null) return { ok: false, reason: "invalid request key" };
@@ -74,6 +75,7 @@ export async function sendChannelMessage(input: {
       channelId: input.channelId,
       raw: input.bodyMarkdown,
       threadParentId: input.threadParentId ?? null,
+      confirmedBroadcastRecipients: input.confirmedBroadcastRecipients,
       now: Date.now(),
     });
     revalidatePath("/c/[channel]", "page");

@@ -133,13 +133,34 @@ export function Composer({
     const trimmed = body.trim();
     if (trimmed.length === 0 || sending) return;
     setSending(true);
-    const result = await sendChannelMessage({
+    const idempotencyKey = `compose:${channelId}:${crypto.randomUUID()}`.slice(0, 128);
+    let result = await sendChannelMessage({
       csrfToken: browserCsrfToken(),
       channelId,
       bodyMarkdown: trimmed,
       // Stable per attempt, so a retried submission is not a second message.
-      idempotencyKey: `compose:${channelId}:${crypto.randomUUID()}`.slice(0, 128),
+      idempotencyKey,
     });
+    const broadcastAudience = result.ok
+      ? null
+      : /^broadcast requires confirmation for (\d+) recipients$/.exec(result.reason);
+    if (broadcastAudience) {
+      const recipients = Number(broadcastAudience[1]);
+      const accepted = window.confirm(
+        `Notify ${recipients} ${recipients === 1 ? "recipient" : "recipients"} with this broadcast?`,
+      );
+      if (accepted) {
+        result = await sendChannelMessage({
+          csrfToken: browserCsrfToken(),
+          channelId,
+          bodyMarkdown: trimmed,
+          idempotencyKey,
+          confirmedBroadcastRecipients: recipients,
+        });
+      } else {
+        result = { ok: false, reason: "Broadcast cancelled." };
+      }
+    }
     setSending(false);
     setStatus(result);
     if (result.ok) {

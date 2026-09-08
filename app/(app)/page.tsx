@@ -1,13 +1,21 @@
 import { Hash, Lock, Sparkles } from "lucide-react";
 import Link from "next/link";
 
+import { ActivityFeed } from "@/components/shell/activity-feed";
+import { ApprovalInbox } from "@/components/shell/approval-inbox";
+import { workspaceApprovals } from "@/src/shell/approvals-context";
+import { workspaceActivity } from "@/src/shell/activity-context";
 import { shellState } from "@/src/shell/shell-context";
 import { channelHref, channelLabel } from "@/src/shell/shell-model";
+import { readCsrfToken } from "@/src/shell/session-cookies";
 
 export default async function HomePage() {
   const state = await shellState();
   if (state.status !== "ready") return null;
   const { snapshot, workspace } = state;
+  const [activityState, approvalState, csrfToken] = await Promise.all([
+    workspaceActivity(false), workspaceApprovals(), readCsrfToken(),
+  ]);
 
   return (
     <>
@@ -65,10 +73,14 @@ export default async function HomePage() {
         )}
       </section>
 
-      <section className="empty-state">
-        <h2>The ranked feed is not built yet</h2>
-        <p>Home will rank what needs you and what your agents did while you were away.</p>
-        <span className="next-step">Ranked Home and the actionable Inbox arrive with C06.</span>
+      <section className="panel" aria-labelledby="home-feed-heading">
+        <h2 id="home-feed-heading">What needs you</h2>
+        <p>Unread mentions and approvals lead, followed by thread replies, direct messages, keyword alerts and room activity.</p>
+        {approvalState.status === "ready" && approvalState.approvals.length > 0 ? (
+          <ApprovalInbox approvals={approvalState.approvals} csrfToken={csrfToken ?? ""} hasPasskey={approvalState.hasPasskey} />
+        ) : null}
+        {activityState.status === "unavailable" ? <div className="notice warn">{activityState.reason}</div> :
+          <ActivityFeed items={activityState.status === "ready" ? activityState.activity.items : []} csrfToken={csrfToken ?? ""} ranked />}
       </section>
     </>
   );

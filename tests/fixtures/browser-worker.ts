@@ -44,6 +44,26 @@ export class Workspace extends ProductionWorkspace {
     await this.reactToMessage({ actor, messageId: first.messageId, emoji: "👀", now });
   }
 
+  async seedBrowserActivity(actor: { memberId: string; authorizationEpoch: number }) {
+    const now = Date.now();
+    const viewer = this.ctx.storage.sql.exec<{ handle: string }>("SELECT handle FROM members WHERE id = ?", actor.memberId).one();
+    const senderId = `activity-sender-${crypto.randomUUID().slice(0, 8)}`;
+    await this.applyMembership({
+      operationId: `browser-activity:${senderId}`, memberId: senderId, accountId: `account-${senderId}`,
+      handle: `sender${senderId.slice(-4)}`, displayName: "Grace Hopper", role: "member", status: "active",
+      authorizationEpoch: 1, version: 1, now,
+    });
+    const channel = await this.createChannel({
+      actor, idempotencyKey: `browser-activity:channel:${now}`, kind: "public", slug: `activity-${String(now).slice(-6)}`,
+      name: "activity", memberIds: [senderId], now,
+    });
+    await this.sendMessage({
+      actor: { memberId: senderId, authorizationEpoch: 1 }, idempotencyKey: `browser-activity:message:${now}`,
+      channelId: channel.channelId, bodyMarkdown: `@${viewer.handle} please review the launch note`, now: now + 1,
+    });
+    return { channelId: channel.channelId };
+  }
+
   async seedDelegatedSession(actor: { memberId: string; authorizationEpoch: number }) {
     const now = Date.now();
     const allowed = await this.createChannel({ actor, idempotencyKey: `browser-session:allowed:${now}`, kind: "public", slug: `delegated-${String(now).slice(-6)}`, now });
@@ -206,7 +226,7 @@ export default {
         credentialId: await onboarding.finishPasskeyRegistration({ accountId, ...body }),
       });
     }
-    if (["/__fixture/seed", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/session-token", "/__fixture/vault", "/__fixture/device-origin", "/__fixture/runner-queue", "/__fixture/runner-enqueue", "/__fixture/runner-revoke"].includes(url.pathname) && request.method === "POST") {
+    if (["/__fixture/seed", "/__fixture/activity", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/session-token", "/__fixture/vault", "/__fixture/device-origin", "/__fixture/runner-queue", "/__fixture/runner-enqueue", "/__fixture/runner-revoke"].includes(url.pathname) && request.method === "POST") {
       const authorization = new AuthorizationService(env.CONTROL_DB, env.WORKSPACE);
       const resolved = await resolveViewerWorkspace({ db: env.CONTROL_DB, workspaces: env.WORKSPACE, authenticateSession: (token) => authorization.authenticateBrowserSession(token) }, request.headers.get("authorization"));
       if (resolved.status !== "ok") return new Response("Unauthorized", { status: 401 });
@@ -260,6 +280,9 @@ export default {
             body.count,
           ),
         );
+      }
+      if (url.pathname.endsWith("activity")) {
+        return Response.json(await stub.seedBrowserActivity({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch }));
       }
       await stub.seedBrowserHistory({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch });
       return Response.json({ ok: true });

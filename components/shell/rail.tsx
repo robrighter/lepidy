@@ -40,12 +40,14 @@ export function Rail({
   viewer,
   channels,
   agents,
+  unreadCount,
   onNavigate,
 }: {
   workspaceName: string;
   viewer: ShellViewer;
   channels: readonly ShellChannel[];
   agents: readonly ShellAgent[];
+  unreadCount: number;
   onNavigate: () => void;
 }) {
   const pathname = usePathname();
@@ -79,6 +81,9 @@ export function Rail({
             >
               {NAV_ICONS[item.id]}
               <span className="lbl">{item.label}</span>
+              {item.id === "inbox" && unreadCount > 0 ? (
+                <span className="badge" aria-label={`${unreadCount} unread`}>{unreadCount}</span>
+              ) : null}
             </Link>
           ))}
         </nav>

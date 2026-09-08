@@ -1168,6 +1168,58 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX vault_canary_trips_credential_idx ON vault_canary_trips(credential_id, detected_at)`,
     ],
   },
+  {
+    version: 28,
+    name: "Notifications, Home and Inbox",
+    statements: [
+      `CREATE TABLE notification_preferences (
+        member_id TEXT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
+        dnd_start_minute INTEGER CHECK (dnd_start_minute IS NULL OR dnd_start_minute BETWEEN 0 AND 1439),
+        dnd_end_minute INTEGER CHECK (dnd_end_minute IS NULL OR dnd_end_minute BETWEEN 0 AND 1439),
+        dnd_manual_until INTEGER,
+        updated_at INTEGER NOT NULL,
+        CHECK ((dnd_start_minute IS NULL) = (dnd_end_minute IS NULL))
+      ) STRICT`,
+      `CREATE TABLE channel_notification_preferences (
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        notify_level TEXT NOT NULL CHECK (notify_level IN ('everything', 'mentions', 'nothing', 'mute')),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, member_id)
+      ) STRICT`,
+      `CREATE TABLE notification_keywords (
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        keyword TEXT NOT NULL COLLATE NOCASE CHECK (length(keyword) BETWEEN 2 AND 64),
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (member_id, keyword)
+      ) STRICT`,
+      `CREATE TABLE thread_subscriptions (
+        thread_root_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        subscribed_at INTEGER NOT NULL,
+        PRIMARY KEY (thread_root_id, member_id)
+      ) STRICT`,
+      `CREATE TABLE notifications (
+        id TEXT PRIMARY KEY,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('mention', 'thread_reply', 'dm', 'keyword', 'channel')),
+        author_kind TEXT NOT NULL CHECK (author_kind IN ('member', 'agent')),
+        author_id TEXT NOT NULL,
+        badge INTEGER NOT NULL CHECK (badge IN (0, 1)),
+        push_allowed INTEGER NOT NULL CHECK (push_allowed IN (0, 1)),
+        private_item INTEGER NOT NULL DEFAULT 0 CHECK (private_item IN (0, 1)),
+        allowed_member_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(allowed_member_ids_json)),
+        created_at INTEGER NOT NULL,
+        read_at INTEGER,
+        UNIQUE (member_id, message_id)
+      ) STRICT`,
+      `CREATE INDEX notifications_inbox_idx ON notifications(member_id, read_at, created_at DESC)`,
+      `CREATE INDEX notifications_message_idx ON notifications(message_id)`,
+      `ALTER TABLE channels ADD COLUMN broadcast_policy TEXT NOT NULL DEFAULT 'admins' CHECK (broadcast_policy IN ('admins', 'members'))`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

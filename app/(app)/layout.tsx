@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 
 import { ShellFrame } from "@/components/shell/shell-frame";
+import { workspaceActivity } from "@/src/shell/activity-context";
 import { shellState } from "@/src/shell/shell-context";
 
 export default async function AppLayout({ children }: { children: ReactNode }) {
@@ -37,6 +38,9 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
     );
   }
 
+  const activity = await workspaceActivity(true);
+  const unreadCount = activity.status === "ready" ? activity.activity.unread.total : 0;
+
   return (
     <ShellFrame
       workspaceName={state.workspace.name}
@@ -44,6 +48,7 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
       viewer={state.snapshot.viewer}
       channels={state.snapshot.channels}
       agents={state.snapshot.agents}
+      unreadCount={unreadCount}
       authenticated={state.authenticated}
     >
       {children}

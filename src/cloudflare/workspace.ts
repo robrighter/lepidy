@@ -104,6 +104,16 @@ import {
 } from "../domain/socket-protocol";
 import { parseMentions } from "../domain/mentions";
 import {
+  decideMessageNotification,
+  homeRank,
+  isDndActive,
+  mayUseBroadcast,
+  notificationIsVisible,
+  parseNotifyLevel,
+  type NotificationKind,
+  type NotifyLevel,
+} from "../domain/notifications";
+import {
   callManagedAgents,
   customWake,
   decryptTransportSecret,
@@ -405,6 +415,36 @@ export type WorkspaceShellSnapshot = {
   agents: readonly ShellAgent[];
   storageMode: WorkspaceStorageMode | null;
   schemaVersion: number;
+};
+
+export type NotificationActivityItem = {
+  id: string;
+  kind: NotificationKind;
+  messageId: string;
+  channelId: string;
+  channelLabel: string;
+  authorKind: "member" | "agent";
+  authorLabel: string;
+  bodyMarkdown: string;
+  threadRootId: string | null;
+  createdAt: number;
+  readAt: number | null;
+  badge: boolean;
+  pushAllowed: boolean;
+  rank: number;
+};
+
+export type NotificationActivity = {
+  items: readonly NotificationActivityItem[];
+  unread: { total: number; mentions: number; threads: number; dms: number };
+};
+
+export type NotificationPreferencesSnapshot = {
+  channels: readonly { channelId: string; level: NotifyLevel }[];
+  keywords: readonly string[];
+  dndStartMinute: number | null;
+  dndEndMinute: number | null;
+  dndManualUntil: number | null;
 };
 
 export type Actor = { memberId: string; authorizationEpoch: number };
@@ -1654,6 +1694,167 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     };
   }
 
+  configureNotifications(input: {
+    actor: Actor;
+    channelId?: string;
+    notifyLevel?: NotifyLevel;
+    keywords?: readonly string[];
+    dndStartMinute?: number | null;
+    dndEndMinute?: number | null;
+    dndManualUntil?: number | null;
+    now: number;
+  }): { updated: true } {
+    const actor = this.authorizeActor(input.actor);
+    if (input.channelId !== undefined) {
+      this.requireVisibleChannel(input.channelId, actor.id);
+      const level = parseNotifyLevel(input.notifyLevel);
+      if (level === null) throw new Error("invalid notification level");
+      this.ctx.storage.sql.exec(
+        `INSERT INTO channel_notification_preferences(channel_id, member_id, notify_level, updated_at)
+         VALUES (?, ?, ?, ?) ON CONFLICT(channel_id, member_id) DO UPDATE SET
+         notify_level = excluded.notify_level, updated_at = excluded.updated_at`,
+        input.channelId, actor.id, level, input.now,
+      );
+    }
+    if (input.keywords !== undefined) {
+      const keywords = [...new Set(input.keywords.map((value) => value.trim().toLocaleLowerCase()).filter((value) => value.length >= 2 && value.length <= 64))];
+      if (keywords.length > 20 || keywords.length !== input.keywords.length) throw new Error("invalid notification keywords");
+      this.ctx.storage.sql.exec("DELETE FROM notification_keywords WHERE member_id = ?", actor.id);
+      for (const keyword of keywords) {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO notification_keywords(member_id, keyword, created_at) VALUES (?, ?, ?)",
+          actor.id, keyword, input.now,
+        );
+      }
+    }
+    if (input.dndStartMinute !== undefined || input.dndEndMinute !== undefined || input.dndManualUntil !== undefined) {
+      const start = input.dndStartMinute ?? null;
+      const end = input.dndEndMinute ?? null;
+      if ((start === null) !== (end === null) || (start !== null && (!Number.isInteger(start) || start < 0 || start > 1439)) || (end !== null && (!Number.isInteger(end) || end < 0 || end > 1439))) {
+        throw new Error("invalid do-not-disturb window");
+      }
+      this.ctx.storage.sql.exec(
+        `INSERT INTO notification_preferences(member_id, dnd_start_minute, dnd_end_minute, dnd_manual_until, updated_at)
+         VALUES (?, ?, ?, ?, ?) ON CONFLICT(member_id) DO UPDATE SET
+         dnd_start_minute = excluded.dnd_start_minute, dnd_end_minute = excluded.dnd_end_minute,
+         dnd_manual_until = excluded.dnd_manual_until, updated_at = excluded.updated_at`,
+        actor.id, start, end, input.dndManualUntil ?? null, input.now,
+      );
+    }
+    return { updated: true };
+  }
+
+  notificationPreferences(input: { actor: Actor }): NotificationPreferencesSnapshot {
+    const actor = this.authorizeActor(input.actor);
+    const settings = this.ctx.storage.sql.exec<{
+      dnd_start_minute: number | null; dnd_end_minute: number | null; dnd_manual_until: number | null;
+    }>("SELECT dnd_start_minute, dnd_end_minute, dnd_manual_until FROM notification_preferences WHERE member_id = ?", actor.id).toArray()[0];
+    return {
+      channels: this.ctx.storage.sql.exec<{ channel_id: string; notify_level: NotifyLevel }>(
+        "SELECT channel_id, notify_level FROM channel_notification_preferences WHERE member_id = ? ORDER BY channel_id", actor.id,
+      ).toArray().map((row) => ({ channelId: row.channel_id, level: row.notify_level })),
+      keywords: this.ctx.storage.sql.exec<{ keyword: string }>(
+        "SELECT keyword FROM notification_keywords WHERE member_id = ? ORDER BY keyword", actor.id,
+      ).toArray().map((row) => row.keyword),
+      dndStartMinute: settings?.dnd_start_minute ?? null,
+      dndEndMinute: settings?.dnd_end_minute ?? null,
+      dndManualUntil: settings?.dnd_manual_until ?? null,
+    };
+  }
+
+  setThreadSubscription(input: { actor: Actor; threadRootId: string; subscribed: boolean; now: number }): { subscribed: boolean } {
+    const actor = this.authorizeActor(input.actor);
+    const root = readMessage(this.ctx.storage, input.threadRootId);
+    if (root === null || root.threadRootId !== null || root.deletedAt !== null) throw new Error("thread not found");
+    this.requireVisibleChannel(root.channelId, actor.id);
+    if (input.subscribed) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO thread_subscriptions(thread_root_id, member_id, subscribed_at) VALUES (?, ?, ?)
+         ON CONFLICT(thread_root_id, member_id) DO NOTHING`,
+        root.id, actor.id, input.now,
+      );
+    } else {
+      this.ctx.storage.sql.exec("DELETE FROM thread_subscriptions WHERE thread_root_id = ? AND member_id = ?", root.id, actor.id);
+    }
+    return { subscribed: input.subscribed };
+  }
+
+  listNotificationActivity(input: { actor: Actor; unreadOnly?: boolean; limit?: number }): NotificationActivity {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const limit = Math.max(1, Math.min(input.limit ?? 50, 100));
+    const rows = this.ctx.storage.sql.exec<{
+      id: string; kind: NotificationKind; message_id: string; channel_id: string; channel_label: string;
+      author_kind: "member" | "agent"; author_label: string; body_markdown: string; thread_root_id: string | null;
+      created_at: number; read_at: number | null; badge: number; push_allowed: number;
+      channel_kind: ShellChannel["kind"]; is_member: number; private_item: number; allowed_member_ids_json: string;
+    }>(
+      `SELECT n.id, n.kind, n.message_id, n.channel_id, COALESCE(c.slug, c.name, c.id) AS channel_label,
+              n.author_kind, m.author_display_snapshot AS author_label, m.body_markdown, m.thread_root_id,
+              n.created_at, n.read_at, n.badge, n.push_allowed, c.kind AS channel_kind,
+              CASE WHEN cm.member_id IS NULL THEN 0 ELSE 1 END AS is_member,
+              n.private_item, n.allowed_member_ids_json
+       FROM notifications n
+       JOIN messages m ON m.id = n.message_id AND m.deleted_at IS NULL
+       JOIN channels c ON c.id = n.channel_id AND c.archived_at IS NULL
+       LEFT JOIN channel_members cm ON cm.channel_id = c.id AND cm.member_id = ?
+       WHERE n.member_id = ? AND (? = 0 OR n.read_at IS NULL)
+       ORDER BY n.created_at DESC, n.id DESC LIMIT ?`,
+      actor.id, actor.id, input.unreadOnly ? 1 : 0, limit,
+    ).toArray();
+    const items = rows.filter((row) => notificationIsVisible({
+      channelKind: row.channel_kind,
+      isCurrentMember: row.is_member === 1,
+      privateItem: row.private_item === 1,
+      privateItemAllowed: JSON.parse(row.allowed_member_ids_json).includes(actor.id),
+    })).map((row) => ({
+      id: row.id, kind: row.kind, messageId: row.message_id, channelId: row.channel_id,
+      channelLabel: row.channel_label, authorKind: row.author_kind, authorLabel: row.author_label,
+      bodyMarkdown: row.body_markdown, threadRootId: row.thread_root_id, createdAt: row.created_at,
+      readAt: row.read_at, badge: row.badge === 1, pushAllowed: row.push_allowed === 1,
+      rank: homeRank({ kind: row.kind, unread: row.read_at === null, createdAt: row.created_at }),
+    }));
+    // The page is bounded; the badge is not. Count every currently visible
+    // unread item instead of silently capping a busy member at the page size.
+    const unread = this.ctx.storage.sql.exec<{
+      total: number;
+      mentions: number;
+      threads: number;
+      dms: number;
+    }>(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(CASE WHEN n.kind = 'mention' THEN 1 ELSE 0 END), 0) AS mentions,
+              COALESCE(SUM(CASE WHEN n.kind = 'thread_reply' THEN 1 ELSE 0 END), 0) AS threads,
+              COALESCE(SUM(CASE WHEN n.kind = 'dm' THEN 1 ELSE 0 END), 0) AS dms
+       FROM notifications n
+       JOIN messages m ON m.id = n.message_id AND m.deleted_at IS NULL
+       JOIN channels c ON c.id = n.channel_id AND c.archived_at IS NULL
+       LEFT JOIN channel_members cm ON cm.channel_id = c.id AND cm.member_id = ?
+       WHERE n.member_id = ? AND n.read_at IS NULL AND n.badge = 1
+         AND (c.kind = 'public' OR cm.member_id IS NOT NULL)
+         AND (n.private_item = 0 OR EXISTS (
+           SELECT 1 FROM json_each(n.allowed_member_ids_json) allowed WHERE allowed.value = ?
+         ))`,
+      actor.id,
+      actor.id,
+      actor.id,
+    ).one();
+    return {
+      items,
+      unread,
+    };
+  }
+
+  markNotification(input: { actor: Actor; notificationId: string; unread: boolean; now: number }): { unread: boolean } {
+    const actor = this.authorizeActor(input.actor);
+    const changed = this.ctx.storage.sql.exec(
+      "UPDATE notifications SET read_at = ? WHERE id = ? AND member_id = ?",
+      input.unread ? null : input.now, input.notificationId, actor.id,
+    );
+    if (changed.rowsWritten === 0) throw new Error("notification not found");
+    return { unread: input.unread };
+  }
+
   /* ------------------------------------------------------------------ */
   /* Live delivery, read state and presence (C03)                        */
   /* ------------------------------------------------------------------ */
@@ -2228,6 +2429,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     channelId: string;
     bodyMarkdown: string;
     threadParentId?: string | null;
+    confirmedBroadcastRecipients?: number;
     now: number;
   }): Promise<SentMessage> {
     const actor = this.authorizeActor(input.actor);
@@ -2261,6 +2463,23 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         const messageId = crypto.randomUUID();
         const channelSequence = nextChannelSequence(this.ctx.storage, channel.id);
         const mentions = resolveMentionTargets(this.ctx.storage, parseMentions(body));
+        if (mentions.some((mention) => mention.kind === "channel" || mention.kind === "here")) {
+          const policy = this.ctx.storage.sql.exec<{ broadcast_policy: "admins" | "members" }>(
+            "SELECT broadcast_policy FROM channels WHERE id = ?", channel.id,
+          ).one();
+          const recipientCount = channelMemberIds(this.ctx.storage, channel.id).filter(
+            (memberId) => memberId !== actor.id,
+          ).length;
+          const permitted = actor.role === "owner" || actor.role === "admin" || policy.broadcast_policy === "members";
+          if (!permitted) throw new Error("broadcast requires permission");
+          if (recipientCount === 0) throw new Error("broadcast has no recipients");
+          if (!mayUseBroadcast({
+            actorRole: actor.role,
+            channelAllowsMembers: policy.broadcast_policy === "members",
+            confirmedRecipientCount: input.confirmedBroadcastRecipients ?? null,
+            actualRecipientCount: recipientCount,
+          })) throw new Error(`broadcast requires confirmation for ${recipientCount} recipients`);
+        }
         insertMessage(this.ctx.storage, {
           id: messageId,
           channelId: channel.id,
@@ -2284,6 +2503,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           mentions,
           isHistorical: false,
           now: input.now,
+        });
+        const notified = this.recordMessageNotifications({
+          messageId, channel, threadRootId, authorKind: "member", authorId: actor.id,
+          bodyMarkdown: body, mentions, now: input.now,
         });
 
         return {
@@ -2312,6 +2535,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                 channel_sequence: channelSequence,
                 mention_count: mentions.length,
                 agent_work_enqueued: enqueued,
+                notification_count: notified.created,
+                push_count: notified.pushMemberIds.length,
               },
             },
             // Delivery carries identifiers; a reader fetches the message it is
@@ -2337,6 +2562,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                 dedupeKey: `message:${messageId}`,
                 payload: { messageId, channelId: channel.id, threadRootId },
               },
+              ...notified.pushMemberIds.map((memberId) => ({
+                id: `notification.${messageId}.${memberId}`,
+                kind: "notification_push",
+                dedupeKey: `notification:${messageId}:${memberId}`,
+                payload: { memberId, messageId, channelId: channel.id },
+              })),
             ],
           } satisfies MutationEffects,
         };
@@ -3382,6 +3613,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     channelId: string;
     raw: string;
     threadParentId?: string | null;
+    confirmedBroadcastRecipients?: number;
     now: number;
   }): Promise<ComposerOutcome> {
     const parsed = parseComposerInput(input.raw);
@@ -3405,6 +3637,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           channelId: input.channelId,
           bodyMarkdown: parsed.bodyMarkdown,
           threadParentId: input.threadParentId ?? null,
+          confirmedBroadcastRecipients: input.confirmedBroadcastRecipients,
           now: input.now,
         });
         return { kind: "sent", messageId: sent.messageId };
@@ -8264,6 +8497,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           isHistorical: false,
           now: input.now,
         });
+        const notified = this.recordMessageNotifications({
+          messageId, channel, threadRootId, authorKind, authorId,
+          bodyMarkdown: body, mentions, now: input.now,
+        });
         if (credential.kind === "oauth" && connection !== null) {
           insertMcpMessageAttribution(this.ctx.storage, {
             messageId,
@@ -8314,6 +8551,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                 client_id: connection?.clientId ?? `runner:${credential.deviceId}`,
                 operating_agent_id: agent?.id ?? null,
                 agent_work_enqueued: enqueued,
+                notification_count: notified.created,
+                push_count: notified.pushMemberIds.length,
               },
             },
             replay: [
@@ -8337,6 +8576,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                 dedupeKey: `message:${messageId}`,
                 payload: { messageId, channelId: channel.id, threadRootId },
               },
+              ...notified.pushMemberIds.map((memberId) => ({
+                id: `notification.${messageId}.${memberId}`,
+                kind: "notification_push",
+                dedupeKey: `notification:${messageId}:${memberId}`,
+                payload: { memberId, messageId, channelId: channel.id },
+              })),
             ],
           } satisfies MutationEffects,
         };
@@ -8354,6 +8599,102 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       });
     }
     return { ...outcome.result, replayed: outcome.replayed };
+  }
+
+  private recordMessageNotifications(input: {
+    messageId: string;
+    channel: ChannelRow;
+    threadRootId: string | null;
+    authorKind: "member" | "agent";
+    authorId: string;
+    bodyMarkdown: string;
+    mentions: readonly { kind: string; resolvedId: string | null }[];
+    now: number;
+  }): { created: number; pushMemberIds: readonly string[] } {
+    const memberIds = new Set(channelMemberIds(this.ctx.storage, input.channel.id));
+    if (input.channel.kind === "public") {
+      for (const mention of input.mentions) if (mention.kind === "member" && mention.resolvedId !== null) memberIds.add(mention.resolvedId);
+    }
+    memberIds.delete(input.authorKind === "member" ? input.authorId : "");
+
+    if (input.authorKind === "member") {
+      const rootId = input.threadRootId ?? input.messageId;
+      this.ctx.storage.sql.exec(
+        `INSERT INTO thread_subscriptions(thread_root_id, member_id, subscribed_at) VALUES (?, ?, ?)
+         ON CONFLICT(thread_root_id, member_id) DO NOTHING`,
+        rootId, input.authorId, input.now,
+      );
+    }
+
+    const directlyMentioned = new Set(input.mentions.filter((mention) => mention.kind === "member" && mention.resolvedId !== null).map((mention) => mention.resolvedId!));
+    const broadcast = input.mentions.some(
+      (mention) => mention.kind === "channel" || mention.kind === "here",
+    );
+    const subscribers = input.threadRootId === null ? new Set<string>() : new Set(
+      this.ctx.storage.sql.exec<{ member_id: string }>(
+        "SELECT member_id FROM thread_subscriptions WHERE thread_root_id = ?", input.threadRootId,
+      ).toArray().map((row) => row.member_id),
+    );
+    const bodyLower = input.bodyMarkdown.toLocaleLowerCase();
+    let created = 0;
+    const pushMemberIds: string[] = [];
+    for (const memberId of memberIds) {
+      const pref = this.ctx.storage.sql.exec<{
+        notify_level: NotifyLevel | null; dnd_start_minute: number | null; dnd_end_minute: number | null; dnd_manual_until: number | null;
+      }>(
+        `SELECT cnp.notify_level, np.dnd_start_minute, np.dnd_end_minute, np.dnd_manual_until
+         FROM members m
+         LEFT JOIN channel_notification_preferences cnp ON cnp.member_id = m.id AND cnp.channel_id = ?
+         LEFT JOIN notification_preferences np ON np.member_id = m.id WHERE m.id = ? AND m.status = 'active'`,
+        input.channel.id, memberId,
+      ).toArray()[0];
+      if (pref === undefined) continue;
+      const keywordMatched = this.ctx.storage.sql.exec<{ keyword: string }>(
+        "SELECT keyword FROM notification_keywords WHERE member_id = ?", memberId,
+      ).toArray().some((row) => bodyLower.includes(row.keyword.toLocaleLowerCase()));
+      const kind: NotificationKind = directlyMentioned.has(memberId)
+        ? "mention"
+        : subscribers.has(memberId)
+          ? "thread_reply"
+          : input.channel.kind === "dm" || input.channel.kind === "group_dm"
+            ? "dm"
+            : keywordMatched
+              ? "keyword"
+              : "channel";
+      const date = new Date(input.now);
+      const decision = decideMessageNotification({
+        level: pref.notify_level ?? "mentions",
+        kind,
+        authorKind: input.authorKind,
+        keywordMatched,
+        broadcast,
+        dndActive: isDndActive({
+          minuteOfDay: date.getUTCHours() * 60 + date.getUTCMinutes(),
+          startMinute: pref.dnd_start_minute,
+          endMinute: pref.dnd_end_minute,
+          manualUntil: pref.dnd_manual_until,
+          now: input.now,
+        }),
+      });
+      if (!decision.inbox) continue;
+      const result = this.ctx.storage.sql.exec(
+        `INSERT INTO notifications(id, member_id, message_id, channel_id, kind, author_kind, author_id,
+          badge, push_allowed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(member_id, message_id) DO NOTHING`,
+        crypto.randomUUID(), memberId, input.messageId, input.channel.id, kind, input.authorKind, input.authorId,
+        decision.badge ? 1 : 0, decision.push ? 1 : 0, input.now,
+      );
+      created += result.rowsWritten;
+      if (decision.push && result.rowsWritten > 0) pushMemberIds.push(memberId);
+      if (kind === "mention" && input.threadRootId !== null) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO thread_subscriptions(thread_root_id, member_id, subscribed_at) VALUES (?, ?, ?)
+           ON CONFLICT(thread_root_id, member_id) DO NOTHING`,
+          input.threadRootId, memberId, input.now,
+        );
+      }
+    }
+    return { created, pushMemberIds };
   }
 
   private consumeMcpWrite(connectionId: string, agentId: string, now: number): void {

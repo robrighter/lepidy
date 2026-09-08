@@ -1,6 +1,7 @@
 "use client";
 
 import { Bell, PanelLeft } from "lucide-react";
+import Link from "next/link";
 import { useEffect, useState, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
 
@@ -20,6 +21,7 @@ export function ShellFrame({
   viewer,
   channels,
   agents,
+  unreadCount,
   authenticated,
   children,
 }: {
@@ -28,6 +30,7 @@ export function ShellFrame({
   viewer: ShellViewer;
   channels: readonly ShellChannel[];
   agents: readonly ShellAgent[];
+  unreadCount: number;
   authenticated: boolean;
   children: ReactNode;
 }) {
@@ -46,6 +49,7 @@ export function ShellFrame({
         viewer={viewer}
         channels={channels}
         agents={agents}
+        unreadCount={unreadCount}
         onNavigate={() => setRailOpen(false)}
       />
       <button
@@ -72,9 +76,10 @@ export function ShellFrame({
           </div>
           <span className="spacer" />
           <ThemeToggle />
-          <button type="button" className="icon-button" disabled aria-label="Notifications" title="Notifications arrive with C06">
+          <Link className="icon-button notification-link" href="/inbox" aria-label={`Notifications${unreadCount ? `, ${unreadCount} unread` : ""}`}>
             <Bell size={17} />
-          </button>
+            {unreadCount ? <span className="notification-dot" aria-hidden="true" /> : null}
+          </Link>
           <ProfileMenu viewer={viewer} plan={plan} />
         </header>
         <main className="content" id="main">
