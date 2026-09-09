@@ -114,6 +114,17 @@ import {
   type NotifyLevel,
 } from "../domain/notifications";
 import {
+  assertKeyBelongsToWorkspace,
+  fileObjectKey,
+  fileStateTransition,
+  isInlineRenderable,
+  parseFileName,
+  parseMediaType,
+  quotaDecision,
+  QUOTA_WARN_FRACTION,
+  RESERVATION_TTL_MS,
+} from "../domain/files";
+import {
   parseAvailability,
   parseGroupHandle,
   parseProfile,
@@ -491,6 +502,26 @@ export type DirectoryGroup = {
   description: string | null;
   createdByMemberId: string | null;
   memberIds: readonly string[];
+};
+
+type FileRow = {
+  id: string; object_key: string; file_name: string; media_type: string; byte_length: number;
+  sha256: string | null; uploaded_by_member_id: string | null; channel_id: string; message_id: string | null;
+  state: "reserved" | "stored" | "deleted"; created_at: number; expires_at: number | null;
+  confirmed_at: number | null; deleted_at: number | null;
+};
+
+export type StoredFile = {
+  id: string;
+  fileName: string;
+  mediaType: string;
+  byteLength: number;
+  channelId: string;
+  messageId: string | null;
+  uploadedByMemberId: string | null;
+  createdAt: number;
+  /** Only images render inline; everything else is offered as a download. */
+  inlineRenderable: boolean;
 };
 
 export type PeopleDirectory = {
@@ -1629,16 +1660,28 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         );
       }
       for (const attachment of staged.attachments) {
+        // Imported attachments arrive already stored, and their room comes from
+        // the message they belong to. A Solo snapshot records no uploader, so
+        // that column stays null rather than being attributed to whoever ran
+        // the upgrade.
+        const owner = this.ctx.storage.sql
+          .exec<{ channel_id: string }>("SELECT channel_id FROM messages WHERE id = ?", attachment.messageId)
+          .toArray()[0];
+        if (!owner) continue;
         this.ctx.storage.sql.exec(
-          `INSERT INTO attachments(id, message_id, file_name, media_type, byte_length, object_key, sha256)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO files(id, object_key, file_name, media_type, byte_length, sha256,
+             uploaded_by_member_id, channel_id, message_id, state, created_at, confirmed_at)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 'stored', ?, ?)`,
           attachment.id,
-          attachment.messageId,
+          attachment.relativePath,
           attachment.fileName,
           attachment.mediaType,
           attachment.byteLength,
-          attachment.relativePath,
           attachment.sha256,
+          owner.channel_id,
+          attachment.messageId,
+          input.now,
+          input.now,
         );
       }
       const routingEpoch = config.routing_epoch + 1;
@@ -1823,6 +1866,315 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const updated = this.listPeople({ actor: input.actor }).people.find((member) => member.id === actor.id);
     if (!updated) throw new Error("profile is unavailable");
     return { profile: updated };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Attachments: reservation, confirmation, listing and download (C08)   */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * The storage allowance, decided in D1 and mirrored here.
+   *
+   * Projected rather than queried because the object cannot reach D1 and must
+   * not try: an upload decision that needed a cross-database read would be a
+   * decision that fails open when the control plane is slow. A workspace that
+   * has never been projected has a zero quota and refuses every upload, which
+   * is the safe direction.
+   */
+  async applyStorageEntitlement(input: { quotaBytes: number; version: number; now: number }): Promise<{ applied: boolean }> {
+    if (!Number.isSafeInteger(input.quotaBytes) || input.quotaBytes < 0) throw new Error("storage quota is invalid");
+    if (!Number.isSafeInteger(input.version) || input.version < 1) throw new Error("entitlement version is invalid");
+    const outcome = await this.commitMutation<{ applied: boolean }>({ scope: "files.entitlement", now: input.now }, () => {
+      const current = this.ctx.storage.sql
+        .exec<{ storage_entitlement_version: number }>("SELECT storage_entitlement_version FROM workspace_config WHERE singleton = 1")
+        .toArray()[0];
+      // An older projection arriving late must not undo a newer one.
+      if (current && current.storage_entitlement_version >= input.version) return { result: { applied: false } };
+      this.ctx.storage.sql.exec(
+        "UPDATE workspace_config SET storage_quota_bytes = ?, storage_entitlement_version = ?, updated_at = ? WHERE singleton = 1",
+        input.quotaBytes, input.version, input.now,
+      );
+      return { result: { applied: true } };
+    });
+    return outcome.result;
+  }
+
+  /** Quota, live usage and the warning threshold, for the uploader and the admin screen. */
+  storageStatus(input: { actor: Actor }): { quotaBytes: number; usedBytes: number; warn: boolean } {
+    this.authorizeActor(input.actor);
+    return this.readStorageStatus();
+  }
+
+  private readStorageStatus(): { quotaBytes: number; usedBytes: number; warn: boolean } {
+    const config = this.ctx.storage.sql
+      .exec<{ storage_quota_bytes: number }>("SELECT storage_quota_bytes FROM workspace_config WHERE singleton = 1")
+      .toArray()[0];
+    // Reservations count against the quota until they expire, so a burst of
+    // parallel uploads cannot each be told there is room for all of them.
+    const used = this.ctx.storage.sql
+      .exec<{ total: number | null }>(
+        `SELECT SUM(byte_length) AS total FROM files
+         WHERE state = 'stored' OR (state = 'reserved' AND expires_at > ?)`,
+        Date.now(),
+      )
+      .toArray()[0];
+    const quotaBytes = config?.storage_quota_bytes ?? 0;
+    const usedBytes = used?.total ?? 0;
+    return { quotaBytes, usedBytes, warn: quotaBytes > 0 && usedBytes >= quotaBytes * QUOTA_WARN_FRACTION };
+  }
+
+  /**
+   * Step one of an upload: check authority and quota, then hand back a key.
+   *
+   * The bytes are not here and never will be — a 2 MB row limit and a 30-second
+   * CPU budget are not where file transfer belongs (HLD §5.4). This reserves
+   * the space and names the object; a Worker route streams the bytes to R2 and
+   * calls {@link confirmUpload} afterwards.
+   */
+  async reserveUpload(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    channelId: string;
+    fileName: string;
+    mediaType: string;
+    byteLength: number;
+    now: number;
+  }): Promise<{ fileId: string; objectKey: string; expiresAt: number; warn: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const config = this.ctx.storage.sql
+      .exec<{ storage_mode: WorkspaceStorageMode }>("SELECT storage_mode FROM workspace_config WHERE singleton = 1")
+      .toArray()[0];
+    // Solo attachments live on the designated host and are bounded by its own
+    // local quota; the cloud relay must never become their store, so this path
+    // refuses rather than quietly accepting bytes the contract forbids.
+    if (config?.storage_mode !== "cloud") throw new Error("this workspace stores attachments on its own host");
+
+    const channel = readChannel(this.ctx.storage, input.channelId);
+    if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))) throw new Error("channel not found");
+    if (!isChannelMember(this.ctx.storage, channel.id, actor.id)) throw new Error("join this channel before attaching a file");
+
+    const fileName = parseFileName(input.fileName);
+    const mediaType = parseMediaType(input.mediaType);
+    const status = this.readStorageStatus();
+    const decision = quotaDecision({ quotaBytes: status.quotaBytes, usedBytes: status.usedBytes, incomingBytes: input.byteLength });
+    if (decision.outcome === "refuse") throw new Error(decision.reason);
+
+    const outcome = await this.commitMutation<{ fileId: string; objectKey: string; expiresAt: number; warn: boolean }>(
+      { scope: "files.reserve", idempotencyKey: input.idempotencyKey, now: input.now },
+      () => {
+        const fileId = crypto.randomUUID().replaceAll("-", "");
+        const objectKey = fileObjectKey({ workspaceId: this.workspaceKeyId(), fileId, fileName, now: input.now });
+        const expiresAt = input.now + RESERVATION_TTL_MS;
+        this.ctx.storage.sql.exec(
+          `INSERT INTO files(id, object_key, file_name, media_type, byte_length, uploaded_by_member_id,
+             channel_id, state, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)`,
+          fileId, objectKey, fileName, mediaType, input.byteLength, actor.id, channel.id, input.now, expiresAt,
+        );
+        return {
+          result: { fileId, objectKey, expiresAt, warn: decision.warn },
+          effects: {
+            audit: {
+              eventType: "file.reserved", outcome: "allowed", requesterKind: "member", requesterId: actor.id,
+              subjectKind: "file", subjectId: fileId, metadata: { channel_id: channel.id, byte_length: input.byteLength },
+            },
+          },
+        };
+      },
+    );
+    return outcome.result;
+  }
+
+  /**
+   * Says whether a transfer may start and where it goes.
+   *
+   * Read-only on purpose: the Worker needs the key before it has bytes, and a
+   * transfer that never completes must leave the reservation to expire on its
+   * own rather than having been mutated into some half state.
+   */
+  beginTransfer(input: { actor: Actor; fileId: string; byteLength: number }): { objectKey: string } {
+    const actor = this.authorizeActor(input.actor);
+    const row = this.readFileRow(input.fileId);
+    if (row === null || row.state !== "reserved") throw new Error("upload not found");
+    if (row.uploaded_by_member_id !== actor.id) throw new Error("upload not found");
+    if (row.expires_at !== null && row.expires_at <= Date.now()) throw new Error("that upload reservation expired");
+    if (row.byte_length !== input.byteLength) throw new Error("the transfer does not match its reservation");
+    assertKeyBelongsToWorkspace(row.object_key, this.workspaceKeyId());
+    return { objectKey: row.object_key };
+  }
+
+  /**
+   * Step two: the bytes are in R2, so the reservation becomes a stored file.
+   *
+   * The verified length and digest come from whatever actually wrote the
+   * object, not from the client's original claim, so a reservation for one byte
+   * cannot be spent on a hundred megabytes.
+   */
+  async confirmUpload(input: {
+    actor: Actor; fileId: string; byteLength: number; sha256?: string | null; now: number;
+  }): Promise<{ confirmed: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const outcome = await this.commitMutation<{ confirmed: boolean }>({ scope: "files.confirm", now: input.now }, () => {
+      const row = this.readFileRow(input.fileId);
+      if (row === null || row.uploaded_by_member_id !== actor.id) throw new Error("upload not found");
+      if (row.state === "stored") return { result: { confirmed: true } };
+      fileStateTransition(row.state, "stored");
+      if (row.expires_at !== null && row.expires_at <= input.now) throw new Error("that upload reservation expired");
+      if (input.byteLength !== row.byte_length) throw new Error("the stored object does not match its reservation");
+      this.ctx.storage.sql.exec(
+        "UPDATE files SET state = 'stored', sha256 = ?, confirmed_at = ?, expires_at = NULL WHERE id = ?",
+        input.sha256 ?? null, input.now, row.id,
+      );
+      return {
+        result: { confirmed: true },
+        effects: {
+          audit: {
+            eventType: "file.stored", outcome: "allowed", requesterKind: "member", requesterId: actor.id,
+            subjectKind: "file", subjectId: row.id, metadata: { channel_id: row.channel_id, byte_length: row.byte_length },
+          },
+        },
+      };
+    });
+    return outcome.result;
+  }
+
+  /** Binds stored files to the message that carries them, once it exists. */
+  async attachFilesToMessage(input: {
+    actor: Actor; messageId: string; fileIds: readonly string[]; now: number;
+  }): Promise<{ attached: number }> {
+    const actor = this.authorizeActor(input.actor);
+    const outcome = await this.commitMutation<{ attached: number }>({ scope: "files.attach", now: input.now }, () => {
+      const message = this.ctx.storage.sql
+        .exec<{ id: string; channel_id: string; author_kind: string; author_id: string }>(
+          "SELECT id, channel_id, author_kind, author_id FROM messages WHERE id = ?", input.messageId,
+        )
+        .toArray()[0];
+      // Only the human who wrote the message may hang files on it; an agent's
+      // message is not a place to park somebody else's upload.
+      if (!message || message.author_kind !== "member" || message.author_id !== actor.id) {
+        throw new Error("message not found");
+      }
+      let attached = 0;
+      for (const fileId of input.fileIds) {
+        const row = this.readFileRow(fileId);
+        // A file may only join a message in the room it was uploaded to, by the
+        // person who uploaded it: otherwise a message becomes a way to move an
+        // attachment into a room its uploader could not post in.
+        if (row === null || row.state !== "stored" || row.uploaded_by_member_id !== actor.id) continue;
+        if (row.channel_id !== message.channel_id || row.message_id !== null) continue;
+        this.ctx.storage.sql.exec("UPDATE files SET message_id = ? WHERE id = ?", message.id, row.id);
+        attached += 1;
+      }
+      return { result: { attached } };
+    });
+    return outcome.result;
+  }
+
+  /** Files in rooms this reader may see, newest first. */
+  listFiles(input: { actor: Actor; channelId?: string | null; limit?: number }): { files: readonly StoredFile[] } {
+    const actor = this.authorizeActor(input.actor);
+    const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
+    const rows = this.ctx.storage.sql
+      .exec<FileRow>(
+        `SELECT * FROM files WHERE state = 'stored' ${input.channelId ? "AND channel_id = ?" : ""}
+         ORDER BY created_at DESC, id LIMIT ?`,
+        ...(input.channelId ? [input.channelId, limit * 4] : [limit * 4]),
+      )
+      .toArray();
+    const files: StoredFile[] = [];
+    for (const row of rows) {
+      if (files.length >= limit) break;
+      const channel = readChannel(this.ctx.storage, row.channel_id);
+      // Visibility is rechecked per row at read time rather than trusted from
+      // the upload, because room membership changes after a file is stored.
+      if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))) continue;
+      files.push(this.projectFile(row));
+    }
+    return { files };
+  }
+
+  /**
+   * Authorizes one download and returns the key to stream.
+   *
+   * The key is rechecked against this workspace even though it was read from
+   * this workspace's own table, because a tenancy assertion that is only made
+   * at write time is one bad row away from not being made at all.
+   */
+  authorizeDownload(input: { actor: Actor; fileId: string }): { objectKey: string; file: StoredFile } {
+    const actor = this.authorizeActor(input.actor);
+    const row = this.readFileRow(input.fileId);
+    if (row === null || row.state !== "stored") throw new Error("file not found");
+    const channel = readChannel(this.ctx.storage, row.channel_id);
+    if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))) throw new Error("file not found");
+    assertKeyBelongsToWorkspace(row.object_key, this.workspaceKeyId());
+    return { objectKey: row.object_key, file: this.projectFile(row) };
+  }
+
+  /**
+   * Deletes a file. Access ends in this transaction; the bytes are swept
+   * afterwards (D07: reads revoked immediately, object removed within 24 hours).
+   */
+  async deleteFile(input: { actor: Actor; fileId: string; now: number }): Promise<{ objectKey: string }> {
+    const actor = this.authorizeActor(input.actor);
+    const outcome = await this.commitMutation<{ objectKey: string }>({ scope: "files.delete", now: input.now }, () => {
+      const row = this.readFileRow(input.fileId);
+      if (row === null || row.state === "deleted") throw new Error("file not found");
+      // Visibility before authority: telling somebody who cannot see the room
+      // that they merely lack permission would confirm the file exists.
+      const channel = readChannel(this.ctx.storage, row.channel_id);
+      if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))) throw new Error("file not found");
+      const isUploader = row.uploaded_by_member_id === actor.id;
+      if (!isUploader && actor.role !== "owner" && actor.role !== "admin") throw new Error("only the uploader or an administrator may delete this file");
+      fileStateTransition(row.state, "deleted");
+      this.ctx.storage.sql.exec("UPDATE files SET state = 'deleted', deleted_at = ?, expires_at = NULL WHERE id = ?", input.now, row.id);
+      return {
+        result: { objectKey: row.object_key },
+        effects: {
+          audit: {
+            eventType: "file.deleted", outcome: "allowed", requesterKind: "member", requesterId: actor.id,
+            subjectKind: "file", subjectId: row.id, metadata: { channel_id: row.channel_id },
+          },
+        },
+      };
+    });
+    return outcome.result;
+  }
+
+  /**
+   * Reservations nobody completed. Returns their keys so the caller can remove
+   * any bytes that did land, which is the case an abandoned upload leaves.
+   */
+  async sweepAbandonedUploads(input: { now: number; limit?: number }): Promise<{ objectKeys: readonly string[] }> {
+    const outcome = await this.commitMutation<{ objectKeys: readonly string[] }>({ scope: "files.sweep", now: input.now }, () => {
+      const rows = this.ctx.storage.sql
+        .exec<{ id: string; object_key: string }>(
+          "SELECT id, object_key FROM files WHERE state = 'reserved' AND expires_at IS NOT NULL AND expires_at <= ? LIMIT ?",
+          input.now, Math.min(Math.max(input.limit ?? 100, 1), 500),
+        )
+        .toArray();
+      for (const row of rows) {
+        this.ctx.storage.sql.exec("UPDATE files SET state = 'deleted', deleted_at = ?, expires_at = NULL WHERE id = ?", input.now, row.id);
+      }
+      return { result: { objectKeys: rows.map((row) => row.object_key) } };
+    });
+    return outcome.result;
+  }
+
+  private readFileRow(fileId: string): FileRow | null {
+    return this.ctx.storage.sql.exec<FileRow>("SELECT * FROM files WHERE id = ?", fileId).toArray()[0] ?? null;
+  }
+
+  private projectFile(row: FileRow): StoredFile {
+    return {
+      id: row.id, fileName: row.file_name, mediaType: row.media_type, byteLength: row.byte_length,
+      channelId: row.channel_id, messageId: row.message_id, uploadedByMemberId: row.uploaded_by_member_id,
+      createdAt: row.created_at, inlineRenderable: isInlineRenderable(row.media_type),
+    };
+  }
+
+  /** The tenant id used in object keys; stable for the life of the workspace. */
+  private workspaceKeyId(): string {
+    return this.ctx.id.toString();
   }
 
   async createGroup(input: {

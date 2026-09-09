@@ -8,6 +8,7 @@ export type ShellEnvironment = {
   CONTROL_DB?: D1Database;
   WORKSPACE?: CloudflareEnv["WORKSPACE"];
   ACCOUNTS?: CloudflareEnv["ACCOUNTS"];
+  FILES?: CloudflareEnv["FILES"];
   ENVIRONMENT?: string;
   TRANSPORT_SECRET_KEY?: string;
   WIF_SIGNING_JWK?: string;

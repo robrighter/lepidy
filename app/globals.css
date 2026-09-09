@@ -751,3 +751,28 @@ button.danger:hover:not(:disabled) { background: #fdf2f4; }
   .form-row { align-items: stretch; flex-direction: column; }
   .admin-row { display: grid; }
 }
+
+/* ---------------- attachments (C08) ---------------- */
+.composer-attachments, .message-attachments { display: grid; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; }
+.composer-attachments li {
+  display: flex; align-items: center; gap: 10px; padding: 7px 10px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--sunken); font-size: 13px;
+}
+.composer-attachment-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-attachment-state { color: var(--text-3); font-size: 12px; }
+.composer-attachments li[data-state="failed"] { border-color: #d68ea0; }
+.composer-attachments li[data-state="failed"] .composer-attachment-state { color: #b53a54; }
+:root[data-theme="dark"] .composer-attachments li[data-state="failed"] .composer-attachment-state { color: var(--coral); }
+
+.message-attachments li a {
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-2);
+  color: var(--text); font-size: 13px; text-decoration: none;
+}
+.message-attachments li a:hover { border-color: var(--line-strong); }
+.message-attachments img { max-width: min(360px, 100%); max-height: 260px; border-radius: 6px; object-fit: cover; }
+.message-attachment-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.message-attachment-size { color: var(--text-3); font-size: 12px; white-space: nowrap; }
+@media (max-width: 700px) {
+  .message-attachments li a { flex-wrap: wrap; }
+}

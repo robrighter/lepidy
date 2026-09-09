@@ -2,6 +2,7 @@
 // @ts-expect-error -- the adapter creates this module before bundling the Worker.
 import openNextWorker from "./.open-next/worker.js";
 
+import { handleFileTransferRequest } from "./src/cloudflare/file-gateway";
 import { handleRunnerSocketRequest } from "./src/cloudflare/runner-socket";
 import { handleRuntimeGatewayRequest } from "./src/cloudflare/runtime-gateway";
 import type { ShellEnvironment } from "./src/shell/resolve-shell-source";
@@ -19,6 +20,10 @@ export default {
     // only place it can live. Everything else is Next's.
     const socket = await handleRunnerSocketRequest(env, request);
     if (socket !== null) return socket;
+    // Attachment bytes stream here rather than through Next, so a large upload
+    // never becomes a buffered request body in the render path.
+    const transfer = await handleFileTransferRequest(env, request);
+    if (transfer !== null) return transfer;
     return openNextWorker.fetch(request, env, ctx) as Promise<Response>;
   },
 };

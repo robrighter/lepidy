@@ -1237,6 +1237,41 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX group_members_member_idx ON group_members(member_id, group_id)`,
     ],
   },
+  {
+    version: 30,
+    name: "attachment storage and quota accounting",
+    statements: [
+      // Replaces the import-only `attachments` table from v6. Nothing read it
+      // and the Solo upgrade is its only writer, which now writes here, so the
+      // workspace keeps one idea of what a file is rather than two.
+      `DROP TABLE attachments`,
+      `CREATE TABLE files (
+        id TEXT PRIMARY KEY,
+        object_key TEXT NOT NULL UNIQUE,
+        file_name TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        byte_length INTEGER NOT NULL CHECK (byte_length > 0),
+        sha256 TEXT,
+        uploaded_by_member_id TEXT REFERENCES members(id) ON DELETE SET NULL,
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        state TEXT NOT NULL CHECK (state IN ('reserved', 'stored', 'deleted')),
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        confirmed_at INTEGER,
+        deleted_at INTEGER
+      ) STRICT`,
+      `CREATE INDEX files_channel_idx ON files(channel_id, state, created_at)`,
+      `CREATE INDEX files_message_idx ON files(message_id)`,
+      // Sweeping abandoned reservations and counting live bytes both read this.
+      `CREATE INDEX files_state_idx ON files(state, expires_at)`,
+      // The allowance is decided in D1 and projected here, the way membership
+      // is: no cross-database foreign key, and a stale projection fails closed
+      // because a zero quota refuses every upload.
+      `ALTER TABLE workspace_config ADD COLUMN storage_quota_bytes INTEGER NOT NULL DEFAULT 0 CHECK (storage_quota_bytes >= 0)`,
+      `ALTER TABLE workspace_config ADD COLUMN storage_entitlement_version INTEGER NOT NULL DEFAULT 0 CHECK (storage_entitlement_version >= 0)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

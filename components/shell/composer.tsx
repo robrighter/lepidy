@@ -1,10 +1,10 @@
 "use client";
 
-import { CalendarClock, CloudCheck, CornerDownLeft, FileCode2, Send } from "lucide-react";
+import { CalendarClock, CloudCheck, CornerDownLeft, FileCode2, Paperclip, Send } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { sendChannelMessage, type SendResult } from "@/app/(app)/c/[channel]/actions";
+import { reserveAttachment, sendChannelMessage, type SendResult } from "@/app/(app)/c/[channel]/actions";
 import {
   saveDraftAction,
   scheduleMessageAction,
@@ -48,6 +48,23 @@ function writeLocalDraft(channelId: string, value: string): void {
   }
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** One file in flight, before the message that will carry it exists. */
+type PendingAttachment = {
+  localId: string;
+  name: string;
+  size: number;
+  state: "uploading" | "ready" | "failed";
+  fileId?: string;
+  reason?: string;
+  warn?: boolean;
+};
+
 export function Composer({
   channelId,
   channelLabel,
@@ -67,6 +84,8 @@ export function Composer({
   const [draftError, setDraftError] = useState<string | null>(null);
   const [scheduling, setScheduling] = useState(false);
   const [sendAt, setSendAt] = useState("");
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const fileInput = useRef<HTMLInputElement>(null);
   const [snippetMode, setSnippetMode] = useState(false);
   const [snippetTitle, setSnippetTitle] = useState("");
   const [snippetLanguage, setSnippetLanguage] = useState("");
@@ -129,9 +148,52 @@ export function Composer({
     return () => clearTimeout(timer);
   }, [body, canPost, channelId]);
 
+  /**
+   * Reserve, then send the bytes straight to the transfer route. The action
+   * decides; the body never travels through a server action, because a large
+   * attachment has no business being a form payload.
+   */
+  const upload = useCallback(
+    async (files: readonly File[]) => {
+      for (const file of files) {
+        const localId = crypto.randomUUID();
+        setAttachments((current) => [...current, { localId, name: file.name, size: file.size, state: "uploading" }]);
+        const reserved = await reserveAttachment({
+          csrfToken: browserCsrfToken(),
+          channelId,
+          idempotencyKey: `attach:${channelId}:${localId}`.slice(0, 128),
+          fileName: file.name,
+          mediaType: file.type || "application/octet-stream",
+          byteLength: file.size,
+        });
+        if (!reserved.ok) {
+          setAttachments((current) =>
+            current.map((item) => (item.localId === localId ? { ...item, state: "failed", reason: reserved.reason } : item)),
+          );
+          continue;
+        }
+        const response = await fetch(`/files/${reserved.fileId}`, { method: "PUT", body: file });
+        setAttachments((current) =>
+          current.map((item) =>
+            item.localId === localId
+              ? response.ok
+                ? { ...item, state: "ready", fileId: reserved.fileId, warn: reserved.warn }
+                : { ...item, state: "failed", reason: "That upload did not finish." }
+              : item,
+          ),
+        );
+      }
+    },
+    [channelId],
+  );
+
   const submit = useCallback(async () => {
     const trimmed = body.trim();
-    if (trimmed.length === 0 || sending) return;
+    const ready = attachments.filter((item) => item.state === "ready" && item.fileId).map((item) => item.fileId!);
+    // A message may be nothing but its attachments, but it may not be sent
+    // while one is still in flight.
+    if ((trimmed.length === 0 && ready.length === 0) || sending) return;
+    if (attachments.some((item) => item.state === "uploading")) return;
     setSending(true);
     const idempotencyKey = `compose:${channelId}:${crypto.randomUUID()}`.slice(0, 128);
     let result = await sendChannelMessage({
@@ -140,6 +202,7 @@ export function Composer({
       bodyMarkdown: trimmed,
       // Stable per attempt, so a retried submission is not a second message.
       idempotencyKey,
+      fileIds: ready,
     });
     const broadcastAudience = result.ok
       ? null
@@ -156,6 +219,7 @@ export function Composer({
           bodyMarkdown: trimmed,
           idempotencyKey,
           confirmedBroadcastRecipients: recipients,
+          fileIds: ready,
         });
       } else {
         result = { ok: false, reason: "Broadcast cancelled." };
@@ -165,6 +229,7 @@ export function Composer({
     setStatus(result);
     if (result.ok) {
       update("");
+      setAttachments([]);
       // The draft is spent; clear it everywhere, not just in this browser.
       await saveDraftAction({
         csrfToken: browserCsrfToken(),
@@ -293,6 +358,47 @@ export function Composer({
             void submit();
           }
         }}
+        onPaste={(event) => {
+          // A pasted image is a file, not text. Anything the clipboard also
+          // offers as text is left to the normal paste.
+          const files = [...event.clipboardData.files];
+          if (files.length === 0) return;
+          event.preventDefault();
+          void upload(files);
+        }}
+      />
+
+      {attachments.length > 0 ? (
+        <ul className="composer-attachments" aria-label="Attachments">
+          {attachments.map((item) => (
+            <li key={item.localId} data-state={item.state}>
+              <span className="composer-attachment-name">{item.name}</span>
+              <span className="composer-attachment-state">
+                {item.state === "uploading" ? "Uploading…" : item.state === "ready" ? formatBytes(item.size) : item.reason}
+              </span>
+              <button
+                type="button"
+                aria-label={`Remove ${item.name}`}
+                onClick={() => setAttachments((current) => current.filter((entry) => entry.localId !== item.localId))}
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      <input
+        ref={fileInput}
+        type="file"
+        multiple
+        className="visually-hidden"
+        aria-label="Attach files"
+        onChange={(event) => {
+          const files = [...(event.target.files ?? [])];
+          event.target.value = "";
+          if (files.length > 0) void upload(files);
+        }}
       />
 
       {scheduling ? (
@@ -331,6 +437,15 @@ export function Composer({
         <button
           type="button"
           className="schedule-toggle"
+          aria-label="Attach a file"
+          disabled={!hydrated}
+          onClick={() => fileInput.current?.click()}
+        >
+          <Paperclip size={15} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="schedule-toggle"
           aria-label="Post this as a snippet"
           aria-expanded={snippetMode}
           onClick={() => setSnippetMode((open) => !open)}
@@ -346,7 +461,15 @@ export function Composer({
         >
           <CalendarClock size={15} aria-hidden="true" />
         </button>
-        <button type="submit" className="primary" disabled={sending || body.trim().length === 0}>
+        <button
+          type="submit"
+          className="primary"
+          disabled={
+            sending ||
+            attachments.some((item) => item.state === "uploading") ||
+            (body.trim().length === 0 && !attachments.some((item) => item.state === "ready"))
+          }
+        >
           <Send size={15} aria-hidden="true" />
           {sending ? "Sending" : snippetMode ? "Post snippet" : "Send"}
         </button>

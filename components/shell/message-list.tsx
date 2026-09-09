@@ -1,6 +1,7 @@
-import { CornerUpRight, MessageSquare, Pencil, Pin, Trash2 } from "lucide-react";
+import { CornerUpRight, MessageSquare, Paperclip, Pencil, Pin, Trash2 } from "lucide-react";
 
 import type { MessageRow } from "@/src/cloudflare/workspace-rooms";
+import type { StoredFile } from "@/src/cloudflare/workspace";
 import type { MentionCard } from "@/src/domain/people";
 import { AgentAvatar, Avatar } from "./avatar";
 import { Markdown } from "./markdown";
@@ -23,12 +24,15 @@ export function MessageList({
   canAct = false,
   forwardTargets = [],
   mentionCards,
+  attachments,
 }: {
   messages: readonly MessageRow[];
   viewerMemberId?: string;
   canAct?: boolean;
   forwardTargets?: readonly ForwardTarget[];
   mentionCards?: ReadonlyMap<string, MentionCard>;
+  /** Stored files by the message that carries them. */
+  attachments?: ReadonlyMap<string, readonly StoredFile[]>;
 }) {
   return (
     <ol className="messages">
@@ -77,6 +81,7 @@ export function MessageList({
               ) : (
                 <>
                   <Markdown body={message.bodyMarkdown} cards={mentionCards} idPrefix={message.id} />
+                  <MessageAttachments files={attachments?.get(message.id) ?? []} />
                   {message.snippet ? <Snippet snippet={message.snippet} /> : null}
                 </>
               )}
@@ -117,4 +122,40 @@ export function MessageList({
       })}
     </ol>
   );
+}
+
+/**
+ * Attachments under the message that carries them.
+ *
+ * Every file is fetched from the same authorized transfer route, images
+ * included: an image is shown inline because the product knows its type, not
+ * because the browser was invited to decide what to do with the bytes.
+ */
+function MessageAttachments({ files }: { files: readonly StoredFile[] }) {
+  if (files.length === 0) return null;
+  return (
+    <ul className="message-attachments">
+      {files.map((file) => (
+        <li key={file.id}>
+          <a href={`/files/${file.id}`} download={file.fileName}>
+            {file.inlineRenderable ? (
+              // eslint-disable-next-line @next/next/no-img-element -- the bytes
+              // are served by our own authorized route, not an optimizable URL.
+              <img alt={file.fileName} src={`/files/${file.id}`} loading="lazy" />
+            ) : (
+              <Paperclip size={14} aria-hidden="true" />
+            )}
+            <span className="message-attachment-name">{file.fileName}</span>
+            <span className="message-attachment-size">{formatFileBytes(file.byteLength)}</span>
+          </a>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function formatFileBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
