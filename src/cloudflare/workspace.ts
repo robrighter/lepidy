@@ -133,6 +133,13 @@ import {
   type LinkUnfurl,
 } from "../domain/link-unfurl";
 import {
+  nextSearchCursor,
+  parseSearchQuery,
+  searchCursor,
+  searchMatch,
+  type ParsedSearchQuery,
+} from "../domain/search";
+import {
   parseAvailability,
   parseGroupHandle,
   parseProfile,
@@ -548,6 +555,19 @@ export type StoredFile = {
 };
 
 export type MessageLinkUnfurl = LinkUnfurl & { messageId: string; position: number };
+
+export type WorkspaceSearchHit =
+  | { kind: "message"; id: string; channelId: string; channelLabel: string; threadRootId: string | null; authorKind: string; authorDisplayName: string; bodyMarkdown: string; createdAt: number }
+  | { kind: "file"; id: string; channelId: string; channelLabel: string; fileName: string; mediaType: string; byteLength: number; uploaderDisplayName: string | null; createdAt: number }
+  | { kind: "credential"; id: string; name: string; description: string; createdAt: number };
+
+export type WorkspaceSearchPage = {
+  query: ParsedSearchQuery;
+  hits: readonly WorkspaceSearchHit[];
+  nextCursor: string | null;
+};
+
+export type SavedSearch = { id: string; name: string; query: string; createdAt: number; updatedAt: number };
 
 export type PeopleDirectory = {
   people: readonly DirectoryMember[];
@@ -2221,6 +2241,193 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       });
     }
     return { unfurls };
+  }
+
+  /** Tenant-local deterministic search. Every result kind applies authority in SQL before ranking. */
+  searchWorkspace(input: { actor: Actor; query: string; cursor?: string | null; limit?: number }): WorkspaceSearchPage {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const query = parseSearchQuery(input.query);
+    const match = searchMatch(query.text);
+    const hasFilters = query.from.length > 0 || query.in.length > 0 || query.has.length > 0
+      || query.before !== null || query.after !== null || query.isThread;
+    if (query.errors.length > 0 || (match === null && !hasFilters)) return { query, hits: [], nextCursor: null };
+
+    const limit = Math.min(Math.max(input.limit ?? 20, 1), 50);
+    const offset = searchCursor(input.cursor);
+    const fetchLimit = offset + limit + 1;
+    const placeholders = (values: readonly string[]) => values.map(() => "?").join(", ");
+    type Ranked = { score: number; hit: WorkspaceSearchHit };
+    const ranked: Ranked[] = [];
+
+    const messageWhere = ["m.deleted_at IS NULL", "c.archived_at IS NULL", `(c.kind = 'public' OR EXISTS (
+      SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_id = ?
+    ))`];
+    const messageValues: (string | number)[] = [actor.id];
+    if (match) { messageWhere.push("workspace_search MATCH ?"); messageValues.push(match); }
+    if (query.from.length > 0) {
+      messageWhere.push(`lower(COALESCE(author_member.handle, author_agent.handle, m.author_display_snapshot, m.author_id)) IN (${placeholders(query.from)})`);
+      messageValues.push(...query.from);
+    }
+    if (query.in.length > 0) {
+      messageWhere.push(`lower(COALESCE(c.slug, c.name, c.id)) IN (${placeholders(query.in)})`);
+      messageValues.push(...query.in);
+    }
+    if (query.has.includes("file")) messageWhere.push("EXISTS (SELECT 1 FROM files f WHERE f.message_id = m.id AND f.state = 'stored')");
+    if (query.has.includes("link")) messageWhere.push("(instr(lower(m.body_markdown), 'https://') > 0 OR instr(lower(m.body_markdown), 'http://') > 0)");
+    if (query.has.includes("code")) messageWhere.push("instr(m.body_markdown, '`') > 0");
+    if (query.isThread) messageWhere.push("m.thread_root_id IS NOT NULL");
+    if (query.after !== null) { messageWhere.push("m.created_at >= ?"); messageValues.push(query.after); }
+    if (query.before !== null) { messageWhere.push("m.created_at < ?"); messageValues.push(query.before); }
+    const messageRows = this.ctx.storage.sql.exec<{
+      id: string; channel_id: string; channel_label: string; thread_root_id: string | null; author_kind: string;
+      author_display_snapshot: string; body_markdown: string; created_at: number; score: number;
+    }>(
+      `SELECT m.id, m.channel_id, COALESCE(c.slug, c.name, c.id) AS channel_label, m.thread_root_id,
+              m.author_kind, m.author_display_snapshot, m.body_markdown, m.created_at,
+              ${match ? "bm25(workspace_search)" : "0"} AS score
+       FROM messages m
+       JOIN channels c ON c.id = m.channel_id
+       LEFT JOIN members author_member ON m.author_kind = 'member' AND author_member.id = m.author_id
+       LEFT JOIN agents author_agent ON m.author_kind = 'agent' AND author_agent.id = m.author_id
+       ${match ? "JOIN workspace_search ON workspace_search.rowid = m.rowid" : ""}
+       WHERE ${messageWhere.join(" AND ")}
+       ORDER BY score, m.created_at DESC, m.id LIMIT ?`,
+      ...messageValues, fetchLimit,
+    ).toArray();
+    for (const row of messageRows) ranked.push({ score: row.score, hit: {
+      kind: "message", id: row.id, channelId: row.channel_id, channelLabel: row.channel_label,
+      threadRootId: row.thread_root_id, authorKind: row.author_kind, authorDisplayName: row.author_display_snapshot,
+      bodyMarkdown: row.body_markdown, createdAt: row.created_at,
+    } });
+
+    // A file satisfies has:file; message-only structure filters deliberately exclude it.
+    if (!query.isThread && !query.has.includes("link") && !query.has.includes("code")) {
+      const fileWhere = ["f.state = 'stored'", `(c.kind = 'public' OR EXISTS (
+        SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_id = ?
+      ))`];
+      const fileValues: (string | number)[] = [actor.id];
+      if (match) { fileWhere.push("file_search MATCH ?"); fileValues.push(match); }
+      if (query.from.length > 0) {
+        fileWhere.push(`lower(COALESCE(u.handle, f.uploaded_by_member_id, '')) IN (${placeholders(query.from)})`);
+        fileValues.push(...query.from);
+      }
+      if (query.in.length > 0) {
+        fileWhere.push(`lower(COALESCE(c.slug, c.name, c.id)) IN (${placeholders(query.in)})`);
+        fileValues.push(...query.in);
+      }
+      if (query.after !== null) { fileWhere.push("f.created_at >= ?"); fileValues.push(query.after); }
+      if (query.before !== null) { fileWhere.push("f.created_at < ?"); fileValues.push(query.before); }
+      const fileRows = this.ctx.storage.sql.exec<{
+        id: string; channel_id: string; channel_label: string; file_name: string; media_type: string;
+        byte_length: number; uploader_display_name: string | null; created_at: number; score: number;
+      }>(
+        `SELECT f.id, f.channel_id, COALESCE(c.slug, c.name, c.id) AS channel_label, f.file_name, f.media_type,
+                f.byte_length, u.display_name AS uploader_display_name, f.created_at,
+                ${match ? "bm25(file_search)" : "0"} AS score
+         FROM files f JOIN channels c ON c.id = f.channel_id
+         LEFT JOIN members u ON u.id = f.uploaded_by_member_id
+         ${match ? "JOIN file_search ON file_search.rowid = f.rowid" : ""}
+         WHERE ${fileWhere.join(" AND ")}
+         ORDER BY score, f.created_at DESC, f.id LIMIT ?`,
+        ...fileValues, fetchLimit,
+      ).toArray();
+      for (const row of fileRows) ranked.push({ score: row.score, hit: {
+        kind: "file", id: row.id, channelId: row.channel_id, channelLabel: row.channel_label,
+        fileName: row.file_name, mediaType: row.media_type, byteLength: row.byte_length,
+        uploaderDisplayName: row.uploader_display_name, createdAt: row.created_at,
+      } });
+    }
+
+    // A browser search has no agent/origin context, so discoverability is the
+    // exact member/group subset of vaultCanDiscover, expressed in this query.
+    if (!query.isThread && query.in.length === 0 && query.has.length === 0) {
+      const credentialWhere = [`EXISTS (
+        SELECT 1 FROM vault_credential_acl acl
+        WHERE acl.credential_id = credential.id
+          AND (acl.subject_type = 'member' AND acl.subject_id = ?
+            OR acl.subject_type = 'group' AND EXISTS (
+              SELECT 1 FROM group_members gm WHERE gm.group_id = acl.subject_id AND gm.member_id = ?
+            ))
+      )`];
+      const credentialValues: (string | number)[] = [actor.id, actor.id];
+      if (match) { credentialWhere.push("credential_search MATCH ?"); credentialValues.push(match); }
+      if (query.from.length > 0) {
+        credentialWhere.push(`lower(COALESCE(creator.handle, credential.created_by_member_id)) IN (${placeholders(query.from)})`);
+        credentialValues.push(...query.from);
+      }
+      if (query.after !== null) { credentialWhere.push("credential.created_at >= ?"); credentialValues.push(query.after); }
+      if (query.before !== null) { credentialWhere.push("credential.created_at < ?"); credentialValues.push(query.before); }
+      const credentialRows = this.ctx.storage.sql.exec<{
+        id: string; name: string; description: string; created_at: number; score: number;
+      }>(
+        `SELECT credential.id, credential.name, credential.description, credential.created_at,
+                ${match ? "bm25(credential_search)" : "0"} AS score
+         FROM vault_credentials credential
+         LEFT JOIN members creator ON creator.id = credential.created_by_member_id
+         ${match ? "JOIN credential_search ON credential_search.rowid = credential.rowid" : ""}
+         WHERE ${credentialWhere.join(" AND ")}
+         ORDER BY score, credential.created_at DESC, credential.id LIMIT ?`,
+        ...credentialValues, fetchLimit,
+      ).toArray();
+      for (const row of credentialRows) ranked.push({ score: row.score, hit: {
+        kind: "credential", id: row.id, name: row.name, description: row.description, createdAt: row.created_at,
+      } });
+    }
+
+    ranked.sort((left, right) => left.score - right.score || right.hit.createdAt - left.hit.createdAt
+      || left.hit.kind.localeCompare(right.hit.kind) || left.hit.id.localeCompare(right.hit.id));
+    const hits = ranked.slice(offset, offset + limit).map((entry) => entry.hit);
+    return { query, hits, nextCursor: nextSearchCursor(offset, limit, ranked.length) };
+  }
+
+  listSavedSearches(input: { actor: Actor }): { searches: readonly SavedSearch[] } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    return { searches: this.ctx.storage.sql.exec<{
+      id: string; name: string; query: string; created_at: number; updated_at: number;
+    }>("SELECT id, name, query, created_at, updated_at FROM saved_searches WHERE member_id = ? ORDER BY updated_at DESC, id", actor.id)
+      .toArray().map((row) => ({ id: row.id, name: row.name, query: row.query, createdAt: row.created_at, updatedAt: row.updated_at })) };
+  }
+
+  async saveSearch(input: { actor: Actor; idempotencyKey: string; name: string; query: string; now: number }): Promise<{ search: SavedSearch; replayed: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    const name = input.name.replace(/\s+/g, " ").trim();
+    const query = input.query.replace(/\s+/g, " ").trim();
+    if (name.length < 1 || name.length > 80) throw new Error("saved search name is empty or too long");
+    if (query.length < 1 || query.length > 500) throw new Error("saved search query is empty or too long");
+    const parsed = parseSearchQuery(query);
+    if (parsed.errors.length > 0 || (searchMatch(parsed.text) === null && parsed.from.length === 0 && parsed.in.length === 0
+      && parsed.has.length === 0 && parsed.before === null && parsed.after === null && !parsed.isThread)) {
+      throw new Error(parsed.errors[0] ?? "saved search query has no searchable terms");
+    }
+    const outcome = await this.commitMutation({
+      scope: "search.save", idempotencyKey: input.idempotencyKey, requestHash: `${actor.id}|${name}|${query}`, now: input.now,
+    }, () => {
+      const existing = this.ctx.storage.sql.exec<{ id: string; created_at: number }>(
+        "SELECT id, created_at FROM saved_searches WHERE member_id = ? AND name = ? COLLATE NOCASE", actor.id, name,
+      ).toArray()[0];
+      if (!existing) {
+        const count = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM saved_searches WHERE member_id = ?", actor.id).one().count;
+        if (count >= 20) throw new Error("saved search limit reached");
+      }
+      const id = existing?.id ?? crypto.randomUUID();
+      const createdAt = existing?.created_at ?? input.now;
+      this.ctx.storage.sql.exec(
+        `INSERT INTO saved_searches(id, member_id, name, query, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(member_id, name) DO UPDATE SET query = excluded.query, updated_at = excluded.updated_at`,
+        id, actor.id, name, query, createdAt, input.now,
+      );
+      return { result: { search: { id, name, query, createdAt, updatedAt: input.now } } };
+    });
+    return { ...outcome.result, replayed: outcome.replayed };
+  }
+
+  deleteSavedSearch(input: { actor: Actor; searchId: string }): { removed: boolean } {
+    const actor = this.authorizeActor(input.actor);
+    this.requireCloudContentAuthority();
+    return { removed: this.ctx.storage.sql.exec("DELETE FROM saved_searches WHERE id = ? AND member_id = ?", input.searchId, actor.id).rowsWritten > 0 };
   }
 
   /**

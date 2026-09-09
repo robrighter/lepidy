@@ -1294,6 +1294,88 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX message_unfurls_message_idx ON message_unfurls(message_id, position)`,
     ],
   },
+  {
+    version: 32,
+    name: "workspace search and saved queries",
+    statements: [
+      // External-content indexes read display text from their authoritative
+      // rows. The credential index cannot even address ciphertext or wraps.
+      `CREATE VIRTUAL TABLE workspace_search USING fts5(
+        body_markdown,
+        content = 'messages',
+        content_rowid = 'rowid',
+        tokenize = 'unicode61 remove_diacritics 2'
+      )`,
+      `CREATE VIRTUAL TABLE file_search USING fts5(
+        file_name,
+        media_type,
+        content = 'files',
+        content_rowid = 'rowid',
+        tokenize = 'unicode61 remove_diacritics 2'
+      )`,
+      `CREATE VIRTUAL TABLE credential_search USING fts5(
+        name,
+        description,
+        content = 'vault_credentials',
+        content_rowid = 'rowid',
+        tokenize = 'unicode61 remove_diacritics 2'
+      )`,
+      `INSERT INTO workspace_search(rowid, body_markdown)
+       SELECT rowid, body_markdown FROM messages WHERE deleted_at IS NULL`,
+      `INSERT INTO file_search(rowid, file_name, media_type)
+       SELECT rowid, file_name, media_type FROM files WHERE state = 'stored'`,
+      `INSERT INTO credential_search(rowid, name, description)
+       SELECT rowid, name, description FROM vault_credentials`,
+      `CREATE TRIGGER workspace_search_message_insert AFTER INSERT ON messages WHEN new.deleted_at IS NULL BEGIN
+         INSERT INTO workspace_search(rowid, body_markdown) VALUES (new.rowid, new.body_markdown);
+       END`,
+      `CREATE TRIGGER workspace_search_message_update AFTER UPDATE OF body_markdown, deleted_at ON messages BEGIN
+         INSERT INTO workspace_search(workspace_search, rowid, body_markdown)
+           SELECT 'delete', old.rowid, old.body_markdown WHERE old.deleted_at IS NULL;
+         INSERT INTO workspace_search(rowid, body_markdown)
+           SELECT new.rowid, new.body_markdown WHERE new.deleted_at IS NULL;
+       END`,
+      `CREATE TRIGGER workspace_search_message_delete AFTER DELETE ON messages BEGIN
+         INSERT INTO workspace_search(workspace_search, rowid, body_markdown)
+           SELECT 'delete', old.rowid, old.body_markdown WHERE old.deleted_at IS NULL;
+       END`,
+      `CREATE TRIGGER workspace_search_file_insert AFTER INSERT ON files WHEN new.state = 'stored' BEGIN
+         INSERT INTO file_search(rowid, file_name, media_type) VALUES (new.rowid, new.file_name, new.media_type);
+       END`,
+      `CREATE TRIGGER workspace_search_file_update AFTER UPDATE OF file_name, media_type, state ON files BEGIN
+         INSERT INTO file_search(file_search, rowid, file_name, media_type)
+           SELECT 'delete', old.rowid, old.file_name, old.media_type WHERE old.state = 'stored';
+         INSERT INTO file_search(rowid, file_name, media_type)
+           SELECT new.rowid, new.file_name, new.media_type WHERE new.state = 'stored';
+       END`,
+      `CREATE TRIGGER workspace_search_file_delete AFTER DELETE ON files BEGIN
+         INSERT INTO file_search(file_search, rowid, file_name, media_type)
+           SELECT 'delete', old.rowid, old.file_name, old.media_type WHERE old.state = 'stored';
+       END`,
+      `CREATE TRIGGER workspace_search_credential_insert AFTER INSERT ON vault_credentials BEGIN
+         INSERT INTO credential_search(rowid, name, description) VALUES (new.rowid, new.name, new.description);
+       END`,
+      `CREATE TRIGGER workspace_search_credential_update AFTER UPDATE OF name, description ON vault_credentials BEGIN
+         INSERT INTO credential_search(credential_search, rowid, name, description)
+           VALUES ('delete', old.rowid, old.name, old.description);
+         INSERT INTO credential_search(rowid, name, description) VALUES (new.rowid, new.name, new.description);
+       END`,
+      `CREATE TRIGGER workspace_search_credential_delete AFTER DELETE ON vault_credentials BEGIN
+         INSERT INTO credential_search(credential_search, rowid, name, description)
+           VALUES ('delete', old.rowid, old.name, old.description);
+       END`,
+      `CREATE TABLE saved_searches (
+        id TEXT PRIMARY KEY,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        name TEXT NOT NULL COLLATE NOCASE,
+        query TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(member_id, name)
+      ) STRICT`,
+      `CREATE INDEX saved_searches_member_idx ON saved_searches(member_id, updated_at DESC)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

@@ -61,6 +61,7 @@ export function sectionTitle(
 ): string {
   const path = normalisePath(pathname);
   if (path === "/profile") return "Profile";
+  if (path === "/search") return "Search";
   if (path.startsWith("/c/")) {
     const key = decodeURIComponent(path.slice("/c/".length).split("/")[0]);
     const channel = channels.find((item) => item.slug === key || item.id === key);

@@ -67,11 +67,11 @@ export function Rail({
         </span>
       </Link>
 
-      <button className="search-button" type="button" disabled title="Search arrives with C09">
+      <Link className="search-button" href="/search" onClick={onNavigate} aria-current={pathname === "/search" ? "page" : undefined}>
         <Search size={16} aria-hidden="true" />
         <span>Search</span>
         <kbd>⌘K</kbd>
-      </button>
+      </Link>
 
       <div className="rail-scroll">
         <nav aria-label="Primary">

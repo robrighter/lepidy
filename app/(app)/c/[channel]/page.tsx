@@ -1,4 +1,5 @@
-import { Pin } from "lucide-react";
+import { Pin, Search } from "lucide-react";
+import Link from "next/link";
 
 import { Composer } from "@/components/shell/composer";
 import { MessageList } from "@/components/shell/message-list";
@@ -59,12 +60,12 @@ export default async function ChannelPage({
 
   return (
     <>
-      <section className="panel">
-        <h2>#{channelLabel(channel)}</h2>
-        <p>
+      <section className="panel channel-heading">
+        <div><h2>#{channelLabel(channel)}</h2><p>
           {channel.kind === "public" ? "Public" : "Private"} channel ·{" "}
           {channel.isMember ? "you are a member" : "you have not joined this room"}
-        </p>
+        </p></div>
+        <Link className="channel-search-link" href={`/search?${new URLSearchParams({ q: `in:#${channelLabel(channel)}` })}`}><Search size={14} />Search this room</Link>
       </section>
 
       {history.status === "ready" && history.pins.length > 0 ? (

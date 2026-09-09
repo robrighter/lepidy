@@ -42,7 +42,7 @@ export function MessageList({
       {messages.map((message) => {
         const deleted = message.deletedAt !== null;
         return (
-          <li key={message.id} className="message" data-author-kind={message.authorKind}>
+          <li id={`message-${message.id}`} key={message.id} className="message" data-author-kind={message.authorKind}>
             {message.authorKind === "agent" ? (
               <AgentAvatar size={32} />
             ) : (
