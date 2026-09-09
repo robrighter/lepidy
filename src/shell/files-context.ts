@@ -2,7 +2,7 @@ import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { cookies } from "next/headers";
 import { cache } from "react";
 
-import type { StoredFile } from "../cloudflare/workspace";
+import type { FileListFilters, MessageLinkUnfurl, StoredFile } from "../cloudflare/workspace";
 import { AuthorizationService } from "../control/authorization";
 import { StorageEntitlementService } from "../control/storage-entitlement";
 import { SESSION_COOKIE, type ShellEnvironment } from "./resolve-shell-source";
@@ -64,6 +64,42 @@ export const channelFiles = cache(async (channelId: string): Promise<ChannelFile
     return EMPTY;
   }
 });
+
+export type WorkspaceFileIndex =
+  | { status: "ready"; files: readonly StoredFile[] }
+  | { status: "signed_out" }
+  | { status: "unavailable"; reason: string };
+
+/** Workspace-wide metadata index. Filtering happens inside the workspace authority. */
+export async function workspaceFileIndex(filters: FileListFilters): Promise<WorkspaceFileIndex> {
+  const context = await viewer();
+  if (!context.ok) return { status: "signed_out" };
+  try {
+    const { files } = await context.stub.listFiles({ actor: context.actor, ...filters, limit: 200 });
+    return { status: "ready", files };
+  } catch (error) {
+    return { status: "unavailable", reason: shellErrorReason(error) };
+  }
+}
+
+/** Text-only previews grouped by the visible message that contains each URL. */
+export async function messageUnfurls(messageIds: readonly string[]): Promise<ReadonlyMap<string, readonly MessageLinkUnfurl[]>> {
+  const context = await viewer();
+  if (!context.ok || messageIds.length === 0) return new Map();
+  try {
+    const { unfurls } = await context.stub.listMessageUnfurls({ actor: context.actor, messageIds, now: Date.now() });
+    const byMessage = new Map<string, MessageLinkUnfurl[]>();
+    for (const unfurl of unfurls) {
+      const existing = byMessage.get(unfurl.messageId);
+      if (existing) existing.push(unfurl);
+      else byMessage.set(unfurl.messageId, [unfurl]);
+    }
+    return byMessage;
+  } catch {
+    // A destination failure never makes room history unavailable.
+    return new Map();
+  }
+}
 
 /** The workspace's allowance and what it has spent, refreshed from D1 first. */
 export const storageStatus = cache(async (): Promise<{ quotaBytes: number; usedBytes: number; warn: boolean } | null> => {

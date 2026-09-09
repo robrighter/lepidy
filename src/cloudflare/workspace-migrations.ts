@@ -1272,6 +1272,28 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `ALTER TABLE workspace_config ADD COLUMN storage_entitlement_version INTEGER NOT NULL DEFAULT 0 CHECK (storage_entitlement_version >= 0)`,
     ],
   },
+  {
+    version: 31,
+    name: "bounded link unfurl cache",
+    statements: [
+      `CREATE TABLE link_unfurls (
+        url TEXT PRIMARY KEY,
+        final_url TEXT,
+        title TEXT,
+        description TEXT,
+        site_name TEXT,
+        state TEXT NOT NULL CHECK (state IN ('ready', 'failed')),
+        fetched_at INTEGER NOT NULL
+      ) STRICT`,
+      `CREATE TABLE message_unfurls (
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        url TEXT NOT NULL REFERENCES link_unfurls(url) ON DELETE CASCADE,
+        position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 2),
+        PRIMARY KEY (message_id, url)
+      ) STRICT`,
+      `CREATE INDEX message_unfurls_message_idx ON message_unfurls(message_id, position)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

@@ -3,6 +3,7 @@
 import {
   Bookmark,
   CalendarClock,
+  Files,
   Hash,
   Home,
   Inbox,
@@ -32,6 +33,7 @@ const NAV_ICONS: Partial<Record<ShellSection, ReactNode>> = {
   inbox: <Inbox size={18} />,
   saved: <Bookmark size={18} />,
   scheduled: <CalendarClock size={18} />,
+  files: <Files size={18} />,
   people: <Users size={18} />,
   agents: <Sparkles size={18} />,
   vault: <KeyRound size={18} />,

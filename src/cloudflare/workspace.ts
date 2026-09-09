@@ -125,6 +125,14 @@ import {
   RESERVATION_TTL_MS,
 } from "../domain/files";
 import {
+  MAX_UNFURL_FETCHES_PER_READ,
+  UNFURL_CACHE_TTL_MS,
+  UNFURL_FAILURE_TTL_MS,
+  externalLinksFromMarkdown,
+  fetchLinkUnfurl,
+  type LinkUnfurl,
+} from "../domain/link-unfurl";
+import {
   parseAvailability,
   parseGroupHandle,
   parseProfile,
@@ -509,6 +517,17 @@ type FileRow = {
   sha256: string | null; uploaded_by_member_id: string | null; channel_id: string; message_id: string | null;
   state: "reserved" | "stored" | "deleted"; created_at: number; expires_at: number | null;
   confirmed_at: number | null; deleted_at: number | null;
+  uploader_display_name?: string | null; uploader_handle?: string | null;
+  channel_name?: string | null; channel_slug?: string | null;
+};
+
+export type FileListFilters = {
+  query?: string | null;
+  mediaTypePrefix?: string | null;
+  uploaderMemberId?: string | null;
+  channelId?: string | null;
+  createdAtOrAfter?: number | null;
+  createdBefore?: number | null;
 };
 
 export type StoredFile = {
@@ -519,10 +538,16 @@ export type StoredFile = {
   channelId: string;
   messageId: string | null;
   uploadedByMemberId: string | null;
+  uploadedByDisplayName: string | null;
+  uploadedByHandle: string | null;
+  channelName: string | null;
+  channelSlug: string | null;
   createdAt: number;
   /** Only images render inline; everything else is offered as a download. */
   inlineRenderable: boolean;
 };
+
+export type MessageLinkUnfurl = LinkUnfurl & { messageId: string; position: number };
 
 export type PeopleDirectory = {
   people: readonly DirectoryMember[];
@@ -2071,14 +2096,37 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }
 
   /** Files in rooms this reader may see, newest first. */
-  listFiles(input: { actor: Actor; channelId?: string | null; limit?: number }): { files: readonly StoredFile[] } {
+  listFiles(input: { actor: Actor; channelId?: string | null; limit?: number } & FileListFilters): { files: readonly StoredFile[] } {
     const actor = this.authorizeActor(input.actor);
     const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
+    const where = ["f.state = 'stored'"];
+    const values: (string | number)[] = [];
+    // Visibility belongs in the query as well as the projection loop. Without
+    // it, a run of newer private files could consume the bounded candidate
+    // window and hide older files the reader is allowed to see.
+    where.push(`(c.kind = 'public' OR EXISTS (
+      SELECT 1 FROM channel_members cm WHERE cm.channel_id = f.channel_id AND cm.member_id = ?
+    ))`);
+    values.push(actor.id);
+    const query = input.query?.trim().slice(0, 200) ?? "";
+    const mediaTypePrefix = input.mediaTypePrefix?.trim().toLowerCase().slice(0, 100) ?? "";
+    if (query) { where.push("instr(lower(f.file_name), lower(?)) > 0"); values.push(query); }
+    if (mediaTypePrefix) { where.push("f.media_type LIKE ?"); values.push(`${mediaTypePrefix}%`); }
+    if (input.uploaderMemberId) { where.push("f.uploaded_by_member_id = ?"); values.push(input.uploaderMemberId); }
+    const channelId = input.channelId ?? null;
+    if (channelId) { where.push("f.channel_id = ?"); values.push(channelId); }
+    if (Number.isSafeInteger(input.createdAtOrAfter)) { where.push("f.created_at >= ?"); values.push(input.createdAtOrAfter!); }
+    if (Number.isSafeInteger(input.createdBefore)) { where.push("f.created_at < ?"); values.push(input.createdBefore!); }
     const rows = this.ctx.storage.sql
       .exec<FileRow>(
-        `SELECT * FROM files WHERE state = 'stored' ${input.channelId ? "AND channel_id = ?" : ""}
-         ORDER BY created_at DESC, id LIMIT ?`,
-        ...(input.channelId ? [input.channelId, limit * 4] : [limit * 4]),
+        `SELECT f.*, m.display_name AS uploader_display_name, m.handle AS uploader_handle,
+                c.name AS channel_name, c.slug AS channel_slug
+         FROM files f
+         LEFT JOIN members m ON m.id = f.uploaded_by_member_id
+         JOIN channels c ON c.id = f.channel_id
+         WHERE ${where.join(" AND ")}
+         ORDER BY f.created_at DESC, f.id LIMIT ?`,
+        ...values, limit,
       )
       .toArray();
     const files: StoredFile[] = [];
@@ -2091,6 +2139,88 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       files.push(this.projectFile(row));
     }
     return { files };
+  }
+
+  /**
+   * Resolve previews for visible messages. Remote markup is reduced to bounded
+   * text before it is persisted; failures are short-cached and never break the
+   * room. At most three uncached destinations are contacted by one read.
+   */
+  async listMessageUnfurls(input: {
+    actor: Actor; messageIds: readonly string[]; now: number;
+  }): Promise<{ unfurls: readonly MessageLinkUnfurl[] }> {
+    const actor = this.authorizeActor(input.actor);
+    const messageIds = [...new Set(input.messageIds)].filter((id) => /^[A-Za-z0-9_-]{1,200}$/.test(id)).slice(0, 40);
+    const visible = new Map<string, readonly string[]>();
+    for (const messageId of messageIds) {
+      const message = this.ctx.storage.sql.exec<{ id: string; channel_id: string; body_markdown: string }>(
+        "SELECT id, channel_id, body_markdown FROM messages WHERE id = ? AND deleted_at IS NULL", messageId,
+      ).toArray()[0];
+      if (!message) continue;
+      const channel = readChannel(this.ctx.storage, message.channel_id);
+      if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))) continue;
+      visible.set(message.id, externalLinksFromMarkdown(message.body_markdown));
+    }
+
+    const fetches: Promise<void>[] = [];
+    let remaining = MAX_UNFURL_FETCHES_PER_READ;
+    for (const [messageId, urls] of visible) {
+      // The message may have been edited since its last read. Rebuild only the
+      // cheap association rows so removed links and changed order disappear;
+      // the destination cache itself remains reusable across messages.
+      this.ctx.storage.sql.exec("DELETE FROM message_unfurls WHERE message_id = ?", messageId);
+      for (const [position, url] of urls.entries()) {
+        const cached = this.ctx.storage.sql.exec<{ state: "ready" | "failed"; fetched_at: number }>(
+          "SELECT state, fetched_at FROM link_unfurls WHERE url = ?", url,
+        ).toArray()[0];
+        const ttl = cached?.state === "ready" ? UNFURL_CACHE_TTL_MS : UNFURL_FAILURE_TTL_MS;
+        const fresh = cached && cached.fetched_at + ttl > input.now;
+        if (!cached) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO link_unfurls(url, state, fetched_at) VALUES (?, 'failed', ?)", url, 0,
+          );
+        }
+        this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO message_unfurls(message_id, url, position) VALUES (?, ?, ?)",
+          messageId, url, position,
+        );
+        if (fresh || remaining <= 0) continue;
+        remaining -= 1;
+        fetches.push((async () => {
+          try {
+            const preview = await fetchLinkUnfurl({ url, resolve: (hostname) => this.resolvePublicDns(hostname) });
+            this.ctx.storage.sql.exec(
+              `UPDATE link_unfurls SET final_url = ?, title = ?, description = ?, site_name = ?,
+                 state = 'ready', fetched_at = ? WHERE url = ?`,
+              preview.finalUrl, preview.title, preview.description, preview.siteName, input.now, url,
+            );
+          } catch {
+            this.ctx.storage.sql.exec(
+              `UPDATE link_unfurls SET final_url = NULL, title = NULL, description = NULL,
+                 site_name = NULL, state = 'failed', fetched_at = ? WHERE url = ?`, input.now, url,
+            );
+          }
+        })());
+      }
+    }
+    await Promise.all(fetches);
+
+    const unfurls: MessageLinkUnfurl[] = [];
+    for (const [messageId] of visible) {
+      const rows = this.ctx.storage.sql.exec<{
+        url: string; final_url: string; title: string; description: string | null; site_name: string; position: number;
+      }>(
+        `SELECT u.url, u.final_url, u.title, u.description, u.site_name, mu.position
+         FROM message_unfurls mu JOIN link_unfurls u ON u.url = mu.url
+         WHERE mu.message_id = ? AND u.state = 'ready'
+         ORDER BY mu.position`, messageId,
+      ).toArray();
+      for (const row of rows) unfurls.push({
+        messageId, position: row.position, url: row.url, finalUrl: row.final_url,
+        title: row.title, description: row.description, siteName: row.site_name,
+      });
+    }
+    return { unfurls };
   }
 
   /**
@@ -2168,6 +2298,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     return {
       id: row.id, fileName: row.file_name, mediaType: row.media_type, byteLength: row.byte_length,
       channelId: row.channel_id, messageId: row.message_id, uploadedByMemberId: row.uploaded_by_member_id,
+      uploadedByDisplayName: row.uploader_display_name ?? null, uploadedByHandle: row.uploader_handle ?? null,
+      channelName: row.channel_name ?? null, channelSlug: row.channel_slug ?? null,
       createdAt: row.created_at, inlineRenderable: isInlineRenderable(row.media_type),
     };
   }
@@ -11233,7 +11365,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       const response = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=${type}`, {
         headers: { accept: "application/dns-json" }, redirect: "manual", signal: AbortSignal.timeout(5_000),
       });
-      if (!response.ok) throw new Error("custom callback DNS lookup failed");
+      if (!response.ok) throw new Error("public egress DNS lookup failed");
       const body = await response.json() as { Answer?: { type?: unknown; data?: unknown }[] };
       const expectedType = type === "A" ? 1 : 28;
       return (body.Answer ?? []).filter((answer) => answer.type === expectedType).map((answer) => answer.data)

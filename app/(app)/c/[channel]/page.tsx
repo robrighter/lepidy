@@ -3,7 +3,7 @@ import { Pin } from "lucide-react";
 import { Composer } from "@/components/shell/composer";
 import { MessageList } from "@/components/shell/message-list";
 import { channelHistory } from "@/src/shell/channel-context";
-import { channelFiles } from "@/src/shell/files-context";
+import { channelFiles, messageUnfurls } from "@/src/shell/files-context";
 import { mentionCards } from "@/src/shell/people-context";
 import { shellState } from "@/src/shell/shell-context";
 import { channelLabel } from "@/src/shell/shell-model";
@@ -45,6 +45,9 @@ export default async function ChannelPage({
     mentionCards(),
     channelFiles(channel.id),
   ]);
+  const unfurls = history.status === "ready"
+    ? await messageUnfurls(history.page.messages.map((message) => message.id))
+    : new Map();
   const viewerMemberId = state.status === "ready" ? state.snapshot.viewer.memberId : undefined;
   const canPost = channel.isMember;
   const forwardTargets =
@@ -111,6 +114,7 @@ export default async function ChannelPage({
             forwardTargets={forwardTargets}
             mentionCards={cards}
             attachments={files.byMessage}
+            unfurls={unfurls}
           />
         </section>
       )}

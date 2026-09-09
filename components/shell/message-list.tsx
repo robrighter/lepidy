@@ -1,7 +1,7 @@
 import { CornerUpRight, MessageSquare, Paperclip, Pencil, Pin, Trash2 } from "lucide-react";
 
 import type { MessageRow } from "@/src/cloudflare/workspace-rooms";
-import type { StoredFile } from "@/src/cloudflare/workspace";
+import type { MessageLinkUnfurl, StoredFile } from "@/src/cloudflare/workspace";
 import type { MentionCard } from "@/src/domain/people";
 import { AgentAvatar, Avatar } from "./avatar";
 import { Markdown } from "./markdown";
@@ -25,6 +25,7 @@ export function MessageList({
   forwardTargets = [],
   mentionCards,
   attachments,
+  unfurls,
 }: {
   messages: readonly MessageRow[];
   viewerMemberId?: string;
@@ -33,6 +34,8 @@ export function MessageList({
   mentionCards?: ReadonlyMap<string, MentionCard>;
   /** Stored files by the message that carries them. */
   attachments?: ReadonlyMap<string, readonly StoredFile[]>;
+  /** Remote markup has already been reduced to bounded text by the workspace. */
+  unfurls?: ReadonlyMap<string, readonly MessageLinkUnfurl[]>;
 }) {
   return (
     <ol className="messages">
@@ -81,6 +84,7 @@ export function MessageList({
               ) : (
                 <>
                   <Markdown body={message.bodyMarkdown} cards={mentionCards} idPrefix={message.id} />
+                  <LinkPreviews previews={unfurls?.get(message.id) ?? []} />
                   <MessageAttachments files={attachments?.get(message.id) ?? []} />
                   {message.snippet ? <Snippet snippet={message.snippet} /> : null}
                 </>
@@ -121,6 +125,23 @@ export function MessageList({
         );
       })}
     </ol>
+  );
+}
+
+function LinkPreviews({ previews }: { previews: readonly MessageLinkUnfurl[] }) {
+  if (previews.length === 0) return null;
+  return (
+    <ul className="link-previews" aria-label="Link previews">
+      {previews.map((preview) => (
+        <li key={preview.url}>
+          <a href={preview.finalUrl} rel="noreferrer noopener" target="_blank">
+            <span className="link-preview-site">{preview.siteName}</span>
+            <strong>{preview.title}</strong>
+            {preview.description ? <span className="link-preview-description">{preview.description}</span> : null}
+          </a>
+        </li>
+      ))}
+    </ul>
   );
 }
 

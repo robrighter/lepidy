@@ -776,3 +776,56 @@ button.danger:hover:not(:disabled) { background: #fdf2f4; }
 @media (max-width: 700px) {
   .message-attachments li a { flex-wrap: wrap; }
 }
+
+/* ---------------- file index and link previews (C08b) ----------------
+   The index reads as one evidence register, not a field of interchangeable
+   cards: every ribbon answers what, where, who and when on one scan line. */
+.file-index-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.file-index-heading p { max-width: 64ch; margin: 4px 0 0; color: var(--text-2); }
+.file-count {
+  display: grid; min-width: 64px; text-align: right;
+  font: 700 24px/1 var(--font-display); color: var(--accent);
+}
+.file-count small { margin-top: 4px; color: var(--text-3); font: 500 11px/1 var(--font-body); }
+.file-filter-panel { padding-block: 14px; }
+.file-filters { display: grid; grid-template-columns: minmax(180px, 1.5fr) repeat(3, minmax(120px, 1fr)); gap: 10px; align-items: end; }
+.file-filters label { display: grid; min-width: 0; gap: 4px; color: var(--text-2); font-size: 12px; font-weight: 600; }
+.file-filters input, .file-filters select {
+  width: 100%; min-width: 0; height: 38px; padding: 7px 9px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface-2); color: var(--text);
+}
+.file-filters input:focus-visible, .file-filters select:focus-visible { border-color: var(--accent); }
+.file-filter-actions { display: flex; align-items: center; gap: 12px; grid-column: span 2; }
+.file-filter-actions .primary-link { border: 0; }
+.file-filter-actions a { color: var(--text-3); font-size: 13px; text-decoration: underline; text-underline-offset: 3px; }
+.file-index { overflow: hidden; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--sh-1); list-style: none; }
+.file-index li + li { border-top: 1px solid var(--line); }
+.file-ribbon { display: grid; grid-template-columns: 36px minmax(190px, 1.5fr) minmax(160px, 1fr) max-content; align-items: center; gap: 12px; padding: 13px 15px; }
+.file-ribbon:hover { background: var(--surface-2); }
+.file-kind { display: grid; width: 34px; height: 34px; place-items: center; border-radius: var(--r-sm); background: var(--periwinkle); color: var(--accent); }
+.file-identity, .file-provenance { display: grid; min-width: 0; }
+.file-identity strong { overflow: hidden; font: 650 13.5px/1.35 var(--font-display); text-overflow: ellipsis; white-space: nowrap; }
+.file-identity small, .file-provenance, .file-ribbon time { color: var(--text-3); font-size: 11.5px; }
+.file-provenance span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-provenance span:first-child { color: var(--text-2); }
+.file-ribbon time { white-space: nowrap; }
+
+.link-previews { display: grid; gap: 7px; max-width: 560px; margin: 9px 0 0; padding: 0; list-style: none; }
+.link-previews a { display: grid; gap: 2px; padding: 10px 12px; border-left: 3px solid var(--lilac); background: var(--surface-2); }
+.link-previews a:hover { border-left-color: var(--accent); }
+.link-preview-site { color: var(--text-3); font-size: 11.5px; }
+.link-previews strong { overflow: hidden; color: var(--text); font: 650 13.5px/1.35 var(--font-display); text-overflow: ellipsis; white-space: nowrap; }
+.link-preview-description { display: -webkit-box; overflow: hidden; color: var(--text-2); font-size: 12.5px; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+
+@media (max-width: 900px) {
+  .file-filters { grid-template-columns: 1fr 1fr; }
+  .file-filter-query { grid-column: 1 / -1; }
+}
+@media (max-width: 640px) {
+  .file-index-heading { align-items: flex-start; }
+  .file-filters { grid-template-columns: 1fr; }
+  .file-filter-query, .file-filter-actions { grid-column: auto; }
+  .file-ribbon { grid-template-columns: 34px minmax(0, 1fr); gap: 8px 10px; padding: 12px; }
+  .file-provenance, .file-ribbon time { grid-column: 2; }
+  .file-provenance { grid-template-columns: 1fr 1fr; gap: 8px; }
+}

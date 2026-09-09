@@ -102,3 +102,41 @@ test("C08-UI-INT-003 pastes an image, shows it inline and stays accessible", asy
     ).toEqual([]);
   }
 });
+
+test("C08B-UI-INT-001 lists workspace files and applies metadata filters at desktop and mobile", async ({ page }, testInfo) => {
+  await attach(page, "Relay runbook.txt", "text/plain", "restart the relay");
+  await expect(page.locator(".composer-attachments li")).toHaveAttribute("data-state", "ready");
+  await page.getByRole("textbox", { name: /Message #general/ }).fill("runbook");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".composer-attachments li")).toHaveCount(0);
+
+  await attach(page, "Topology.png", "image/png", "not-a-real-png");
+  await expect(page.locator(".composer-attachments li").last()).toHaveAttribute("data-state", "ready");
+  await page.getByRole("textbox", { name: /Message #general/ }).fill("topology");
+  await page.keyboard.press("Enter");
+
+  await page.goto("/files");
+  await expect(page.getByRole("heading", { name: "Files", level: 2 })).toBeVisible();
+  await expect(page.locator(".file-ribbon")).toHaveCount(2);
+  await expect(page.locator(".file-ribbon").filter({ hasText: "Relay runbook.txt" })).toContainText("#general");
+
+  await page.getByLabel("Type").selectOption("image/");
+  await page.getByRole("button", { name: "Filter files" }).click();
+  await expect(page.locator(".file-ribbon")).toHaveCount(1);
+  await expect(page.locator(".file-ribbon")).toContainText("Topology.png");
+
+  await page.getByRole("link", { name: "Clear" }).click();
+  await page.getByLabel("Name").fill("runbook");
+  await page.getByRole("button", { name: "Filter files" }).click();
+  await expect(page.locator(".file-ribbon")).toHaveCount(1);
+  await expect(page.locator(".file-ribbon")).toContainText("Relay runbook.txt");
+
+  if (testInfo.project.name === "mobile-chromium") {
+    await expect(page.locator("body")).not.toHaveCSS("overflow-x", "scroll");
+    expect(
+      (await new AxeBuilder({ page }).include("#main").analyze()).violations.filter(
+        ({ impact }) => impact === "serious" || impact === "critical",
+      ),
+    ).toEqual([]);
+  }
+});

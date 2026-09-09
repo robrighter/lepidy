@@ -167,4 +167,70 @@ describe("files, uploads and quota", () => {
       })).rejects.toThrow("stores attachments on its own host");
     });
   });
+
+  it("C08B-INT-001 filters the workspace index by metadata without crossing room visibility", async () => {
+    const stub = await workspaceWithMembers("c08b-index");
+    const owner: Actor = { memberId: "owner", authorizationEpoch: 1 };
+    const member: Actor = { memberId: "member", authorizationEpoch: 1 };
+    const outsider: Actor = { memberId: "outsider", authorizationEpoch: 1 };
+    await stub.applyStorageEntitlement({ quotaBytes: 30 * MIB, version: 1, now: NOW });
+    const publicRoom = await stub.createChannel({
+      actor: owner, idempotencyKey: "c08b-channel-public1", kind: "public", slug: "design", memberIds: ["member"], now: NOW,
+    });
+    const privateRoom = await stub.createChannel({
+      actor: owner, idempotencyKey: "c08b-channel-private", kind: "private", slug: "board", memberIds: [], now: NOW,
+    });
+
+    const report = await stub.reserveUpload({
+      actor: owner, idempotencyKey: "c08b-reserve-report", channelId: privateRoom.channelId,
+      fileName: "Board report.pdf", mediaType: "application/pdf", byteLength: 900, now: NOW + 1,
+    });
+    await stub.confirmUpload({ actor: owner, fileId: report.fileId, byteLength: 900, now: NOW + 2 });
+    const sketch = await stub.reserveUpload({
+      actor: member, idempotencyKey: "c08b-reserve-sketch", channelId: publicRoom.channelId,
+      fileName: "Navigation sketch.png", mediaType: "image/png", byteLength: 700, now: NOW + 3,
+    });
+    await stub.confirmUpload({ actor: member, fileId: sketch.fileId, byteLength: 700, now: NOW + 4 });
+
+    expect((await stub.listFiles({ actor: owner, query: "report" })).files[0]).toMatchObject({
+      id: report.fileId, uploadedByDisplayName: "Maya Chen", uploadedByHandle: "maya", channelSlug: "board",
+    });
+    expect((await stub.listFiles({ actor: owner, mediaTypePrefix: "image/" })).files.map((file) => file.id)).toEqual([sketch.fileId]);
+    expect((await stub.listFiles({ actor: owner, uploaderMemberId: "member" })).files.map((file) => file.id)).toEqual([sketch.fileId]);
+    expect((await stub.listFiles({ actor: owner, channelId: publicRoom.channelId })).files.map((file) => file.id)).toEqual([sketch.fileId]);
+    expect((await stub.listFiles({ actor: owner, createdAtOrAfter: NOW + 2, createdBefore: NOW + 4 })).files.map((file) => file.id)).toEqual([sketch.fileId]);
+    // The same broad query cannot confirm a private room's matching file to an outsider.
+    expect((await stub.listFiles({ actor: outsider, query: "report" })).files).toEqual([]);
+  });
+
+  it("C08B-INT-002 returns cached preview text only through a currently visible message", async () => {
+    const stub = await workspaceWithMembers("c08b-unfurl");
+    const owner: Actor = { memberId: "owner", authorizationEpoch: 1 };
+    const outsider: Actor = { memberId: "outsider", authorizationEpoch: 1 };
+    const room = await stub.createChannel({
+      actor: owner, idempotencyKey: "c08b-unfurl-room001", kind: "private", slug: "preview", memberIds: [], now: NOW,
+    });
+    const message = await stub.sendMessage({
+      actor: owner, idempotencyKey: "c08b-unfurl-message", channelId: room.channelId,
+      bodyMarkdown: "Read [the runbook](https://docs.example/runbook).", now: NOW + 1,
+    });
+    await runInDurableObject<Workspace, void>(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO link_unfurls(url, final_url, title, description, site_name, state, fetched_at)
+         VALUES (?, ?, ?, ?, ?, 'ready', ?)`,
+        "https://docs.example/runbook", "https://docs.example/runbook", "Relay runbook",
+        "How to restart the relay.", "Lepidy docs", NOW + 1,
+      );
+    });
+
+    await expect(stub.listMessageUnfurls({ actor: owner, messageIds: [message.messageId], now: NOW + 2 }))
+      .resolves.toMatchObject({ unfurls: [{ messageId: message.messageId, title: "Relay runbook", siteName: "Lepidy docs" }] });
+    await expect(stub.listMessageUnfurls({ actor: outsider, messageIds: [message.messageId], now: NOW + 2 }))
+      .resolves.toEqual({ unfurls: [] });
+    await stub.editMessage({
+      actor: owner, messageId: message.messageId, bodyMarkdown: "The runbook moved.", now: NOW + 3,
+    });
+    await expect(stub.listMessageUnfurls({ actor: owner, messageIds: [message.messageId], now: NOW + 4 }))
+      .resolves.toEqual({ unfurls: [] });
+  });
 });

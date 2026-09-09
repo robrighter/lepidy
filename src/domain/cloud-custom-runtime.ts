@@ -260,7 +260,7 @@ export async function signCustomWake(body: string, deliveryId: string, timestamp
   return `v1=${base64Url(new Uint8Array(mac))}`;
 }
 
-function isPublicIp(address: string): boolean {
+export function isPublicIp(address: string): boolean {
   try {
     let parsed = ipaddr.parse(address.replace(/^\[|\]$/g, ""));
     if (parsed.kind() === "ipv6" && (parsed as ipaddr.IPv6).isIPv4MappedAddress()) {
@@ -275,11 +275,11 @@ function isPublicIp(address: string): boolean {
 export async function validatePublicCallbackUrl(urlText: string, resolve: (hostname: string) => Promise<readonly string[]>): Promise<URL> {
   const url = new URL(urlText);
   if (url.protocol !== "https:" || url.username || url.password || url.hash || (url.port && url.port !== "443")) {
-    throw new Error("custom callback must be uncredentialed HTTPS on port 443");
+    throw new Error("public egress URL must be uncredentialed HTTPS on port 443");
   }
-  if (!url.hostname.includes(".") || url.hostname.startsWith("[") || /^[0-9.]+$/.test(url.hostname)) throw new Error("custom callback needs a public DNS hostname");
+  if (!url.hostname.includes(".") || url.hostname.startsWith("[") || /^[0-9.]+$/.test(url.hostname)) throw new Error("public egress URL needs a public DNS hostname");
   const addresses = await resolve(url.hostname);
-  if (addresses.length === 0 || addresses.some((address) => !isPublicIp(address))) throw new Error("custom callback DNS is not strictly public");
+  if (addresses.length === 0 || addresses.some((address) => !isPublicIp(address))) throw new Error("public egress DNS is not strictly public");
   return url;
 }
 
