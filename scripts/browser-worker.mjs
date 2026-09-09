@@ -23,22 +23,31 @@ if (migrated.status !== 0) {
   cleanup();
   process.exit(migrated.status ?? 1);
 }
-// The dev server's stdout goes to a file rather than being inherited, and this
-// is not a tidiness preference. Playwright starts this script with
-// `stdout: "ignore"`, which gives it a pipe nobody reads; inheriting that fd
-// hands it to workerd, whose logging fills the 64 KiB pipe buffer partway
-// through a long suite and then fails on `write(): Broken pipe`. A file is
-// always drainable, and unlike `/dev/null` it keeps whatever the dev server
-// said about its own death, which is the thing you need when it dies.
+// Both of the dev server's output streams go to a file rather than being
+// inherited, and this is not a tidiness preference. Playwright gives this
+// script pipes that it does not keep draining; handing one to workerd means its
+// logging fills the 64 KiB buffer partway through a long suite and then fails
+// on `write(): Broken pipe`, taking the server down and failing every scenario
+// after it. A file is always drainable, and unlike `/dev/null` it keeps
+// whatever the dev server said about its own death, which is the thing you
+// need when it dies.
+//
+// `stderr` matters as much as `stdout` and was the half still inherited until
+// the whole matrix could no longer finish: this suite deliberately provokes
+// server-side errors — refused canaries, forged actions, denied handles — and
+// wrangler writes every one of them to stderr, so it fills first on a run long
+// enough to matter. The parent still announces an unexpected exit on its own
+// stderr below, so a mid-suite death is still named on the console.
 // Not `playwright-report`: the HTML reporter clears that directory when a run
 // starts, which silently emptied this log every time it was most wanted.
 const logDirectory = path.join(root, ".wrangler");
 mkdirSync(logDirectory, { recursive: true });
 const logPath = path.join(logDirectory, `worker-${environment}.log`);
+const logFd = openSync(logPath, "w");
 const child = spawn(
   process.execPath,
   [cli, "dev", "--port", environment === "development" ? "3100" : "3101", ...common],
-  { stdio: ["ignore", openSync(logPath, "w"), "inherit"] },
+  { stdio: ["ignore", logFd, logFd] },
 );
 for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => child.kill(signal));
 child.on("error", (error) => { cleanup(); throw error; });

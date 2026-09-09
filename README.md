@@ -42,6 +42,27 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 Run `npm run cf:typegen` whenever bindings in `wrangler.jsonc` change. The generated `worker-configuration.d.ts` is committed so a fresh checkout can type-check before provisioning Cloudflare resources.
 
+## People and workspace administration
+
+The People screen is the tenant-local directory. Members can publish a title,
+time zone, working hours, a short status and a declared availability without
+exposing their global account identity. Declaring Focus or Away outranks being
+connected, and clearing it hands the dot back to live connection state.
+Mentioning somebody in a room shows that profile as a
+hovercard on hover or keyboard focus. Group handles use the `g.` namespace; a
+group creator or a workspace administrator can maintain its membership, a group
+mention's card names who it would actually reach, and archived groups keep
+their identity without remaining mentionable. An agent's mention card names its
+owners, because mentioning an agent hands the message to all of them.
+
+Owners and administrators can invite people, change permitted roles and
+offboard members from the same screen. Solo invitations that would add a paid
+seat are held until an administrator explicitly confirms the seat change.
+Ownership transfer requires typing the destination member's exact handle, and
+offboarding immediately advances authority in both the control plane and the
+workspace, closing or revoking the former member's delegated access while
+retaining their directory tombstone for attribution.
+
 ## Credential CLI
 
 `lepidy` is the local client that injects vault credentials into a command. It

@@ -10,6 +10,8 @@ import {
   type LinkAuthorization,
 } from "./identity";
 import type { Workspace } from "../cloudflare/workspace";
+import { AdministrationService, type AdministrationSnapshot } from "./administration";
+import type { MemberStatus, WorkspaceRole } from "../domain/people";
 import {
   SimpleWebAuthnPasskeyProvider,
   type PasskeyProvider,
@@ -17,9 +19,9 @@ import {
 } from "./passkeys";
 
 type ChallengeKind = "verify_email" | "email_login";
-type WorkspaceRole = "owner" | "admin" | "member" | "guest";
+export type IssuedChallenge = { id: string; token: string; expiresAt: number; heldForPlan?: boolean };
 
-export type IssuedChallenge = { id: string; token: string; expiresAt: number };
+export type { AdministrationSnapshot } from "./administration";
 
 /** Where a WebAuthn ceremony is happening, when it is not the configured default. */
 export type RelyingParty = { rpId: string; origin: string };
@@ -432,30 +434,9 @@ export class OnboardingService {
     invitedByMemberId: string;
     email: string;
     role: Exclude<WorkspaceRole, "owner">;
+    billingConfirmed?: boolean;
   }): Promise<IssuedChallenge> {
-    const inviter = await this.db
-      .prepare(
-        `SELECT role, status FROM memberships
-         WHERE workspace_id = ? AND member_id = ?`,
-      )
-      .bind(input.workspaceId, input.invitedByMemberId)
-      .first<{ role: WorkspaceRole; status: string }>();
-    if (!inviter || inviter.status !== "active" || !["owner", "admin"].includes(inviter.role)) {
-      throw new Error("active owner or admin required to invite");
-    }
-    const id = crypto.randomUUID();
-    const token = randomToken();
-    const tokenHash = await hashOpaqueToken(token);
-    const createdAt = this.now();
-    const expiresAt = createdAt + 7 * 24 * 60 * 60_000;
-    await this.db
-      .prepare(
-        `INSERT INTO invitations(id, workspace_id, email_normalized, token_hash, role, invited_by_member_id, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(id, input.workspaceId, normalizeEmail(input.email), tokenHash, input.role, input.invitedByMemberId, expiresAt, createdAt)
-      .run();
-    return { id, token, expiresAt };
+    return new AdministrationService(this.db, this.workspaces, this.now).inviteMember(input);
   }
 
   async acceptInvitation(input: {
@@ -470,7 +451,8 @@ export class OnboardingService {
         `SELECT i.workspace_id, i.email_normalized, i.role, w.durable_object_id, w.membership_version,
                 a.primary_email_normalized, a.display_name
          FROM invitations i JOIN workspaces w ON w.id = i.workspace_id JOIN accounts a ON a.id = ?
-         WHERE i.id = ? AND i.token_hash = ? AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > ?`,
+         WHERE i.id = ? AND i.token_hash = ? AND i.delivery_state = 'ready'
+           AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > ?`,
       )
       .bind(input.accountId, input.invitationId, tokenHash, this.now())
       .first<{
@@ -522,61 +504,33 @@ export class OnboardingService {
     return { memberId };
   }
 
+  async listAdministration(workspaceId: string, actorMemberId: string): Promise<AdministrationSnapshot> {
+    return new AdministrationService(this.db, this.workspaces, this.now).listAdministration(workspaceId, actorMemberId);
+  }
+
+  async revokeInvitation(workspaceId: string, actorMemberId: string, invitationId: string): Promise<void> {
+    return new AdministrationService(this.db, this.workspaces, this.now).revokeInvitation(workspaceId, actorMemberId, invitationId);
+  }
+
+  async confirmInvitationPlan(workspaceId: string, actorMemberId: string, invitationId: string): Promise<void> {
+    return new AdministrationService(this.db, this.workspaces, this.now).confirmInvitationPlan(workspaceId, actorMemberId, invitationId);
+  }
+
+  async administerMember(input: {
+    workspaceId: string; actorMemberId: string; memberId: string;
+    role?: WorkspaceRole; status?: Exclude<MemberStatus, "pending">;
+  }): Promise<void> {
+    return new AdministrationService(this.db, this.workspaces, this.now).administerMember(input);
+  }
+
+  async transferOwnership(input: {
+    workspaceId: string; actorMemberId: string; targetMemberId: string; confirmation: string;
+  }): Promise<void> {
+    return new AdministrationService(this.db, this.workspaces, this.now).transferOwnership(input);
+  }
+
   async changeMemberRole(workspaceId: string, memberId: string, role: WorkspaceRole): Promise<void> {
-    const now = this.now();
-    const current = await this.db
-      .prepare(
-        `SELECT m.account_id, m.role, m.status, m.authorization_epoch, m.version,
-                a.display_name, w.durable_object_id, w.membership_version
-         FROM memberships m
-         JOIN accounts a ON a.id = m.account_id
-         JOIN workspaces w ON w.id = m.workspace_id
-         WHERE m.workspace_id = ? AND m.member_id = ?`,
-      )
-      .bind(workspaceId, memberId)
-      .first<{
-        account_id: string;
-        role: WorkspaceRole;
-        status: "pending" | "active" | "suspended" | "removed";
-        authorization_epoch: number;
-        version: number;
-        display_name: string;
-        durable_object_id: string;
-        membership_version: number;
-      }>();
-    if (!current) throw new Error("membership not found");
-    const local = await this.workspaces
-      .get(this.workspaces.idFromString(current.durable_object_id))
-      .getMember(memberId);
-    if (!local) throw new Error("workspace membership projection not found");
-    const version = current.membership_version + 1;
-    const operationId = crypto.randomUUID();
-    const member = {
-      operationId,
-      memberId,
-      accountId: current.account_id,
-      handle: local.handle,
-      displayName: current.display_name,
-      role,
-      status: current.status,
-      authorizationEpoch: current.authorization_epoch + 1,
-      version,
-      now,
-    };
-    await this.db.batch([
-      this.db.prepare("UPDATE workspaces SET membership_version = ?, updated_at = ? WHERE id = ?").bind(version, now, workspaceId),
-      this.db
-        .prepare(
-          "UPDATE memberships SET role = ?, version = ?, authorization_epoch = ?, updated_at = ? WHERE workspace_id = ? AND member_id = ?",
-        )
-        .bind(role, version, member.authorizationEpoch, now, workspaceId, memberId),
-      this.operationStatement(workspaceId, operationId, "membership_upsert", memberId, version, member, now),
-    ]);
-    await this.workspaces.get(this.workspaces.idFromString(current.durable_object_id)).applyMembership(member);
-    await this.db
-      .prepare("UPDATE control_operations SET status = 'applied', applied_at = ? WHERE id = ?")
-      .bind(now, operationId)
-      .run();
+    return new AdministrationService(this.db, this.workspaces, this.now).changeMemberRole(workspaceId, memberId, role);
   }
 
   private async consumeChallenge(id: string, token: string, kind: ChallengeKind): Promise<{ email: string }> {

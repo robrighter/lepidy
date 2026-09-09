@@ -114,6 +114,15 @@ import {
   type NotifyLevel,
 } from "../domain/notifications";
 import {
+  parseAvailability,
+  parseGroupHandle,
+  parseProfile,
+  planGroupMention,
+  resolvePresence,
+  type Availability,
+  type Presence,
+} from "../domain/people";
+import {
   callManagedAgents,
   customWake,
   decryptTransportSecret,
@@ -454,6 +463,39 @@ export type ActiveMember = {
   handle: string;
   displayName: string;
   role: MemberProjection["role"];
+};
+
+export type DirectoryMember = {
+  id: string;
+  handle: string;
+  displayName: string;
+  avatarUrl: string | null;
+  role: MemberProjection["role"];
+  status: MemberProjection["status"];
+  title: string | null;
+  timezone: string | null;
+  workingStartMinute: number | null;
+  workingEndMinute: number | null;
+  customStatus: string | null;
+  /** What this member declared; `auto` means they left it to their connections. */
+  availability: Availability;
+  /** What a reader should show: the declaration if there is one, else live state. */
+  presence: Presence;
+  ownedAgentCount: number;
+};
+
+export type DirectoryGroup = {
+  id: string;
+  handle: string;
+  displayName: string;
+  description: string | null;
+  createdByMemberId: string | null;
+  memberIds: readonly string[];
+};
+
+export type PeopleDirectory = {
+  people: readonly DirectoryMember[];
+  groups: readonly DirectoryGroup[];
 };
 
 export type VaultCredentialSummary = VaultCredentialMetadata & {
@@ -1302,6 +1344,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           member.memberId,
         );
         this.ctx.storage.sql.exec(
+          `UPDATE agent_delegations SET revoked_at = ?, revoked_reason = 'owner_authority_changed'
+           WHERE owner_member_id = ? AND revoked_at IS NULL`,
+          member.now,
+          member.memberId,
+        );
+        this.ctx.storage.sql.exec(
           `UPDATE vault_grants SET revoked_at = ?, revoked_reason = 'member_authority_changed'
            WHERE member_id = ? AND revoked_at IS NULL`,
           member.now,
@@ -1692,6 +1740,170 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       storageMode: config?.storage_mode ?? null,
       schemaVersion: schema.version,
     };
+  }
+
+  listPeople(input: { actor: Actor }): PeopleDirectory {
+    const actor = this.authorizeActor(input.actor);
+    const maySeeInactive = actor.role === "owner" || actor.role === "admin";
+    const online = new Set(this.onlineMemberIds());
+    const people = this.ctx.storage.sql
+      .exec<{
+        id: string; handle: string; display_name: string; avatar_url: string | null;
+        role: MemberProjection["role"]; status: MemberProjection["status"]; title: string | null;
+        timezone: string | null; working_start_minute: number | null; working_end_minute: number | null;
+        custom_status: string | null; availability: Availability; owned_agent_count: number;
+      }>(
+        `SELECT m.id, m.handle, m.display_name, m.avatar_url, m.role, m.status, m.title, m.timezone,
+                m.working_start_minute, m.working_end_minute, m.custom_status, m.availability,
+                COUNT(ao.agent_id) AS owned_agent_count
+         FROM members m LEFT JOIN agent_owners ao ON ao.member_id = m.id
+         WHERE m.status ${maySeeInactive ? "<> 'pending'" : "= 'active'"}
+         GROUP BY m.id ORDER BY m.display_name COLLATE NOCASE, m.id`,
+      )
+      .toArray()
+      .map((row) => ({
+        id: row.id, handle: row.handle, displayName: row.display_name, avatarUrl: row.avatar_url,
+        role: row.role, status: row.status, title: row.title, timezone: row.timezone,
+        workingStartMinute: row.working_start_minute, workingEndMinute: row.working_end_minute,
+        customStatus: row.custom_status, availability: row.availability,
+        presence: resolvePresence(row.availability, online.has(row.id)),
+        ownedAgentCount: row.owned_agent_count,
+      }));
+    const groups = this.ctx.storage.sql
+      .exec<{
+        id: string; handle: string; display_name: string; description: string | null;
+        created_by_member_id: string | null; member_ids_json: string;
+      }>(
+        `SELECT g.id, g.handle, g.display_name, g.description, g.created_by_member_id,
+                COALESCE(json_group_array(gm.member_id) FILTER (WHERE m.status = 'active'), '[]') AS member_ids_json
+         FROM groups g
+         LEFT JOIN group_members gm ON gm.group_id = g.id
+         LEFT JOIN members m ON m.id = gm.member_id
+         WHERE g.archived_at IS NULL
+         GROUP BY g.id ORDER BY g.handle COLLATE NOCASE`,
+      )
+      .toArray()
+      .map((row) => ({
+        id: row.id, handle: row.handle, displayName: row.display_name, description: row.description,
+        createdByMemberId: row.created_by_member_id,
+        memberIds: (JSON.parse(row.member_ids_json) as string[]).filter((id) => id !== null).sort(),
+      }));
+    return { people, groups };
+  }
+
+  async updateOwnProfile(input: {
+    actor: Actor;
+    displayName: string;
+    title?: string | null;
+    timezone?: string | null;
+    workingStartMinute?: number | null;
+    workingEndMinute?: number | null;
+    customStatus?: string | null;
+    availability?: Availability | string | null;
+    now: number;
+  }): Promise<{ profile: DirectoryMember }> {
+    const actor = this.authorizeActor(input.actor);
+    const profile = parseProfile(input);
+    const availability = parseAvailability(input.availability);
+    await this.commitMutation({ scope: "people.profile", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        `UPDATE members SET display_name = ?, title = ?, timezone = ?, working_start_minute = ?,
+           working_end_minute = ?, custom_status = ?, availability = ?, updated_at = ? WHERE id = ?`,
+        profile.displayName, profile.title, profile.timezone, profile.workingStartMinute,
+        profile.workingEndMinute, profile.customStatus, availability, input.now, actor.id,
+      );
+      return {
+        result: { updated: true },
+        effects: {
+          audit: { eventType: "member.profile_updated", outcome: "allowed", requesterKind: "member", requesterId: actor.id, subjectKind: "member", subjectId: actor.id, metadata: {} },
+          replay: [{ kind: "member.profile_updated", audience: ["workspace"], payload: { memberId: actor.id } }],
+        },
+      };
+    });
+    const updated = this.listPeople({ actor: input.actor }).people.find((member) => member.id === actor.id);
+    if (!updated) throw new Error("profile is unavailable");
+    return { profile: updated };
+  }
+
+  async createGroup(input: {
+    actor: Actor; idempotencyKey: string; handle: string; displayName: string;
+    description?: string | null; memberIds?: readonly string[]; now: number;
+  }): Promise<{ groupId: string }> {
+    const actor = this.authorizeActor(input.actor);
+    const key = parseIdempotencyKey(input.idempotencyKey);
+    if (key === null) throw new Error("invalid idempotency key");
+    const handle = parseGroupHandle(input.handle);
+    const displayName = input.displayName.trim();
+    if (displayName.length < 1 || displayName.length > 120) throw new Error("group name must be 1-120 characters");
+    const description = input.description?.trim() || null;
+    if (description !== null && description.length > 250) throw new Error("group description is too long");
+    const memberIds = this.resolveActiveMemberIds(input.memberIds ?? []);
+    const groupId = crypto.randomUUID();
+    const outcome = await this.commitMutation({
+      scope: "group.create",
+      idempotencyKey: key,
+      requestHash: JSON.stringify({ handle, displayName, description, memberIds }),
+      now: input.now,
+    }, () => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO groups(id, handle, display_name, description, created_by_member_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        groupId, handle, displayName, description, actor.id, input.now, input.now,
+      );
+      for (const memberId of memberIds) {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO group_members(group_id, member_id, added_at, added_by_member_id) VALUES (?, ?, ?, ?)",
+          groupId, memberId, input.now, actor.id,
+        );
+      }
+      return {
+        result: { groupId },
+        effects: {
+          audit: { eventType: "group.created", outcome: "allowed", requesterKind: "member", requesterId: actor.id, subjectKind: "group", subjectId: groupId, metadata: { handle, member_count: memberIds.length } },
+          replay: [{ kind: "group.created", audience: ["workspace"], payload: { groupId, handle } }],
+        },
+      };
+    });
+    return outcome.result;
+  }
+
+  async replaceGroupMembers(input: { actor: Actor; groupId: string; memberIds: readonly string[]; now: number }): Promise<{ memberIds: readonly string[] }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireGroupEditor(input.groupId, actor);
+    const memberIds = this.resolveActiveMemberIds(input.memberIds);
+    await this.commitMutation({ scope: "group.members", now: input.now }, () => {
+      this.ctx.storage.sql.exec("DELETE FROM group_members WHERE group_id = ?", input.groupId);
+      for (const memberId of memberIds) this.ctx.storage.sql.exec(
+        "INSERT INTO group_members(group_id, member_id, added_at, added_by_member_id) VALUES (?, ?, ?, ?)",
+        input.groupId, memberId, input.now, actor.id,
+      );
+      this.ctx.storage.sql.exec("UPDATE groups SET updated_at = ? WHERE id = ?", input.now, input.groupId);
+      return {
+        result: { memberIds },
+        effects: { audit: { eventType: "group.members_replaced", outcome: "allowed", requesterKind: "member", requesterId: actor.id, subjectKind: "group", subjectId: input.groupId, metadata: { member_count: memberIds.length } }, replay: [{ kind: "group.updated", audience: ["workspace"], payload: { groupId: input.groupId } }] },
+      };
+    });
+    return { memberIds };
+  }
+
+  async archiveGroup(input: { actor: Actor; groupId: string; now: number }): Promise<{ archived: true }> {
+    const actor = this.authorizeActor(input.actor);
+    this.requireGroupEditor(input.groupId, actor);
+    await this.commitMutation({ scope: "group.archive", now: input.now }, () => {
+      this.ctx.storage.sql.exec("UPDATE groups SET archived_at = ?, updated_at = ? WHERE id = ? AND archived_at IS NULL", input.now, input.now, input.groupId);
+      return { result: { archived: true as const }, effects: { audit: { eventType: "group.archived", outcome: "allowed", requesterKind: "member", requesterId: actor.id, subjectKind: "group", subjectId: input.groupId, metadata: {} }, replay: [{ kind: "group.archived", audience: ["workspace"], payload: { groupId: input.groupId } }] } };
+    });
+    return { archived: true };
+  }
+
+  private requireGroupEditor(groupId: string, actor: ActiveMember): void {
+    const row = this.ctx.storage.sql.exec<{ created_by_member_id: string | null }>(
+      "SELECT created_by_member_id FROM groups WHERE id = ? AND archived_at IS NULL", groupId,
+    ).toArray()[0];
+    if (!row) throw new Error("group not found");
+    if (row.created_by_member_id !== actor.id && actor.role !== "owner" && actor.role !== "admin") {
+      throw new Error("only the group creator or an administrator may change it");
+    }
   }
 
   configureNotifications(input: {
@@ -8612,8 +8824,26 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     now: number;
   }): { created: number; pushMemberIds: readonly string[] } {
     const memberIds = new Set(channelMemberIds(this.ctx.storage, input.channel.id));
+    const groupIds = input.mentions
+      .filter((mention) => mention.kind === "group" && mention.resolvedId !== null)
+      .map((mention) => mention.resolvedId!);
+    const allGroupMembers = new Set<string>();
+    for (const groupId of groupIds) {
+      const groupMembers = this.ctx.storage.sql.exec<{ member_id: string }>(
+        `SELECT gm.member_id FROM group_members gm JOIN members m ON m.id = gm.member_id
+         WHERE gm.group_id = ? AND m.status = 'active' ORDER BY gm.member_id`, groupId,
+      ).toArray().map((row) => row.member_id);
+      // Each named group must be real and non-empty; one populated group must
+      // not conceal a second empty token that looked like it notified people.
+      planGroupMention({ memberIds: groupMembers, senderId: input.authorKind === "member" ? input.authorId : "" });
+      for (const memberId of groupMembers) allGroupMembers.add(memberId);
+    }
+    const groupTargets = groupIds.length === 0 ? [] : planGroupMention({
+      memberIds: [...allGroupMembers], senderId: input.authorKind === "member" ? input.authorId : "",
+    });
     if (input.channel.kind === "public") {
       for (const mention of input.mentions) if (mention.kind === "member" && mention.resolvedId !== null) memberIds.add(mention.resolvedId);
+      for (const memberId of groupTargets) memberIds.add(memberId);
     }
     memberIds.delete(input.authorKind === "member" ? input.authorId : "");
 
@@ -8626,9 +8856,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       );
     }
 
-    const directlyMentioned = new Set(input.mentions.filter((mention) => mention.kind === "member" && mention.resolvedId !== null).map((mention) => mention.resolvedId!));
+    const directlyMentioned = new Set([
+      ...input.mentions.filter((mention) => mention.kind === "member" && mention.resolvedId !== null).map((mention) => mention.resolvedId!),
+      ...groupTargets,
+    ]);
     const broadcast = input.mentions.some(
-      (mention) => mention.kind === "channel" || mention.kind === "here",
+      (mention) => mention.kind === "channel" || mention.kind === "here" || mention.kind === "group",
     );
     const subscribers = input.threadRootId === null ? new Set<string>() : new Set(
       this.ctx.storage.sql.exec<{ member_id: string }>(

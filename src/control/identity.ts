@@ -1,8 +1,10 @@
 import argon2NonSimdModule from "argon2id/dist/no-simd.wasm";
 import argon2SimdModule from "argon2id/dist/simd.wasm";
 import setupArgon2id, { type computeHash } from "argon2id/lib/setup.js";
+import { normalizeEmail, validateHumanHandle } from "./identity-rules";
 
 export { hashOpaqueToken, randomToken } from "./opaque-tokens";
+export { normalizeEmail, validateHumanHandle };
 
 const encoder = new TextEncoder();
 let argon2idPromise: Promise<computeHash> | undefined;
@@ -43,10 +45,6 @@ export type LinkAuthorization = {
   stepUpVerified: boolean;
   confirmed: boolean;
 };
-
-export function normalizeEmail(email: string): string {
-  return email.trim().normalize("NFKC").toLowerCase();
-}
 
 export function assertSafeIdentityLink(
   assertion: ExternalIdentityAssertion,
@@ -103,15 +101,4 @@ function toBase64(value: Uint8Array): string {
 function fromBase64(value: string): Uint8Array {
   const binary = atob(value);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-
-export function validateHumanHandle(handle: string): string {
-  const normalized = handle.trim().normalize("NFKC").toLowerCase();
-  if (!/^[a-z0-9][a-z0-9._-]{1,31}$/.test(normalized)) {
-    throw new Error("handle must be 2-32 letters, numbers, dots, underscores or hyphens");
-  }
-  if (normalized.startsWith("a.") || normalized.startsWith("g.")) {
-    throw new Error("human handles cannot use the a. or g. namespace");
-  }
-  return normalized;
 }

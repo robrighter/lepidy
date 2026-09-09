@@ -770,7 +770,7 @@ export function resolveMentionTargets(
     }
     if (mention.kind === "group") {
       const row = storage.sql
-        .exec<{ id: string }>("SELECT id FROM groups WHERE handle = ?", mention.handle)
+        .exec<{ id: string }>("SELECT id FROM groups WHERE handle = ? AND archived_at IS NULL", mention.handle)
         .toArray()[0];
       return { ...mention, resolvedId: row?.id ?? null };
     }

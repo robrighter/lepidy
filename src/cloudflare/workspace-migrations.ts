@@ -1220,6 +1220,23 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `ALTER TABLE channels ADD COLUMN broadcast_policy TEXT NOT NULL DEFAULT 'admins' CHECK (broadcast_policy IN ('admins', 'members'))`,
     ],
   },
+  {
+    version: 29,
+    name: "people profiles and managed groups",
+    statements: [
+      `ALTER TABLE members ADD COLUMN title TEXT`,
+      `ALTER TABLE members ADD COLUMN timezone TEXT`,
+      `ALTER TABLE members ADD COLUMN working_start_minute INTEGER CHECK (working_start_minute BETWEEN 0 AND 1439)`,
+      `ALTER TABLE members ADD COLUMN working_end_minute INTEGER CHECK (working_end_minute BETWEEN 0 AND 1439)`,
+      `ALTER TABLE members ADD COLUMN custom_status TEXT`,
+      `ALTER TABLE members ADD COLUMN availability TEXT NOT NULL DEFAULT 'auto' CHECK (availability IN ('auto', 'focus', 'away'))`,
+      `ALTER TABLE groups ADD COLUMN description TEXT`,
+      `ALTER TABLE groups ADD COLUMN archived_at INTEGER`,
+      `ALTER TABLE group_members ADD COLUMN added_by_member_id TEXT REFERENCES members(id) ON DELETE SET NULL`,
+      `CREATE INDEX groups_active_handle_idx ON groups(handle, archived_at)`,
+      `CREATE INDEX group_members_member_idx ON group_members(member_id, group_id)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

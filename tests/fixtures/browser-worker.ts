@@ -226,11 +226,27 @@ export default {
         credentialId: await onboarding.finishPasskeyRegistration({ accountId, ...body }),
       });
     }
-    if (["/__fixture/seed", "/__fixture/activity", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/session-token", "/__fixture/vault", "/__fixture/device-origin", "/__fixture/runner-queue", "/__fixture/runner-enqueue", "/__fixture/runner-revoke"].includes(url.pathname) && request.method === "POST") {
+    if (["/__fixture/seed", "/__fixture/activity", "/__fixture/people", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/session-token", "/__fixture/vault", "/__fixture/device-origin", "/__fixture/runner-queue", "/__fixture/runner-enqueue", "/__fixture/runner-revoke"].includes(url.pathname) && request.method === "POST") {
       const authorization = new AuthorizationService(env.CONTROL_DB, env.WORKSPACE);
       const resolved = await resolveViewerWorkspace({ db: env.CONTROL_DB, workspaces: env.WORKSPACE, authenticateSession: (token) => authorization.authenticateBrowserSession(token) }, request.headers.get("authorization"));
       if (resolved.status !== "ok") return new Response("Unauthorized", { status: 401 });
       const stub = env.WORKSPACE.get(env.WORKSPACE.idFromString(resolved.row.durable_object_id)) as unknown as DurableObjectStub<Workspace>;
+      if (url.pathname.endsWith("people")) {
+        const now = Date.now();
+        const suffix = crypto.randomUUID().slice(0, 8);
+        const accountId = `people-account-${suffix}`;
+        const memberId = `people-member-${suffix}`;
+        const handle = `grace.${suffix}`;
+        const versionRow = await env.CONTROL_DB.prepare("SELECT membership_version FROM workspaces WHERE id = ?").bind(resolved.row.id).first<{ membership_version: number }>();
+        const version = (versionRow?.membership_version ?? 0) + 1;
+        await env.CONTROL_DB.batch([
+          env.CONTROL_DB.prepare("INSERT INTO accounts(id, primary_email_normalized, display_name, status, security_epoch, created_at, updated_at) VALUES (?, ?, 'Grace Hopper', 'active', 1, ?, ?)").bind(accountId, `grace-${suffix}@example.test`, now, now),
+          env.CONTROL_DB.prepare("UPDATE workspaces SET membership_version = ?, updated_at = ? WHERE id = ?").bind(version, now, resolved.row.id),
+          env.CONTROL_DB.prepare("INSERT INTO memberships(member_id, workspace_id, account_id, role, status, authorization_epoch, version, created_at, updated_at) VALUES (?, ?, ?, 'member', 'active', 1, ?, ?, ?)").bind(memberId, resolved.row.id, accountId, version, now, now),
+        ]);
+        await stub.applyMembership({ operationId: `browser-people-${suffix}`, memberId, accountId, handle, displayName: "Grace Hopper", role: "member", status: "active", authorizationEpoch: 1, version, now });
+        return Response.json({ memberId, handle });
+      }
       if (url.pathname.endsWith("workspace-counts")) return Response.json(await stub.browserCounts());
       if (url.pathname.endsWith("session-token")) {
         return Response.json(await stub.seedDelegatedSession({ memberId: resolved.row.member_id, authorizationEpoch: resolved.row.authorization_epoch }));

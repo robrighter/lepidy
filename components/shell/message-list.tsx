@@ -1,6 +1,7 @@
 import { CornerUpRight, MessageSquare, Pencil, Pin, Trash2 } from "lucide-react";
 
 import type { MessageRow } from "@/src/cloudflare/workspace-rooms";
+import type { MentionCard } from "@/src/domain/people";
 import { AgentAvatar, Avatar } from "./avatar";
 import { Markdown } from "./markdown";
 import { MessageActions, type ForwardTarget } from "./message-actions";
@@ -21,11 +22,13 @@ export function MessageList({
   viewerMemberId,
   canAct = false,
   forwardTargets = [],
+  mentionCards,
 }: {
   messages: readonly MessageRow[];
   viewerMemberId?: string;
   canAct?: boolean;
   forwardTargets?: readonly ForwardTarget[];
+  mentionCards?: ReadonlyMap<string, MentionCard>;
 }) {
   return (
     <ol className="messages">
@@ -73,7 +76,7 @@ export function MessageList({
                 </p>
               ) : (
                 <>
-                  <Markdown body={message.bodyMarkdown} />
+                  <Markdown body={message.bodyMarkdown} cards={mentionCards} idPrefix={message.id} />
                   {message.snippet ? <Snippet snippet={message.snippet} /> : null}
                 </>
               )}

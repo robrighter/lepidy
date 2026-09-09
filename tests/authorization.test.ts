@@ -176,6 +176,7 @@ describe("session and device authorization", () => {
       invitedByMemberId: workspace.memberId,
       email: "second-owner@example.com",
       role: "member",
+      billingConfirmed: true,
     });
     const second = await onboarding.acceptInvitation({
       invitationId: invite.id,

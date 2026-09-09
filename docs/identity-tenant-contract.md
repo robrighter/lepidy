@@ -67,6 +67,39 @@ For account-wide compromise recovery, D1 first increments `security_epoch` and d
 
 Removing the last active workspace owner is rejected. Removing a member preserves authored content and audit attribution while denying every new request and terminating live workspace authority.
 
+The tenant-local directory stores only workspace profile fields: display name,
+title, IANA time zone, optional working-hours minutes and a short custom status.
+Regular members receive active directory entries only; owners and administrators
+also receive inactive tombstones for administration and attribution.
+
+Presence has two independent halves. A member may declare `focus` or `away`,
+and that declaration outranks live connection state for as long as it stands;
+`auto` is the absence of a declaration, and only then is presence derived from
+open workspace connections. Derived online state is never accepted as a profile
+write.
+
+A mention hovercard is a rendering of that same directory read and never a
+second visibility rule: it is built from the entries the reader was already
+authorized to receive, a handle absent from them renders as a plain name with
+no card, and a former member's card says so rather than presenting them as
+merely offline. An agent's card names its owners, because mentioning an agent
+hands the message to every owner whether or not they could open that room; an
+owner the reader cannot name is counted rather than omitted, so the list is
+never shorter than the truth.
+
+Group identities are immutable and use normalized `g.` handles. `g.here`,
+`g.channel` and `g.everyone` remain reserved broadcast names. A group's creator,
+an active administrator or an active owner may replace its membership or archive
+it. Group mentions expand only to active members at send time, refuse an empty
+group, and refuse combined fan-out above 50 rather than silently truncating it.
+
+Invitations remain single-use and email-bound. An active duplicate membership or
+pending invitation is refused. When the active-seat count has reached the paid
+seat quantity, a new invitation is stored as held and cannot be accepted until
+an owner or administrator explicitly confirms the seat change. This confirmation
+is an entitlement acknowledgement; provider checkout and webhook reconciliation
+remain the billing implementation's responsibility.
+
 ## 5. Required integration invariants
 
 Implementation must prove these cases with local integration tests:

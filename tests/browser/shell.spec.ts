@@ -146,10 +146,16 @@ test("ROOM-INT-013 renders channel history and tells a person from an agent", as
   await expect(page.locator(".messages > li[data-author-kind=member]")).toContainText("Maya Chen");
   await expect(page.locator(".messages > li[data-author-kind=member]")).toContainText("failed-charge retry");
   await expect(page.locator(".messages > li[data-author-kind=member]")).toContainText("2 replies");
-  // An agent is visibly an agent, not a person with an odd name.
+  // An agent is visibly an agent, not a person with an odd name. The badge is
+  // addressed in the byline rather than by loose body text, because a message
+  // body can legitimately say "agent" now that C07 renders mention hovercards.
   await expect(page.locator(".messages > li[data-author-kind=agent]")).toContainText("a.releasebot");
-  await expect(page.locator(".messages > li[data-author-kind=agent]").getByText("agent")).toBeVisible();
-  await expect(page.locator(".messages > li[data-author-kind=member]").getByText("agent")).toHaveCount(0);
+  await expect(
+    page.locator(".messages > li[data-author-kind=agent] .message-meta").getByText("agent", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.locator(".messages > li[data-author-kind=member] .message-meta").getByText("agent", { exact: true }),
+  ).toHaveCount(0);
 
   // A room with nothing in it says so rather than showing a blank panel.
   await page.goto("/c/release");
@@ -216,11 +222,11 @@ test("SHELL-INT-006 keeps shipped surfaces real and marks only unfinished ones",
   await expect(page.getByRole("heading", { name: "Messages for you" })).toBeVisible();
   await expect(page.getByText("0 unread · 0 mentions · 0 threads · 0 DMs")).toBeVisible();
 
-  // The vault is a real surface now (V03/V04), so the unbuilt example moved to
-  // one that genuinely is: profile editing, which C07 owns.
+  // Profile editing is now a real C07 surface as well.
   await page.goto("/profile");
-  await expect(page.getByRole("heading", { name: "Editing your profile is not built yet" })).toBeVisible();
-  await expect(page.getByText(/arrive with C07/)).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Profile", level: 2 })).toBeVisible();
+  await expect(page.getByLabel("Display name")).toHaveValue("Maya Chen");
+  await expect(page.getByRole("button", { name: "Save profile" })).toBeVisible();
 
   // A channel nobody can see is refused rather than invented.
   await page.goto("/c/does-not-exist");

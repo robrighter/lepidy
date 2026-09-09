@@ -1,9 +1,10 @@
 import { MessageList } from "@/components/shell/message-list";
+import { mentionCards } from "@/src/shell/people-context";
 import { savedItems } from "@/src/shell/saved-context";
 import { shellState } from "@/src/shell/shell-context";
 
 export default async function SavedPage() {
-  const [state, saved] = await Promise.all([shellState(), savedItems()]);
+  const [state, saved, cards] = await Promise.all([shellState(), savedItems(), mentionCards()]);
   const viewerMemberId = state.status === "ready" ? state.snapshot.viewer.memberId : undefined;
 
   if (saved.status === "unavailable") {
@@ -41,6 +42,7 @@ export default async function SavedPage() {
         <MessageList
           messages={saved.items.map((item) => item.message)}
           viewerMemberId={viewerMemberId}
+          mentionCards={cards}
         />
       </section>
       {saved.unavailable > 0 ? <UnavailableNotice count={saved.unavailable} /> : null}

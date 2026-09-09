@@ -269,9 +269,38 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 .markdown a { color: var(--accent); text-decoration: underline; }
 .mention { padding: 0 4px; border-radius: 5px; background: var(--violet-soft, rgb(124 58 237 / 12%)); color: var(--accent); font-weight: 600; }
 .mention-agent { background: rgb(255 143 163 / 18%); color: #b03a52; }
+/* The accent itself only reaches 4.29:1 on the dark mention chip, so the dark
+   theme lightens the name rather than leaving it just under WCAG 2 AA. */
+:root[data-theme="dark"] .mention { color: #b391ff; }
 :root[data-theme="dark"] .mention-agent { color: var(--coral); }
 .mention-channel, .mention-here { background: color-mix(in srgb, var(--amber) 18%, transparent); color: #8a5a06; }
 :root[data-theme="dark"] .mention-channel, :root[data-theme="dark"] .mention-here { color: var(--amber); }
+
+/* Mention hovercards: the directory brought to the message, with no client
+   script. The card is a sibling of the name inside one anchor, so hover and
+   keyboard focus open the same element. */
+.mention-anchor { position: relative; display: inline-block; }
+.mention-anchor .mention { cursor: default; }
+.mention-anchor .mention:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.mention-card {
+  position: absolute; z-index: 40; bottom: calc(100% + 7px); left: 0; display: none;
+  width: max-content; max-width: min(280px, 78vw); padding: 11px 13px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--surface);
+  box-shadow: 0 10px 28px rgb(28 20 60 / 16%); color: var(--text); font-weight: 400; text-align: left;
+}
+:root[data-theme="dark"] .mention-card { box-shadow: 0 10px 28px rgb(0 0 0 / 45%); }
+.mention-anchor:hover .mention-card, .mention-anchor:focus-within .mention-card { display: block; }
+.mention-card > span { display: block; }
+.mention-card-name { font: 600 13.5px/1.35 var(--font-body); }
+.mention-card-handle { color: var(--text-2); font-family: var(--font-mono); font-size: 12px; }
+.mention-card-subtitle { margin-top: 3px; color: var(--text-2); font-size: 12.5px; }
+.mention-card-status { margin-top: 6px; font-size: 12.5px; }
+.mention-card-facts { margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--line); color: var(--text-3); font-size: 12px; }
+.mention-card-facts span { display: block; }
+@media (max-width: 700px) {
+  /* A card wider than the phone would push the room sideways. */
+  .mention-card { left: auto; right: 0; max-width: min(240px, 82vw); }
+}
 .message-deleted { display: inline-flex; align-items: center; gap: 6px; color: var(--text-3); font-style: italic; }
 
 .reactions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; }
@@ -430,6 +459,8 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 .auth-footer { margin: 16px 0 0; color: var(--text-2); font-size: 13px; }
 .auth-footer a { color: var(--accent); text-decoration: underline; }
 .primary-link { display: inline-block; margin-top: 8px; padding: 9px 14px; border-radius: var(--r-sm); background: var(--accent); color: var(--on-accent); font-weight: 600; }
+:root[data-theme="dark"] .primary-link { color: #100e26; }
+.profile-handle { color: var(--text-2); font-family: var(--font-mono); }
 .profile-menu-panel form { margin: 0; }
 
 /* ---------------- responsive ---------------- */
@@ -691,3 +722,32 @@ button.danger:hover:not(:disabled) { background: #fdf2f4; }
 :root[data-theme="dark"] .tag.runtime-alert, :root[data-theme="dark"] .tag.runtime-failed { color: var(--coral); }
 
 .vault-table tr[data-tone="alert"] td, .vault-table tr[data-live="yes"] td { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+
+.people-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+.person-heading, .person-meta, .admin-row, .form-row { display: flex; align-items: center; gap: 10px; }
+.person-heading > div, .admin-row > span { min-width: 0; flex: 1; }
+.person-heading h3, .person-heading p { margin: 0; }
+.person-meta { flex-wrap: wrap; color: var(--text-3); font-size: 12.5px; }
+.presence-dot { width: 10px; height: 10px; border-radius: 999px; background: #817a99; }
+.presence-dot.online { background: #2fb67b; }
+.presence-dot.focus { background: #e1982f; }
+.presence-dot.away { background: #d6b54b; }
+.settings-form, .group-list, .admin-list { display: grid; gap: 12px; }
+.settings-form label, .transfer-form label { display: grid; gap: 5px; }
+.settings-form input, .settings-form select, .transfer-form input, .admin-row select {
+  min-height: 38px; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px;
+  color: var(--text); background: var(--surface-2);
+}
+.check-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 7px; }
+.check-grid label { display: flex; align-items: center; }
+.subpanel, .admin-row { border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+.admin-row { align-items: flex-start; flex-wrap: wrap; }
+.admin-row small { display: block; color: var(--text-3); }
+.admin-row form { display: flex; gap: 7px; flex-wrap: wrap; }
+.transfer-form { flex-basis: 100%; }
+.danger-link { color: #b53a54; }
+@media (max-width: 700px) {
+  .people-grid { grid-template-columns: 1fr; }
+  .form-row { align-items: stretch; flex-direction: column; }
+  .admin-row { display: grid; }
+}

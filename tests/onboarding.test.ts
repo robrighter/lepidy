@@ -266,6 +266,7 @@ describe("identity and workspace onboarding", () => {
       invitedByMemberId: owner.memberId,
       email: "Lee@example.com",
       role: "member",
+      billingConfirmed: true,
     });
 
     const wrong = { accountId: await register("other@example.com", "Wrong Person") };

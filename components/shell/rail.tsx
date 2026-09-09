@@ -11,6 +11,7 @@ import {
   Plus,
   Search,
   Sparkles,
+  Users,
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -31,6 +32,7 @@ const NAV_ICONS: Partial<Record<ShellSection, ReactNode>> = {
   inbox: <Inbox size={18} />,
   saved: <Bookmark size={18} />,
   scheduled: <CalendarClock size={18} />,
+  people: <Users size={18} />,
   agents: <Sparkles size={18} />,
   vault: <KeyRound size={18} />,
 };

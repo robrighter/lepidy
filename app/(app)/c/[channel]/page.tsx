@@ -3,6 +3,7 @@ import { Pin } from "lucide-react";
 import { Composer } from "@/components/shell/composer";
 import { MessageList } from "@/components/shell/message-list";
 import { channelHistory } from "@/src/shell/channel-context";
+import { mentionCards } from "@/src/shell/people-context";
 import { shellState } from "@/src/shell/shell-context";
 import { channelLabel } from "@/src/shell/shell-model";
 
@@ -38,7 +39,7 @@ export default async function ChannelPage({
   // Paging widens the window rather than replacing it, so revealing older
   // messages leaves everything already on screen exactly where it was.
   const pages = Math.min(Math.max(Number(show ?? "1") || 1, 1), 20);
-  const history = await channelHistory(channel.id, PAGE * pages);
+  const [history, cards] = await Promise.all([channelHistory(channel.id, PAGE * pages), mentionCards()]);
   const viewerMemberId = state.status === "ready" ? state.snapshot.viewer.memberId : undefined;
   const canPost = channel.isMember;
   const forwardTargets =
@@ -103,6 +104,7 @@ export default async function ChannelPage({
             viewerMemberId={viewerMemberId}
             canAct={canPost}
             forwardTargets={forwardTargets}
+            mentionCards={cards}
           />
         </section>
       )}

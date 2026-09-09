@@ -57,6 +57,7 @@ describe("workspace shell data adapter", () => {
       invitedByMemberId: memberId,
       email: "shell-guest@example.test",
       role: "member",
+      billingConfirmed: true,
     });
     const guest = await onboarding.acceptInvitation({
       invitationId: invitation.id,
