@@ -43,6 +43,21 @@ import {
 } from "../domain/due-work";
 import { parseIdempotencyKey } from "../domain/idempotency-key";
 import {
+  assertMetadataOnly,
+  buildPushPayload,
+  pushTtlSeconds,
+  pushUrgency,
+  validateSubscription,
+  vapidClaims,
+  notificationText,
+  NOTIFICATION_BODY_LIMIT,
+  NOTIFICATION_TITLE_LIMIT,
+  type PushKind,
+  type RenderedNotification,
+  type ValidatedSubscription,
+} from "../domain/web-push";
+import { encryptPushPayload, sendPush, signVapidToken, vapidPublicKey } from "./web-push";
+import {
   ACCESS_TOKEN_TTL_MS,
   AUTHORIZATION_CODE_TTL_MS,
   checkCodeExchange,
@@ -1460,6 +1475,18 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           member.memberId,
         );
       }
+      if (member.status !== "active") {
+        // Every browser they registered, forgotten. The member row stays as a
+        // directory tombstone so old messages keep their attribution, which is
+        // exactly why the `ON DELETE CASCADE` on this table never fires — and
+        // why this has to be explicit. A former member's phone still receiving
+        // notifications about a workspace they were removed from is the precise
+        // failure the tombstone is careful not to be.
+        this.ctx.storage.sql.exec(
+          "DELETE FROM push_subscriptions WHERE member_id = ?",
+          member.memberId,
+        );
+      }
       this.ctx.storage.sql.exec(
         `INSERT INTO applied_control_operations(operation_id, kind, aggregate_id, version, applied_at)
          VALUES (?, 'membership_upsert', ?, ?, ?)`,
@@ -2741,6 +2768,146 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       dndEndMinute: settings?.dnd_end_minute ?? null,
       dndManualUntil: settings?.dnd_manual_until ?? null,
     };
+  }
+
+  /**
+   * Register this browser to receive pushes for the acting member.
+   *
+   * One row per browser rather than per person: somebody signed in on a laptop
+   * and a phone has two, and an approval has to reach whichever one they are
+   * actually holding. The endpoint is the subscription's identity as far as the
+   * push service is concerned, so re-subscribing the same browser replaces the
+   * row rather than adding a second — a browser that refreshed its subscription
+   * would otherwise accumulate dead endpoints that fail forever.
+   *
+   * The endpoint is also **moved to the acting member**. A shared machine where
+   * one person signs out and another signs in produces the same endpoint for a
+   * different person, and leaving it attached to the first would send them
+   * somebody else's notifications.
+   */
+  subscribeToPush(input: {
+    actor: Actor;
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+    now: number;
+  }): { subscribed: true } {
+    const actor = this.authorizeActor(input.actor);
+    const subscription = validateSubscription({
+      endpoint: input.endpoint,
+      p256dh: input.p256dh,
+      auth: input.auth,
+    });
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM push_subscriptions WHERE endpoint = ?", subscription.endpoint);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO push_subscriptions(id, member_id, endpoint, p256dh, auth, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        `push_${crypto.randomUUID()}`,
+        actor.id,
+        subscription.endpoint,
+        subscription.p256dh,
+        subscription.auth,
+        input.now,
+      );
+    });
+    return { subscribed: true };
+  }
+
+  /**
+   * Forget this browser.
+   *
+   * Ungated beyond membership, and deliberately: a person signing out, or
+   * turning notifications off, is asking to stop being notified, and a request
+   * to stop should never be the one that needs an extra condition met.
+   */
+  unsubscribeFromPush(input: { actor: Actor; endpoint: string }): { removed: number } {
+    const actor = this.authorizeActor(input.actor);
+    const cursor = this.ctx.storage.sql.exec(
+      "DELETE FROM push_subscriptions WHERE endpoint = ? AND member_id = ?",
+      input.endpoint,
+      actor.id,
+    );
+    return { removed: cursor.rowsWritten };
+  }
+
+  /**
+   * The words a device may put on a screen for one notification.
+   *
+   * This is the other half of the metadata-only payload, and the reason that
+   * design is worth its cost. The push carried identifiers; the device comes
+   * back here with the viewer's own session, and **visibility is decided now** —
+   * not when the push was sent. Somebody removed from a room in the seconds
+   * between the two gets nothing, and a notification that was already
+   * unanswerable says so instead of showing a preview of a room they left.
+   *
+   * A subject the viewer may not see is reported as missing rather than as
+   * forbidden, for the same reason a channel is: "you are not allowed to see
+   * this" tells somebody it exists.
+   */
+  renderNotification(input: {
+    actor: Actor;
+    kind: PushKind;
+    id: string;
+    now: number;
+  }): RenderedNotification | null {
+    const actor = this.authorizeActor(input.actor);
+    if (input.kind === "approval") {
+      const card = this.listVaultApprovals({ actor: input.actor, now: input.now }).approvals.find(
+        (approval) => approval.approvalId === input.id,
+      );
+      // Expired, answered, or never theirs. All three are "nothing to show":
+      // waking somebody to decide something already decided is how a person
+      // learns to ignore the notification that mattered.
+      if (!card || !card.viewerMayDecide) return null;
+      const names = card.items.map((item) => item.name).join(", ");
+      const asker = card.agentHandle ?? card.requesterHandle;
+      return {
+        title: notificationText(`@${asker} needs ${names}`, NOTIFICATION_TITLE_LIMIT),
+        // The reason is written by an agent, so it is sanitised exactly as a
+        // message body is before it reaches a lock screen.
+        body: notificationText(card.reason, NOTIFICATION_BODY_LIMIT),
+        path: `/inbox?approval=${card.approvalId}`,
+      };
+    }
+
+    const message = readMessage(this.ctx.storage, input.id);
+    if (message === null || message.deletedAt !== null) return null;
+    let channel: ChannelRow;
+    try {
+      channel = this.requireVisibleChannel(message.channelId, actor.id);
+    } catch {
+      return null;
+    }
+    const room = channel.slug ?? channel.name ?? channel.id;
+    return {
+      // The author's display name as it was when they wrote it, which is the
+      // name the room itself shows — a notification naming somebody differently
+      // from the message it is about is a notification about a stranger.
+      title: notificationText(`#${room} — ${message.authorDisplaySnapshot}`, NOTIFICATION_TITLE_LIMIT),
+      body: notificationText(message.bodyMarkdown, NOTIFICATION_BODY_LIMIT),
+      path: `/c/${channel.slug ?? channel.id}`,
+    };
+  }
+
+  /** Every browser registered for one member. Internal: no actor, no ACL. */
+  private pushSubscriptionsFor(memberId: string): ValidatedSubscription[] {
+    return this.ctx.storage.sql
+      .exec<{ endpoint: string; p256dh: string; auth: string }>(
+        "SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE member_id = ? ORDER BY created_at",
+        memberId,
+      )
+      .toArray()
+      .flatMap((row) => {
+        try {
+          return [validateSubscription(row)];
+        } catch {
+          // A row that can no longer be validated is a row that would fail
+          // every send forever. Dropped here rather than retried.
+          this.ctx.storage.sql.exec("DELETE FROM push_subscriptions WHERE endpoint = ?", row.endpoint);
+          return [];
+        }
+      });
   }
 
   setThreadSubscription(input: { actor: Actor; threadRootId: string; subscribed: boolean; now: number }): { subscribed: boolean } {
@@ -11953,6 +12120,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     if (entry.kind === "custom_runtime_wake") return this.dispatchCustomRuntimeWake(entry);
     if (entry.kind === "cloud_runtime_mention") return this.dispatchCloudRuntimeMention(entry);
     if (entry.kind === "anthropic_resource_fetch") return this.dispatchAnthropicResourceFetch(entry);
+    if (entry.kind === "notification_push") return this.dispatchPush(entry, "message");
+    if (entry.kind === "vault_approval_requested") return this.dispatchPush(entry, "approval");
     const queue = this.env.EVENTS;
     if (!queue) return { status: "retry", error: "events queue binding is unavailable" };
     try {
@@ -11965,6 +12134,126 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         payload: entry.payload,
       });
       return { status: "delivered" };
+    } catch (error) {
+      return { status: "retry", error: redactedError(error) };
+    }
+  }
+
+  /**
+   * Turn one outbox entry into a push on every browser the recipient registered.
+   *
+   * The payload is **identifiers and a destination**, never words. It is
+   * encrypted end to end, so the push service cannot read it — but the device
+   * renders it on a lock screen, and what appears there is somebody else's
+   * workspace. So the service worker fetches the text to display with the
+   * viewer's own session, which also means visibility is rechecked at the
+   * moment of display rather than at the moment of send. C06 made that decision
+   * when it wrote a metadata-only outbox; sending content here would quietly
+   * undo it, so `assertMetadataOnly` checks the object actually being encrypted.
+   */
+  private async dispatchPush(entry: OutboxEntry, kind: PushKind): Promise<OutboxOutcome> {
+    const payload = entry.payload as { memberId?: unknown; messageId?: unknown; approvalId?: unknown; expiresAt?: unknown };
+    const memberId = payload.memberId;
+    const subject = kind === "approval" ? payload.approvalId : payload.messageId;
+    if (typeof memberId !== "string" || typeof subject !== "string") {
+      return { status: "permanent", error: "invalid push payload" };
+    }
+
+    const privateJwkText = this.env.VAPID_PRIVATE_JWK;
+    const contact = this.env.VAPID_SUBJECT;
+    if (!privateJwkText || !contact) {
+      // Not a retry. A deployment with no key will not grow one between now and
+      // the next backoff, and looping would fill the outbox with work that
+      // cannot succeed. Dead-lettered so the state is visible rather than
+      // silently reported as delivered.
+      return { status: "permanent", error: "web push is not configured for this deployment" };
+    }
+
+    const subscriptions = this.pushSubscriptionsFor(memberId);
+    // Nobody registered a browser. There is nothing to deliver, and that is not
+    // a failure of this event.
+    if (subscriptions.length === 0) return { status: "delivered" };
+
+    // Where activating it leads. An approval opens its card; a mention opens the
+    // room it was in, and falls back to the Inbox when the event predates a
+    // channel identifier rather than building a path with an empty segment.
+    const channelId = (entry.payload as { channelId?: unknown }).channelId;
+    const path =
+      kind === "approval"
+        ? `/inbox?approval=${subject}`
+        : typeof channelId === "string" && channelId.length > 0
+          ? `/c/${channelId}`
+          : "/inbox";
+    const body = buildPushPayload(kind, subject, path);
+    assertMetadataOnly(body);
+    const plaintext = new TextEncoder().encode(JSON.stringify(body));
+
+    const privateJwk = JSON.parse(privateJwkText) as JsonWebKey;
+    // Built explicitly rather than by stripping `d`: a JWK that still carries a
+    // private field is a private key, and exporting one as `raw` fails in a way
+    // that would look like a push-service problem.
+    const publicKey = await vapidPublicKey({
+      kty: privateJwk.kty,
+      crv: privateJwk.crv,
+      x: privateJwk.x,
+      y: privateJwk.y,
+    });
+    const ttl = pushTtlSeconds(kind, typeof payload.expiresAt === "number" ? payload.expiresAt : null, Date.now());
+    // An approval whose five minutes have already run out is not worth waking
+    // anybody for: being asked to decide something already decided is how a
+    // person learns to ignore the notification that mattered.
+    if (kind === "approval" && ttl === 0) return { status: "delivered" };
+
+    let anyDelivered = false;
+    let lastError = "no push was accepted";
+    for (const subscription of subscriptions) {
+      const outcome = await this.deliverOnePush(subscription, plaintext, privateJwk, publicKey, contact, ttl, kind);
+      if (outcome.status === "delivered") anyDelivered = true;
+      else lastError = outcome.error;
+    }
+    // One browser reachable is a delivered notification. Retrying because a
+    // second device was asleep would send the first one a duplicate.
+    return anyDelivered ? { status: "delivered" } : { status: "retry", error: lastError };
+  }
+
+  private async deliverOnePush(
+    subscription: ValidatedSubscription,
+    plaintext: Uint8Array,
+    privateJwk: JsonWebKey,
+    publicKey: string,
+    contact: string,
+    ttl: number,
+    kind: PushKind,
+  ): Promise<{ status: "delivered" } | { status: "retry" | "permanent"; error: string }> {
+    try {
+      const token = await signVapidToken(vapidClaims(subscription.audience, contact, Date.now()), privateJwk);
+      const outcome = await sendPush({
+        subscription,
+        body: await encryptPushPayload(plaintext, subscription),
+        token,
+        publicKey,
+        ttlSeconds: ttl,
+        urgency: pushUrgency(kind),
+      });
+      if (outcome.status === "expired") {
+        // A reinstalled browser, a cleared profile, a revoked permission. The
+        // subscription will never work again, so it goes rather than being
+        // retried until the attempt budget runs out.
+        this.ctx.storage.sql.exec("DELETE FROM push_subscriptions WHERE endpoint = ?", subscription.endpoint);
+        return { status: "permanent", error: outcome.error };
+      }
+      if (outcome.status === "delivered") {
+        this.ctx.storage.sql.exec(
+          "UPDATE push_subscriptions SET last_success_at = ?, last_error = NULL WHERE endpoint = ?",
+          Date.now(), subscription.endpoint,
+        );
+        return { status: "delivered" };
+      }
+      this.ctx.storage.sql.exec(
+        "UPDATE push_subscriptions SET last_error = ? WHERE endpoint = ?",
+        outcome.error.slice(0, 200), subscription.endpoint,
+      );
+      return outcome;
     } catch (error) {
       return { status: "retry", error: redactedError(error) };
     }

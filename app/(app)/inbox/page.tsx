@@ -63,7 +63,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ v
       {activityState.status === "ready" && shell.status === "ready" ? <section className="panel" aria-labelledby="notification-settings-heading">
         <h2 id="notification-settings-heading">Notification settings</h2>
         <p>Agent messages are quieter by default. Approvals remain visible through their dedicated urgent path.</p>
-        <NotificationPermission />
+        <NotificationPermission csrfToken={csrfToken ?? ""} />
         <form action={configureNotificationsAction} className="settings-form">
           <input type="hidden" name="csrfToken" value={csrfToken ?? ""} />
           <label>Room

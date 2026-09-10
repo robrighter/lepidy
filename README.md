@@ -177,6 +177,10 @@ Lepidy is installable from any modern browser. `app/manifest.ts` describes it, `
 
 The service worker **caches nothing that came back from a signed-in request** — not a page, not an API response, not a message. A workspace is shared, its content is other people's, and a cache is a copy that outlives a sign-out and survives an offboarding. The offline experience this buys is worse than a caching worker's, and that is the trade. It also never intercepts anything but a GET navigation, because every form in this product posts to a Server Action and a worker that failed one would lose a message somebody wrote.
 
+Push delivery needs two platform secret bindings: `VAPID_PRIVATE_JWK`, a P-256 JWK identifying this deployment to Google, Apple and Mozilla, and `VAPID_SUBJECT`, the `mailto:` or `https:` contact those services are told to reach on abuse. Provision both with the deployment secret store, never in `wrangler.jsonc`. A deployment without them has **no push transport at all**, which the browser is told (503 from `/api/push/key`) so a person is not left waiting for a notification nothing will send.
+
+**A push payload carries identifiers, never words.** It is encrypted end to end, so the push service cannot read it — but the device renders it on a lock screen, and what appears there is somebody else's workspace. So the service worker fetches the text to display with the viewer's own session, which means visibility is decided at the moment of display: somebody removed from a room in the seconds between the send and the render gets nothing.
+
 **Lepidy never promises a notification will arrive.** Permission belongs to the browser and to the operating system underneath it, both of which can refuse, silence or drop one for reasons the application cannot see. Every state of the permission surface names the Inbox as where things wait instead, and the denied state offers no button, because a browser that has been told no does not re-prompt.
 
 ## Desktop shell

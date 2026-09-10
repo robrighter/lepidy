@@ -20,9 +20,54 @@ type State = "unsupported" | "default" | "granted" | "denied" | "insecure";
  * page cannot do is ask again. A browser that has been told "no" does not
  * re-prompt, and a button that appeared to re-ask would do nothing.
  */
-export function NotificationPermission() {
+/**
+ * Register this browser with the push service, and tell the workspace about it.
+ *
+ * The public VAPID key is fetched rather than embedded: a deployment without one
+ * has no push transport, and finding that out from a 503 lets this say so
+ * instead of failing inside `pushManager.subscribe` with a message nobody can
+ * act on.
+ */
+async function subscribe(csrfToken: string): Promise<"subscribed" | "unconfigured" | "failed"> {
+  const key = await fetch("/api/push/key");
+  if (key.status === 503) return "unconfigured";
+  if (!key.ok) return "failed";
+  const { key: applicationServerKey } = (await key.json()) as { key: string };
+
+  const registration = await navigator.serviceWorker.ready;
+  // Reuse whatever this browser already has. Subscribing again would produce a
+  // second endpoint for the same browser and leave the first one to fail
+  // forever.
+  const existing = await registration.pushManager.getSubscription();
+  const subscription =
+    existing ??
+    (await registration.pushManager.subscribe({
+      // Required by every browser: a subscription that anyone could push to
+      // would be a subscription anyone could push to.
+      userVisibleOnly: true,
+      applicationServerKey,
+    }));
+
+  const json = subscription.toJSON() as { endpoint?: string; keys?: { p256dh?: string; auth?: string } };
+  const response = await fetch("/api/push/subscribe", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      csrfToken,
+      endpoint: json.endpoint,
+      p256dh: json.keys?.p256dh,
+      auth: json.keys?.auth,
+    }),
+  });
+  return response.ok ? "subscribed" : "failed";
+}
+
+export function NotificationPermission({ csrfToken }: { csrfToken: string }) {
   const [state, setState] = useState<State | null>(null);
   const [asking, setAsking] = useState(false);
+  const [delivery, setDelivery] = useState<"unknown" | "subscribed" | "unconfigured" | "failed">(
+    "unknown",
+  );
 
   useEffect(() => {
     if (typeof Notification === "undefined" || !("serviceWorker" in navigator)) {
@@ -41,7 +86,14 @@ export function NotificationPermission() {
   const ask = async () => {
     setAsking(true);
     try {
-      setState((await Notification.requestPermission()) as State);
+      const granted = (await Notification.requestPermission()) as State;
+      setState(granted);
+      // Permission is only half of it. A browser that granted permission and
+      // was never registered with the push service receives nothing, and would
+      // sit here looking as though it worked.
+      if (granted === "granted") {
+        setDelivery(await subscribe(csrfToken).catch(() => "failed"));
+      }
     } finally {
       setAsking(false);
     }
@@ -50,11 +102,26 @@ export function NotificationPermission() {
   return (
     <div className="notification-permission" data-permission={state}>
       {state === "granted" ? (
-        <p className="notice">
-          This browser will show Lepidy notifications. Your operating system can still
-          silence them — during a focus mode, for example — and Lepidy cannot override
-          that. Anything you miss is waiting in the Inbox.
-        </p>
+        <>
+          <p className="notice">
+            This browser will show Lepidy notifications. Your operating system can still
+            silence them — during a focus mode, for example — and Lepidy cannot override
+            that. Anything you miss is waiting in the Inbox.
+          </p>
+          {delivery === "unconfigured" ? (
+            <p className="notice warn">
+              This deployment has no push service configured, so nothing will be delivered
+              to this browser even though it would show one. The Inbox is where things
+              wait.
+            </p>
+          ) : null}
+          {delivery === "failed" ? (
+            <p className="notice warn">
+              This browser could not be registered for delivery. Notifications will not
+              arrive until it is; the Inbox is unaffected.
+            </p>
+          ) : null}
+        </>
       ) : null}
 
       {state === "default" ? (

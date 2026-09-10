@@ -90,6 +90,73 @@ function destination(data) {
   return path;
 }
 
+/**
+ * A push arrived.
+ *
+ * The payload is identifiers and a destination, never words — see
+ * `src/domain/web-push.ts` for why. So the words are fetched here, with this
+ * browser's own session, which is what makes the display decision honour the
+ * viewer's current authority rather than the authority they had when the push
+ * was sent.
+ *
+ * A notification is shown **whatever happens**. A push event that resolves
+ * without one makes the browser show its own "this site has been updated in the
+ * background" message, which is worse than a generic line of ours: it is
+ * unattributable, unclickable, and it teaches people the icon means nothing.
+ */
+async function present(payload) {
+  const path = destination(payload);
+  const kind = payload?.kind === "approval" ? "approval" : "message";
+  const generic =
+    kind === "approval"
+      ? { title: "An approval needs you", body: "Open Lepidy to answer it." }
+      : { title: "Lepidy", body: "Something is waiting for you." };
+
+  let shown = generic;
+  if (typeof payload?.id === "string") {
+    try {
+      const response = await fetch(
+        `/api/push/render?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(payload.id)}`,
+        { credentials: "same-origin", cache: "no-store" },
+      );
+      if (response.ok) {
+        const rendered = await response.json();
+        if (typeof rendered?.title === "string" && typeof rendered?.body === "string") {
+          shown = { title: rendered.title, body: rendered.body };
+        }
+      }
+      // A 401, a 404 or an offline device all land on the generic line. Each is
+      // a case where showing a preview would be wrong rather than merely
+      // unavailable: signed out, no longer visible, or unverifiable.
+    } catch {
+      // Offline. The generic notification still carries the destination.
+    }
+  }
+
+  await self.registration.showNotification(shown.title, {
+    body: shown.body,
+    icon: "/icon-192.png",
+    badge: "/icon-192.png",
+    // One tag per subject, so a re-sent push replaces its own notification
+    // rather than stacking a second copy of the same thing.
+    tag: `lepidy:${kind}:${payload?.id ?? "unknown"}`,
+    renotify: kind === "approval",
+    requireInteraction: kind === "approval",
+    data: { path, kind, id: payload?.id ?? null },
+  });
+}
+
+self.addEventListener("push", (event) => {
+  let payload = null;
+  try {
+    payload = event.data ? event.data.json() : null;
+  } catch {
+    // A payload we cannot parse is still a push somebody sent. Show the generic
+    // notification rather than nothing.
+  }
+  event.waitUntil(present(payload));
+});
+
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const path = destination(event.notification.data);

@@ -172,3 +172,88 @@ test("PWA-INT-005 never promises a notification will arrive", async ({ page }) =
   await expect(panel).toContainText("nothing is lost");
   await expect(panel.locator("button")).toHaveCount(0);
 });
+
+test("PWA-INT-006 refuses a push subscription without a session or a CSRF token", async ({ page }) => {
+  // Both are state changes made with a cookie, so both carry a token. A signed
+  // out browser asking to be subscribed is not an error to log — it is a
+  // session that ended between the permission prompt and this request.
+  const anonymous = await page.request.post("/api/push/subscribe", {
+    data: { endpoint: "https://push.example.test/f/a", p256dh: "x", auth: "y" },
+  });
+  expect([401, 403]).toContain(anonymous.status());
+
+  await signUp(page, { ...freshAccount(), displayName: "Ada Ruiz", handle: "ada" });
+  await page.goto("/inbox");
+
+  // Signed in, but with no token: still refused, and refused before anything is
+  // stored.
+  const forged = await page.request.post("/api/push/subscribe", {
+    data: { endpoint: "https://push.example.test/f/a", p256dh: "x", auth: "y" },
+  });
+  expect(forged.status()).toBe(403);
+});
+
+test("PWA-INT-007 stores a real subscription and refuses a malformed one", async ({ page }) => {
+  await signUp(page, { ...freshAccount(), displayName: "Ada Ruiz", handle: "ada" });
+  await page.goto("/inbox");
+
+  const csrfToken = await page.evaluate(
+    () =>
+      (document.cookie.split("; ").find((entry) => entry.startsWith("lepidy_csrf=")) ?? "").split(
+        "=",
+      )[1] ?? "",
+  );
+  expect(csrfToken).not.toBe("");
+
+  // A real P-256 subscription, generated here so the scenario owns both halves.
+  const real = await page.evaluate(async () => {
+    const pair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, [
+      "deriveBits",
+    ]);
+    const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+    const encode = (bytes: Uint8Array) =>
+      btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    return {
+      endpoint: "https://push.example.test/f/browser",
+      p256dh: encode(raw),
+      auth: encode(crypto.getRandomValues(new Uint8Array(16))),
+    };
+  });
+
+  const stored = await page.request.post("/api/push/subscribe", {
+    data: { csrfToken, ...real },
+  });
+  expect(stored.ok(), await stored.text()).toBe(true);
+
+  // A key of the wrong length is one the encryption would fail on later, in an
+  // outbox retry loop, with nothing to point at. Refused here instead.
+  const malformed = await page.request.post("/api/push/subscribe", {
+    data: { csrfToken, ...real, auth: "c2hvcnQ" },
+  });
+  expect(malformed.status()).toBe(400);
+
+  // Plain http would be a push endpoint on the wire.
+  const insecure = await page.request.post("/api/push/subscribe", {
+    data: { csrfToken, ...real, endpoint: "http://push.example.test/f/browser" },
+  });
+  expect(insecure.status()).toBe(400);
+
+  // And stopping is idempotent, because a request to stop being notified must
+  // not fail because it had already been carried out.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const removed = await page.request.delete("/api/push/subscribe", {
+      data: { csrfToken, endpoint: real.endpoint },
+    });
+    expect(removed.ok()).toBe(true);
+  }
+});
+
+test("PWA-INT-008 says a deployment cannot push rather than failing silently", async ({ page }) => {
+  // No VAPID key is bound in the test environment, which is the state every
+  // development deployment is in. The browser has to be told that, or a person
+  // grants permission and waits forever for a notification nothing will send.
+  const response = await page.request.get("/api/push/key");
+  expect(response.status()).toBe(503);
+  expect(await response.json()).toMatchObject({ error: expect.stringContaining("not configured") });
+});
+

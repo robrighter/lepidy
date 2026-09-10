@@ -1425,6 +1425,28 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
        END`,
     ],
   },
+  {
+    version: 34,
+    name: "web push subscriptions",
+    statements: [
+      // One row per browser, not per person: somebody signed in on a laptop and
+      // a phone has two, and an approval has to reach whichever one they are
+      // holding. The endpoint is unique because that is what the push service
+      // considers the subscription's identity, and re-subscribing the same
+      // browser must replace rather than accumulate.
+      `CREATE TABLE push_subscriptions (
+         id TEXT PRIMARY KEY,
+         member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+         endpoint TEXT NOT NULL UNIQUE,
+         p256dh TEXT NOT NULL,
+         auth TEXT NOT NULL,
+         created_at INTEGER NOT NULL,
+         last_success_at INTEGER,
+         last_error TEXT
+       ) STRICT`,
+      `CREATE INDEX push_subscriptions_member_idx ON push_subscriptions(member_id)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {
