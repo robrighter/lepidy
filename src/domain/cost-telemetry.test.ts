@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { forecastMonthly, normalizeUsageDelta, PUBLISHED_RESOURCE_LIMITS, usageBucket } from "./cost-telemetry";
+import { forecastMonthly, limitUtilization, normalizeUsageDelta, PUBLISHED_RESOURCE_LIMITS, runnerIdleMs, usageBucket } from "./cost-telemetry";
 
 describe("cost telemetry", () => {
   it("rolls events into stable five-minute buckets", () => {
@@ -24,5 +24,12 @@ describe("cost telemetry", () => {
     expect(PUBLISHED_RESOURCE_LIMITS.humansPerWorkspace).toBe(50);
     expect(PUBLISHED_RESOURCE_LIMITS.concurrentWorkspaceSockets).toBe(500);
     expect(PUBLISHED_RESOURCE_LIMITS.concurrentRunsPerDevice).toBe(4);
+  });
+
+  it("measures idle runner time separately and grades limit pressure", () => {
+    expect(runnerIdleMs(normalizeUsageDelta({ runnerConnectedMs: 10_000, runnerActiveMs: 2_500 }))).toBe(7_500);
+    expect(limitUtilization(79, 100)).toEqual({ percent: 79, severity: "ok" });
+    expect(limitUtilization(80, 100).severity).toBe("warning");
+    expect(limitUtilization(100, 100).severity).toBe("critical");
   });
 });

@@ -62,6 +62,7 @@ export async function handleFileTransferRequest(env: ShellEnvironment, request: 
     }
     const object = await env.FILES.get(authorized.objectKey);
     if (object === null) return refusal("Not found", 404);
+    await stub.recordUsage({ at: Date.now(), delta: { requests: 1, r2Reads: 1 } });
     return new Response(object.body, {
       headers: {
         // Never the stored media type on a download: serving attacker-supplied
@@ -102,6 +103,7 @@ export async function handleFileTransferRequest(env: ShellEnvironment, request: 
     httpMetadata: { contentDisposition: "attachment" },
   });
   if (stored === null) return refusal("Upload failed", 502);
+  await stub.recordUsage({ at: Date.now(), delta: { requests: 1, r2Writes: 1 } });
   await digested;
   const sha256 = [...new Uint8Array(await digest.digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   if (stored.size !== declared) {

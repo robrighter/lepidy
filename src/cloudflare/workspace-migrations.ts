@@ -1582,6 +1582,13 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX resource_limit_events_time_idx ON resource_limit_events(occurred_at DESC)`,
     ],
   },
+  {
+    version: 38,
+    name: "runner active cost telemetry",
+    statements: [
+      `ALTER TABLE usage_buckets ADD COLUMN runner_active_ms INTEGER NOT NULL DEFAULT 0 CHECK (runner_active_ms >= 0)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

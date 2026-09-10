@@ -12,6 +12,7 @@ export const PUBLISHED_RESOURCE_LIMITS = Object.freeze({
 export type UsageDelta = {
   requests?: number; rowsRead?: number; rowsWritten?: number; cpuMs?: number;
   activeMs?: number; socketConnectedMs?: number; runnerConnectedMs?: number;
+  runnerActiveMs?: number;
   queueMessages?: number; r2Reads?: number; r2Writes?: number; r2StoredByteMs?: number;
 };
 
@@ -26,13 +27,23 @@ export function normalizeUsageDelta(delta: UsageDelta): UsageTotals {
   const result = {
     requests: delta.requests ?? 0, rowsRead: delta.rowsRead ?? 0, rowsWritten: delta.rowsWritten ?? 0,
     cpuMs: delta.cpuMs ?? 0, activeMs: delta.activeMs ?? 0, socketConnectedMs: delta.socketConnectedMs ?? 0,
-    runnerConnectedMs: delta.runnerConnectedMs ?? 0, queueMessages: delta.queueMessages ?? 0,
+    runnerConnectedMs: delta.runnerConnectedMs ?? 0, runnerActiveMs: delta.runnerActiveMs ?? 0, queueMessages: delta.queueMessages ?? 0,
     r2Reads: delta.r2Reads ?? 0, r2Writes: delta.r2Writes ?? 0, r2StoredByteMs: delta.r2StoredByteMs ?? 0,
   };
   for (const [name, value] of Object.entries(result)) {
     if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${name} usage must be a non-negative whole number`);
   }
   return result;
+}
+
+export function runnerIdleMs(usage: UsageTotals): number {
+  return Math.max(0, usage.runnerConnectedMs - usage.runnerActiveMs);
+}
+
+export function limitUtilization(observed: number, limit: number): { percent: number; severity: "ok" | "warning" | "critical" } {
+  if (!Number.isSafeInteger(observed) || observed < 0 || !Number.isSafeInteger(limit) || limit <= 0) throw new Error("limit utilization is invalid");
+  const percent = Math.round(observed / limit * 100);
+  return { percent, severity: percent >= 100 ? "critical" : percent >= 80 ? "warning" : "ok" };
 }
 
 /** Marginal Cloudflare estimate from HLD §13; observed counters remain separately visible. */

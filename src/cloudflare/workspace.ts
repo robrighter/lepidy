@@ -34,7 +34,7 @@ import {
   type RetentionSweepReport,
 } from "./workspace-scheduler";
 import type { AuditChainVerification, AuditEntryInput, StoredAuditEntry } from "../domain/audit-chain";
-import { forecastMonthly, normalizeUsageDelta, usageBucket, type UsageDelta, type UsageTotals } from "../domain/cost-telemetry";
+import { forecastMonthly, normalizeUsageDelta, PUBLISHED_RESOURCE_LIMITS, runnerIdleMs, usageBucket, type UsageDelta, type UsageTotals } from "../domain/cost-telemetry";
 import {
   DAY_MS,
   HOUR_MS,
@@ -1369,31 +1369,43 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const value = normalizeUsageDelta(input.delta);
     this.ctx.storage.sql.exec(
       `INSERT INTO usage_buckets(bucket_at, requests, rows_read, rows_written, cpu_ms, active_ms, socket_connected_ms,
-         runner_connected_ms, queue_messages, r2_reads, r2_writes, r2_stored_byte_ms, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         runner_connected_ms, runner_active_ms, queue_messages, r2_reads, r2_writes, r2_stored_byte_ms, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(bucket_at) DO UPDATE SET requests = requests + excluded.requests, rows_read = rows_read + excluded.rows_read,
          rows_written = rows_written + excluded.rows_written, cpu_ms = cpu_ms + excluded.cpu_ms, active_ms = active_ms + excluded.active_ms,
          socket_connected_ms = socket_connected_ms + excluded.socket_connected_ms, runner_connected_ms = runner_connected_ms + excluded.runner_connected_ms,
+         runner_active_ms = runner_active_ms + excluded.runner_active_ms,
          queue_messages = queue_messages + excluded.queue_messages, r2_reads = r2_reads + excluded.r2_reads,
          r2_writes = r2_writes + excluded.r2_writes, r2_stored_byte_ms = r2_stored_byte_ms + excluded.r2_stored_byte_ms,
          updated_at = excluded.updated_at`,
       bucket, value.requests, value.rowsRead, value.rowsWritten, value.cpuMs, value.activeMs, value.socketConnectedMs,
-      value.runnerConnectedMs, value.queueMessages, value.r2Reads, value.r2Writes, value.r2StoredByteMs, input.at,
+      value.runnerConnectedMs, value.runnerActiveMs, value.queueMessages, value.r2Reads, value.r2Writes, value.r2StoredByteMs, input.at,
     );
   }
 
-  usageReport(input: { actor: Actor; from: number; to: number }): { observed: UsageTotals; forecast: ReturnType<typeof forecastMonthly>; bucketCount: number } {
-    this.authorizeActor(input.actor);
+  usageReport(input: { actor: Actor; from: number; to: number }): { observed: UsageTotals; storageBytes: number; runnerIdleMs: number; forecast: ReturnType<typeof forecastMonthly>; limits: typeof PUBLISHED_RESOURCE_LIMITS; limitEvents: Array<{ kind: string; observed: number; limit: number; occurredAt: number }>; bucketCount: number } {
+    const actor = this.authorizeActor(input.actor);
+    if (actor.role !== "owner" && actor.role !== "admin") throw new Error("usage reports require workspace administration");
     if (!Number.isSafeInteger(input.from) || !Number.isSafeInteger(input.to) || input.from < 0 || input.to <= input.from) throw new Error("usage range is invalid");
     const rows = this.ctx.storage.sql.exec<Record<string, number>>(`SELECT requests, rows_read, rows_written, cpu_ms, active_ms, socket_connected_ms,
-      runner_connected_ms, queue_messages, r2_reads, r2_writes, r2_stored_byte_ms FROM usage_buckets WHERE bucket_at >= ? AND bucket_at < ?`, input.from, input.to).toArray();
+      runner_connected_ms, runner_active_ms, queue_messages, r2_reads, r2_writes, r2_stored_byte_ms FROM usage_buckets WHERE bucket_at >= ? AND bucket_at < ?`, input.from, input.to).toArray();
     const observed = normalizeUsageDelta(rows.reduce<UsageDelta>((sum, row) => ({
       requests: (sum.requests ?? 0) + row.requests, rowsRead: (sum.rowsRead ?? 0) + row.rows_read, rowsWritten: (sum.rowsWritten ?? 0) + row.rows_written,
       cpuMs: (sum.cpuMs ?? 0) + row.cpu_ms, activeMs: (sum.activeMs ?? 0) + row.active_ms, socketConnectedMs: (sum.socketConnectedMs ?? 0) + row.socket_connected_ms,
-      runnerConnectedMs: (sum.runnerConnectedMs ?? 0) + row.runner_connected_ms, queueMessages: (sum.queueMessages ?? 0) + row.queue_messages,
+      runnerConnectedMs: (sum.runnerConnectedMs ?? 0) + row.runner_connected_ms, runnerActiveMs: (sum.runnerActiveMs ?? 0) + row.runner_active_ms, queueMessages: (sum.queueMessages ?? 0) + row.queue_messages,
       r2Reads: (sum.r2Reads ?? 0) + row.r2_reads, r2Writes: (sum.r2Writes ?? 0) + row.r2_writes, r2StoredByteMs: (sum.r2StoredByteMs ?? 0) + row.r2_stored_byte_ms,
     }), {}));
-    return { observed, forecast: forecastMonthly(observed, input.to - input.from), bucketCount: rows.length };
+    const limitEvents = this.ctx.storage.sql.exec<{ kind: string; observed: number; limit_value: number; occurred_at: number }>(
+      "SELECT kind, observed, limit_value, occurred_at FROM resource_limit_events WHERE occurred_at >= ? AND occurred_at < ? ORDER BY occurred_at DESC LIMIT 200", input.from, input.to,
+    ).toArray().map((row) => ({ kind: row.kind, observed: row.observed, limit: row.limit_value, occurredAt: row.occurred_at }));
+    const storageBytes = this.ctx.storage.sql.exec<{ bytes: number }>(
+      "SELECT COALESCE(SUM(byte_length), 0) AS bytes FROM files WHERE state = 'stored'",
+    ).one().bytes;
+    return { observed, storageBytes, runnerIdleMs: runnerIdleMs(observed), forecast: forecastMonthly(observed, input.to - input.from), limits: PUBLISHED_RESOURCE_LIMITS, limitEvents, bucketCount: rows.length };
+  }
+
+  private recordLimitEvent(kind: string, observed: number, limit: number, at: number): void {
+    this.ctx.storage.sql.exec("INSERT INTO resource_limit_events(kind, observed, limit_value, occurred_at) VALUES (?, ?, ?, ?)", kind, observed, limit, at);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -1412,6 +1424,11 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     }
     const since = Number(url.searchParams.get("since") ?? "0");
     const now = Date.now();
+    const socketCount = this.ctx.getWebSockets().length;
+    if (socketCount >= PUBLISHED_RESOURCE_LIMITS.concurrentWorkspaceSockets) {
+      this.recordLimitEvent("concurrent_workspace_sockets", socketCount + 1, PUBLISHED_RESOURCE_LIMITS.concurrentWorkspaceSockets, now);
+      return new Response("Workspace connection limit reached", { status: 429 });
+    }
     const pair = new WebSocketPair();
     // The tag is how a woken socket is recognised after hibernation; the
     // attachment carries the rest and survives with it.
@@ -3128,9 +3145,14 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   webSocketClose(socket: WebSocket): void {
     // A runner going away is not a presence change; it is a machine that will
     // collect its pending wakes when it comes back.
-    if (this.runnerAttachmentOf(socket) !== null) return;
+    const runner = this.runnerAttachmentOf(socket);
+    if (runner !== null) {
+      this.recordUsage({ at: Date.now(), delta: { runnerConnectedMs: Math.max(0, Date.now() - runner.connectedAt) } });
+      return;
+    }
     const attachment = this.attachmentOf(socket);
     if (attachment === null) return;
+    this.recordUsage({ at: Date.now(), delta: { socketConnectedMs: Math.max(0, Date.now() - attachment.connectedAt) } });
     if (this.socketsFor(attachment.memberId).length <= 1) {
       this.broadcastPresence(attachment.memberId, false);
     }
@@ -7000,17 +7022,17 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const resultJson = JSON.stringify(input.result ?? {});
     if (resultJson.length > 16_000) throw new Error("completion result is too large");
     const proof = await this.authorizeAgentLease(input, "agent_complete", true);
-    return this.ctx.storage.transactionSync(() => {
+    const outcome = this.ctx.storage.transactionSync(() => {
       const existing = this.ctx.storage.sql
-        .exec<{ completion_id: string | null; completion_digest: string | null; completed_at: number | null }>(
-          "SELECT completion_id, completion_digest, completed_at FROM agent_queue WHERE id = ? AND agent_id = ?",
+        .exec<{ completion_id: string | null; completion_digest: string | null; completed_at: number | null; execution_started_at: number | null }>(
+          "SELECT completion_id, completion_digest, completed_at, execution_started_at FROM agent_queue WHERE id = ? AND agent_id = ?",
           input.itemId,
           proof.agent.id,
         )
         .one();
       if (existing.completed_at !== null) {
         if (existing.completion_id === input.completionId && existing.completion_digest === input.outputDigest) {
-          return { completedAt: existing.completed_at, replayed: true };
+          return { completedAt: existing.completed_at, replayed: true, activeMs: 0 };
         }
         throw new Error("completion id or digest conflicts with the recorded result");
       }
@@ -7058,8 +7080,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         },
         input.now,
       );
-      return { completedAt: input.now, replayed: false };
+      return { completedAt: input.now, replayed: false, activeMs: Math.max(0, input.now - (existing.execution_started_at ?? input.now)) };
     });
+    if (outcome.activeMs > 0) this.recordUsage({ at: input.now, delta: { runnerActiveMs: outcome.activeMs } });
+    return { completedAt: outcome.completedAt, replayed: outcome.replayed };
   }
 
   async postMcpMessage(input: {
@@ -12467,6 +12491,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     },
     apply: () => { result: T; effects?: MutationEffects },
   ): Promise<MutationOutcome<T>> {
+    const measurementStartedAt = Date.now();
     const schema = readWorkspaceSchema(this.ctx.storage);
     if (schema.status !== "ready") throw new Error("workspace is quarantined");
 
@@ -12533,7 +12558,16 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     // committed, never inside it. A rolled-back transaction must not leave a
     // machine having been told about work that does not exist.
     this.flushStagedRunnerWakes(input.now);
-    return { ...committed, alarmAt: await this.armAlarm() };
+    const alarmAt = await this.armAlarm();
+    // Logical counters are deliberately sampled at the common mutation boundary:
+    // one bucket update covers many operations instead of turning telemetry into
+    // the dominant write load it is intended to reveal.
+    this.recordUsage({ at: input.now, delta: {
+      requests: 1,
+      rowsWritten: committed.replayed ? 0 : 1 + committed.outboxQueued + (committed.audit === null ? 0 : 1),
+      activeMs: Math.max(1, Date.now() - measurementStartedAt),
+    } });
+    return { ...committed, alarmAt };
   }
 
   /** Add or advance multiplexed deadlines and re-point the object's one alarm. */
@@ -12570,6 +12604,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
    * without stalling the other deadlines sharing this alarm.
    */
   async runDueWork(now: number, dispatcher?: OutboxDispatcher): Promise<DueWorkReport> {
+    const measurementStartedAt = Date.now();
     const claimed = claimDueWork(this.ctx.storage, now, DUE_WORK_BATCH_SIZE);
     const processed: string[] = [];
     const failed: { id: string; kind: string; error: string; retried: boolean }[] = [];
@@ -12670,7 +12705,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       );
     }
 
-    return {
+    const report = {
       now,
       processed,
       failed,
@@ -12682,6 +12717,13 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       storage,
       alarmAt: await this.armAlarm(),
     };
+    this.recordUsage({ at: now, delta: {
+      requests: 1,
+      rowsWritten: processed.length + failed.length + outbox.attempted,
+      queueMessages: outbox.attempted,
+      activeMs: Math.max(1, Date.now() - measurementStartedAt),
+    } });
+    return report;
   }
 
   /**
