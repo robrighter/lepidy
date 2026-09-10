@@ -183,6 +183,16 @@ Push delivery needs two platform secret bindings: `VAPID_PRIVATE_JWK`, a P-256 J
 
 **Lepidy never promises a notification will arrive.** Permission belongs to the browser and to the operating system underneath it, both of which can refuse, silence or drop one for reasons the application cannot see. Every state of the permission surface names the Inbox as where things wait instead, and the denied state offers no button, because a browser that has been told no does not re-prompt.
 
+## Deleting a workspace
+
+Deleting a workspace needs owner authority, the workspace's own name typed out, and a verified gesture — all three, because it is the only action in the product with no recovery path. The workspace becomes inaccessible immediately and stays recoverable for seven days; a separate **purge now**, with its own confirmation and gesture, skips that window.
+
+The purge runs one stage at a time with a checkpoint after each, so an interrupted one resumes rather than restarting, and routing goes last because a workspace whose routing is gone is one nothing can reach — including the purge that had not finished. It ends in a receipt carrying ids, counts and a digest, and nothing else: no channel names, no handles, no message counts by room. A test reads `sqlite_master` and fails if any table is neither purged nor deliberately kept, which is what catches a future migration adding a table nobody thought to purge.
+
+Two long-standing guards stay guards. The audit log's append-only delete trigger and the last-owner trigger both refuse a purge by default; the purge earns its way past each through recorded state — an audit retention release, and a started purge — rather than by dropping the trigger. A Solo purge never claims to have erased the designated computer or a backup somebody made of it.
+
+Deleted attachments and abandoned uploads are given back to R2 by an hourly sweep, so D07's 24-hour deadline is met even when a sweep fails.
+
 ## Desktop shell
 
 Run `npm run desktop:dev` after installing the Tauri system prerequisites. The desktop window follows the current Slipchat platform pattern:

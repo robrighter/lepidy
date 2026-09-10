@@ -36,12 +36,24 @@ import {
 import type { AuditChainVerification, AuditEntryInput, StoredAuditEntry } from "../domain/audit-chain";
 import {
   DAY_MS,
+  HOUR_MS,
   DUE_WORK_BATCH_SIZE,
   OUTBOX_BATCH_SIZE,
   RETENTION_MS,
   redactedError,
 } from "../domain/due-work";
 import { parseIdempotencyKey } from "../domain/idempotency-key";
+import {
+  assertReceiptCarriesNoContent,
+  authorizePurge,
+  nextPurgeStage,
+  planDeletion,
+  PURGE_TABLES,
+  receiptVerification,
+  type DeletionReceipt,
+  type PurgeProgress,
+  type PurgeStage,
+} from "../domain/tenant-lifecycle";
 import {
   assertMetadataOnly,
   buildPushPayload,
@@ -431,6 +443,8 @@ export type DueWorkReport = {
   anchor: AuditAnchor | null;
   scheduledSends: { sent: number; failed: number };
   approvals: { expired: number };
+  /** Attachment objects given back to R2: abandoned reservations, then deletes. */
+  storage: { abandoned: number; reclaimed: number };
   alarmAt: number | null;
 };
 
@@ -444,6 +458,14 @@ export type SchedulerState = {
 
 /** Recurring work every workspace owns from the moment it exists. */
 export const RETENTION_SWEEP_WORK_ID = "system:retention_sweep";
+/**
+ * Giving back storage that deleted and abandoned attachments still occupy.
+ *
+ * Hourly rather than daily: D07 gives a deleted object 24 hours to follow its
+ * row out, and a daily sweep would meet that deadline only if it never failed
+ * and never fell behind. Hourly means a stalled sweep has 23 more chances.
+ */
+export const STORAGE_RECLAIM_WORK_ID = "system:storage_reclaim";
 export const AUDIT_ANCHOR_WORK_ID = "system:audit_anchor";
 export const OUTBOX_FLUSH_WORK_ID = "system:outbox_flush";
 /** One row for every pending card, re-armed at the earliest expiry. */
@@ -1296,6 +1318,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           ctx.storage,
           [
             { id: RETENTION_SWEEP_WORK_ID, kind: "retention_sweep", dueAt: now + DAY_MS, intervalMs: DAY_MS },
+            {
+              id: STORAGE_RECLAIM_WORK_ID,
+              kind: "storage_reclaim",
+              dueAt: now + HOUR_MS,
+              intervalMs: HOUR_MS,
+            },
             { id: AUDIT_ANCHOR_WORK_ID, kind: "audit_anchor", dueAt: now + DAY_MS, intervalMs: DAY_MS },
             { id: RUNTIME_RECONCILIATION_WORK_ID, kind: "runtime_reconciliation", dueAt: now + DAY_MS, intervalMs: DAY_MS },
           ],
@@ -10884,6 +10912,12 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   private authorizeActor(actor: Actor): ActiveMember {
     const schema = readWorkspaceSchema(this.ctx.storage);
     if (schema.status !== "ready") throw new Error("workspace is quarantined");
+    // "The workspace becomes inaccessible immediately" (D07 §2). Enforced here
+    // because this is the one function every authorised read and write in this
+    // object passes through — a check in each caller would be a check some
+    // future caller forgets, and the surface it would forget on is the one
+    // holding a company's messages after they asked for them to be gone.
+    this.requireNotDeleting();
     if (!this.authorizeMember(actor.memberId, actor.authorizationEpoch)) {
       throw new Error("member is not authorized for this workspace");
     }
@@ -10894,6 +10928,366 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       )
       .one();
     return { id: row.id, handle: row.handle, displayName: row.display_name, role: row.role };
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Deleting this workspace (O01a)                                            */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Ask for this workspace to be deleted.
+   *
+   * Owner authority, the workspace's own name typed out, and a verified
+   * gesture. All three, because this is the only action in the product with no
+   * recovery path: a revoked grant can be granted again and an offboarded
+   * member re-invited, but a purged workspace is a company's conversations,
+   * attachments and credential ciphertext gone, and no authority afterwards
+   * brings any of it back.
+   *
+   * The workspace becomes inaccessible the moment this returns — `authorizeActor`
+   * refuses from here on — and stays recoverable for seven days.
+   */
+  async requestWorkspaceDeletion(input: {
+    actor: Actor;
+    slug: string;
+    confirmation: string;
+    stepUp?: { verified: boolean };
+    now: number;
+  }): Promise<{ requestId: string; purgeAfter: number }> {
+    const actor = this.authorizeActor(input.actor);
+    if (actor.role !== "owner") throw new Error("only an owner may delete a workspace");
+    const planned = planDeletion({
+      workspaceId: this.workspaceKey(),
+      requestedByMemberId: actor.id,
+      slug: input.slug,
+      confirmation: input.confirmation,
+      stepUpVerified: input.stepUp?.verified === true,
+      now: input.now,
+    });
+    const requestId = `del_${crypto.randomUUID()}`;
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO workspace_deletion(singleton, request_id, requested_by_member_id, requested_at, purge_after)
+         VALUES (1, ?, ?, ?, ?)`,
+        requestId, planned.requestedByMemberId, planned.requestedAt, planned.purgeAfter,
+      );
+      appendAuditEntry(this.ctx.storage, this.workspaceKey(), {
+        eventType: "workspace.deletion_requested",
+        outcome: "allowed",
+        requesterKind: "member",
+        requesterId: actor.id,
+        subjectKind: "workspace",
+        subjectId: this.workspaceKey(),
+        metadata: { request_id: requestId, purge_after: planned.purgeAfter },
+      }, input.now);
+    });
+    return { requestId, purgeAfter: planned.purgeAfter };
+  }
+
+  /**
+   * Call it off, inside the window.
+   *
+   * Deliberately reachable while the workspace is otherwise inaccessible: the
+   * seven days exist so a mistake can be noticed, and a cancellation that
+   * needed the very access the deletion revoked would be a window nobody could
+   * use. It refuses once the purge has started, because by then there is
+   * nothing left to come back to.
+   */
+  cancelWorkspaceDeletion(input: { actorMemberId: string; now: number }): { cancelled: true } {
+    const pending = this.deletionRow();
+    if (pending === null) throw new Error("this workspace is not being deleted");
+    if (pending.purge_started_at !== null) {
+      throw new Error("the purge has already begun and cannot be called off");
+    }
+    // Authority is read directly rather than through `authorizeActor`, which
+    // now refuses every caller on a deleting workspace. The member still has to
+    // be an active owner.
+    const owner = this.ctx.storage.sql
+      .exec<{ role: string; status: string }>(
+        "SELECT role, status FROM members WHERE id = ?",
+        input.actorMemberId,
+      )
+      .toArray()[0];
+    if (!owner || owner.role !== "owner" || owner.status !== "active") {
+      throw new Error("only an active owner may call off a deletion");
+    }
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM workspace_deletion WHERE singleton = 1");
+      appendAuditEntry(this.ctx.storage, this.workspaceKey(), {
+        eventType: "workspace.deletion_cancelled",
+        outcome: "allowed",
+        requesterKind: "member",
+        requesterId: input.actorMemberId,
+        subjectKind: "workspace",
+        subjectId: this.workspaceKey(),
+        metadata: { request_id: pending.request_id },
+      }, input.now);
+    });
+    return { cancelled: true };
+  }
+
+  /** What a caller needs to decide whether the purge may run. */
+  workspaceDeletionState(): {
+    pending: boolean;
+    requestId: string | null;
+    purgeAfter: number | null;
+    purgeStartedAt: number | null;
+    completedAt: number | null;
+    stages: readonly PurgeProgress[];
+  } {
+    const row = this.deletionRow();
+    return {
+      pending: row !== null,
+      requestId: row?.request_id ?? null,
+      purgeAfter: row?.purge_after ?? null,
+      purgeStartedAt: row?.purge_started_at ?? null,
+      completedAt: row?.completed_at ?? null,
+      stages: this.ctx.storage.sql
+        .exec<{ stage: PurgeStage; removed: number; completed_at: number }>(
+          "SELECT stage, removed, completed_at FROM purge_stages",
+        )
+        .toArray()
+        .map((entry) => ({ stage: entry.stage, removed: entry.removed, completedAt: entry.completed_at })),
+    };
+  }
+
+  /**
+   * Destroy this workspace's contents, one stage at a time.
+   *
+   * Resumable and idempotent: each stage records a checkpoint, and a purge
+   * interrupted anywhere continues from the stage it had not finished. Every
+   * stage would be safe to repeat — they all delete by predicate — but a purge
+   * that began again from the top on each alarm would never reach the end of a
+   * workspace large enough to matter.
+   *
+   * Routing is last, and that ordering is the one that carries weight: a
+   * workspace whose routing is gone is one nothing can reach, including the
+   * purge that had not finished.
+   *
+   * There is no actor here on purpose. The authority was spent when the
+   * deletion was requested — owner role, the workspace's own name typed out and
+   * a verified gesture — and this is the scheduled consequence of that
+   * decision, called by the control plane rather than by a person. Asking for
+   * authority again would mean a purge could only run while somebody was
+   * watching, which is the opposite of what a seven-day window is for.
+   */
+  async purgeWorkspace(input: {
+    now: number;
+    /**
+     * Supplied rather than read: residency is a control-plane fact, chosen when
+     * the workspace was created and bound to the provider resources it lives
+     * on. This object does not know it and must not guess — a receipt claiming
+     * the wrong jurisdiction is worse than one that omits it.
+     */
+    jurisdiction: string;
+    skipWindow?: { confirmation: string; slug: string; stepUpVerified: boolean };
+  }): Promise<{ status: "window_open" | "in_progress" | "complete"; receipt: DeletionReceipt | null }> {
+    const pending = this.deletionRow();
+    if (pending === null) throw new Error("this workspace is not being deleted");
+    if (pending.completed_at !== null) {
+      const receipt = this.ctx.storage.sql
+        .exec<{ receipt_json: string | null }>("SELECT receipt_json FROM workspace_deletion WHERE singleton = 1")
+        .one().receipt_json;
+      return { status: "complete", receipt: receipt === null ? null : (JSON.parse(receipt) as DeletionReceipt) };
+    }
+
+    const authorized = authorizePurge({
+      request: {
+        workspaceId: this.workspaceKey(),
+        requestedByMemberId: pending.requested_by_member_id,
+        requestedAt: pending.requested_at,
+        purgeAfter: pending.purge_after,
+      },
+      now: input.now,
+      skipWindow: input.skipWindow,
+    });
+    if (!authorized.allowed) return { status: "window_open", receipt: null };
+
+    if (pending.purge_started_at === null) {
+      this.ctx.storage.sql.exec(
+        "UPDATE workspace_deletion SET purge_started_at = ? WHERE singleton = 1",
+        input.now,
+      );
+    }
+
+    const completed = this.ctx.storage.sql
+      .exec<{ stage: PurgeStage }>("SELECT stage FROM purge_stages")
+      .toArray()
+      .map((row) => row.stage);
+    const stage = nextPurgeStage(completed);
+    if (stage !== null) {
+      const removed = await this.runPurgeStage(stage, input.now);
+      this.ctx.storage.sql.exec(
+        "INSERT INTO purge_stages(stage, removed, completed_at) VALUES (?, ?, ?) ON CONFLICT(stage) DO NOTHING",
+        stage, removed, input.now,
+      );
+      if (nextPurgeStage([...completed, stage]) !== null) {
+        return { status: "in_progress", receipt: null };
+      }
+    }
+
+    const stages = this.ctx.storage.sql
+      .exec<{ stage: PurgeStage; removed: number }>("SELECT stage, removed FROM purge_stages")
+      .toArray()
+      .map((row) => ({ stage: row.stage, removed: row.removed }));
+    const receipt: DeletionReceipt = {
+      workspaceId: this.workspaceKey(),
+      requestId: pending.request_id,
+      requestedAt: pending.requested_at,
+      completedAt: input.now,
+      jurisdiction: input.jurisdiction,
+      stages,
+      verification: await receiptVerification(this.workspaceKey(), stages),
+    };
+    // Checked rather than trusted. This artefact outlives the workspace, which
+    // makes it the most tempting place to keep "just the channel names".
+    assertReceiptCarriesNoContent(receipt);
+    this.ctx.storage.sql.exec(
+      "UPDATE workspace_deletion SET completed_at = ?, receipt_json = ? WHERE singleton = 1",
+      input.now, JSON.stringify(receipt),
+    );
+    return { status: "complete", receipt };
+  }
+
+  /**
+   * One stage of the purge.
+   *
+   * Every branch deletes by predicate rather than by a list gathered earlier,
+   * which is what makes a repeated stage harmless and an interrupted one safe.
+   * The counts are what the receipt is built from, so they are the number of
+   * rows actually removed rather than the number found.
+   */
+  private async runPurgeStage(stage: PurgeStage, now: number): Promise<number> {
+    let removed = 0;
+    if (stage === "attachments") {
+      // The objects first, then the rows. A row removed before its object would
+      // leave an object nothing knows the key of — an orphan in a bucket
+      // somebody is billed for, which no later sweep could ever find.
+      removed += await this.reclaimObjects(
+        this.ctx.storage.sql
+          .exec<{ object_key: string }>("SELECT object_key FROM files")
+          .toArray()
+          .map((row) => row.object_key),
+      );
+    }
+    if (stage === "audit") {
+      // The audit log is append-only and its delete trigger refuses anything
+      // above the released sequence, so that an operator cannot quietly drop
+      // recent evidence (F06). A purge is the one legitimate reason to remove
+      // all of it, and it earns that by going through the same release the
+      // retention sweep uses rather than by dropping the trigger — the guard
+      // stays a guard, and the release is a record that this happened.
+      const last = this.ctx.storage.sql
+        .exec<{ sequence: number | null }>("SELECT MAX(sequence) AS sequence FROM audit_events")
+        .one().sequence;
+      if (last !== null) {
+        this.ctx.storage.sql.exec(
+          "UPDATE audit_retention SET release_through_sequence = ?, updated_at = ? WHERE singleton = 1",
+          last, now,
+        );
+      }
+    }
+    for (const table of PURGE_TABLES[stage]) {
+      // By predicate, not by a list gathered earlier: that is what makes a
+      // repeated stage harmless and an interrupted one safe to resume.
+      removed += this.ctx.storage.sql.exec(`DELETE FROM ${table}`).rowsWritten;
+    }
+    return removed;
+  }
+
+  /**
+   * Delete objects from R2, and report how many were actually removed.
+   *
+   * Missing keys are not an error: an object already gone is the state this is
+   * trying to reach, and treating it as a failure would stall a purge forever
+   * on a bucket somebody had already tidied by hand.
+   */
+  private async reclaimObjects(keys: readonly string[]): Promise<number> {
+    const bucket = this.env.FILES;
+    if (!bucket || keys.length === 0) return 0;
+    let reclaimed = 0;
+    // In batches, because `delete` accepts a list and one call per object on a
+    // workspace with thousands of attachments is thousands of round trips.
+    for (let index = 0; index < keys.length; index += 100) {
+      const batch = keys.slice(index, index + 100);
+      try {
+        await bucket.delete(batch);
+        reclaimed += batch.length;
+      } catch {
+        // Reported by the count rather than thrown: the caller records what was
+        // reclaimed, and the sweep will find whatever is left next time.
+      }
+    }
+    return reclaimed;
+  }
+
+  /**
+   * Give back the storage that deleted and abandoned attachments still occupy.
+   *
+   * Two populations, and they became garbage in different ways. An **abandoned
+   * upload** is a reservation whose transfer never completed — a closed laptop,
+   * a lost connection — and it holds quota against a workspace that has nothing
+   * to show for it. A **deleted attachment** had its access revoked in the same
+   * transaction that deleted its message; D07 gives the object 24 hours to
+   * follow, and this is what makes that true rather than aspirational.
+   *
+   * C08a implemented and tested both halves and left them unscheduled. This is
+   * the half that runs them.
+   */
+  async reclaimStorage(input: { now: number; limit?: number }): Promise<{
+    abandoned: number;
+    reclaimed: number;
+  }> {
+    const limit = Math.min(Math.max(input.limit ?? 200, 1), 500);
+    const abandoned = await this.sweepAbandonedUploads({ now: input.now, limit });
+
+    const pending = this.ctx.storage.sql
+      .exec<{ id: string; object_key: string }>(
+        `SELECT id, object_key FROM files
+         WHERE state = 'deleted' AND object_reclaimed_at IS NULL
+         ORDER BY deleted_at LIMIT ?`,
+        limit,
+      )
+      .toArray();
+    const reclaimed = await this.reclaimObjects(pending.map((row) => row.object_key));
+    // Marked after the delete, so an interrupted sweep retries rather than
+    // recording a reclamation that did not happen.
+    for (const row of pending) {
+      this.ctx.storage.sql.exec(
+        "UPDATE files SET object_reclaimed_at = ? WHERE id = ?",
+        input.now, row.id,
+      );
+    }
+    return { abandoned: abandoned.objectKeys.length, reclaimed };
+  }
+
+  /** The pending deletion, if this workspace has one. */
+  private deletionRow(): {
+    request_id: string;
+    requested_by_member_id: string;
+    requested_at: number;
+    purge_after: number;
+    purge_started_at: number | null;
+    completed_at: number | null;
+  } | null {
+    return (
+      this.ctx.storage.sql
+        .exec<{
+          request_id: string;
+          requested_by_member_id: string;
+          requested_at: number;
+          purge_after: number;
+          purge_started_at: number | null;
+          completed_at: number | null;
+        }>("SELECT * FROM workspace_deletion WHERE singleton = 1")
+        .toArray()[0] ?? null
+    );
+  }
+
+  private requireNotDeleting(): void {
+    if (this.deletionRow() !== null) {
+      throw new Error("this workspace is being deleted and is no longer accessible");
+    }
   }
 
   /**
@@ -11881,6 +12275,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     let anchor: AuditAnchor | null = null;
     let scheduledSends = { sent: 0, failed: 0 };
     let approvals = { expired: 0 };
+    let storage = { abandoned: 0, reclaimed: 0 };
 
     for (const item of claimed) {
       try {
@@ -11908,6 +12303,14 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                       value + retention![key as keyof RetentionSweepReport],
                     ]),
                   ) as RetentionSweepReport);
+            break;
+          }
+          case "storage_reclaim": {
+            const report = await this.reclaimStorage({ now });
+            storage = {
+              abandoned: storage.abandoned + report.abandoned,
+              reclaimed: storage.reclaimed + report.reclaimed,
+            };
             break;
           }
           case "scheduled_send": {
@@ -11969,6 +12372,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       anchor,
       scheduledSends,
       approvals,
+      storage,
       alarmAt: await this.armAlarm(),
     };
   }

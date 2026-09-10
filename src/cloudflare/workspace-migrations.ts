@@ -1447,6 +1447,82 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX push_subscriptions_member_idx ON push_subscriptions(member_id)`,
     ],
   },
+  {
+    version: 35,
+    name: "workspace deletion, purge checkpoints and object reclamation",
+    statements: [
+      // An attachment's row is marked deleted in the same transaction that
+      // revokes access to it; the object in R2 goes afterwards, on the
+      // scheduler, within 24 hours. This column is what makes that asynchronous
+      // half resumable and idempotent — an object already gone stays gone, and
+      // a sweep interrupted halfway does not lose track of the rest.
+      `ALTER TABLE files ADD COLUMN object_reclaimed_at INTEGER`,
+      `CREATE INDEX files_reclaim_idx ON files(deleted_at)
+         WHERE state = 'deleted' AND object_reclaimed_at IS NULL`,
+      // One request at a time, and it is a singleton for the same reason the
+      // schema version is: two concurrent deletions of one workspace is not a
+      // state with a sensible meaning.
+      `CREATE TABLE workspace_deletion (
+         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+         request_id TEXT NOT NULL,
+         requested_by_member_id TEXT NOT NULL,
+         requested_at INTEGER NOT NULL,
+         purge_after INTEGER NOT NULL,
+         purge_started_at INTEGER,
+         completed_at INTEGER,
+         receipt_json TEXT CHECK (receipt_json IS NULL OR json_valid(receipt_json))
+       ) STRICT`,
+      // Checkpoints, so an interrupted purge resumes rather than restarting.
+      // Restarting would be safe — every stage is idempotent — but a purge that
+      // began again from the top on every alarm would never reach the end on a
+      // workspace large enough to matter.
+      `CREATE TABLE purge_stages (
+         stage TEXT PRIMARY KEY,
+         removed INTEGER NOT NULL CHECK (removed >= 0),
+         completed_at INTEGER NOT NULL
+       ) STRICT`,
+      // The last-owner guard, re-stated with one exception.
+      //
+      // A workspace must never be left without an owner — that is what these
+      // triggers have protected since v3, and removing them to make a purge
+      // work would remove the protection every other day of the year. So the
+      // guard stays and the purge earns its way past it through recorded
+      // state: the exception applies only once a purge has actually started,
+      // which is itself gated by owner authority, the workspace's own name
+      // typed out, a verified gesture and a seven-day window. It is the same
+      // shape as the audit log's retention release, for the same reason.
+      //
+      // The invariant is unchanged in substance: a workspace is never left
+      // ownerless. A purged workspace is not left at all.
+      `DROP TRIGGER members_keep_last_owner_update`,
+      `DROP TRIGGER members_keep_last_owner_delete`,
+      `CREATE TRIGGER members_keep_last_owner_update
+       BEFORE UPDATE OF role, status ON members
+       WHEN OLD.role = 'owner' AND OLD.status = 'active'
+         AND (NEW.role <> 'owner' OR NEW.status <> 'active')
+         AND NOT EXISTS (
+           SELECT 1 FROM members other
+           WHERE other.id <> OLD.id AND other.role = 'owner' AND other.status = 'active'
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM workspace_deletion
+           WHERE singleton = 1 AND purge_started_at IS NOT NULL
+         )
+       BEGIN SELECT RAISE(ABORT, 'workspace requires an active owner'); END`,
+      `CREATE TRIGGER members_keep_last_owner_delete
+       BEFORE DELETE ON members
+       WHEN OLD.role = 'owner' AND OLD.status = 'active'
+         AND NOT EXISTS (
+           SELECT 1 FROM members other
+           WHERE other.id <> OLD.id AND other.role = 'owner' AND other.status = 'active'
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM workspace_deletion
+           WHERE singleton = 1 AND purge_started_at IS NOT NULL
+         )
+       BEGIN SELECT RAISE(ABORT, 'workspace requires an active owner'); END`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

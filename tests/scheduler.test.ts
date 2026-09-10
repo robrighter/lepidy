@@ -6,6 +6,7 @@ import {
   AUDIT_ANCHOR_WORK_ID,
   OUTBOX_FLUSH_WORK_ID,
   RETENTION_SWEEP_WORK_ID,
+  STORAGE_RECLAIM_WORK_ID,
   RUNTIME_RECONCILIATION_WORK_ID,
   type Workspace,
 } from "../src/cloudflare/workspace";
@@ -51,6 +52,7 @@ describe("workspace alarm scheduler", () => {
       "expiry.early",
       "expiry.middle",
       "expiry.late",
+      STORAGE_RECLAIM_WORK_ID,
       AUDIT_ANCHOR_WORK_ID,
       RETENTION_SWEEP_WORK_ID,
       RUNTIME_RECONCILIATION_WORK_ID,
@@ -70,6 +72,7 @@ describe("workspace alarm scheduler", () => {
     // The tenant's own recurring work is what remains.
     expect(third.alarmAt).toBeGreaterThan(base + 9_000);
     expect((await stub.schedulerState()).dueWork.map((item) => item.id)).toEqual([
+      STORAGE_RECLAIM_WORK_ID,
       AUDIT_ANCHOR_WORK_ID,
       RETENTION_SWEEP_WORK_ID,
       RUNTIME_RECONCILIATION_WORK_ID,
@@ -153,7 +156,9 @@ describe("workspace alarm scheduler", () => {
     );
     // Ten hours pass with the object evicted; one catch-up run, not ten.
     const report = await stub.runDueWork(base + 10 * 3_600_000 + 5);
-    expect(report.processed).toEqual(["sweep.hourly"]);
+    // The tenant's own hourly reclamation comes due in the same catch-up, and
+    // like the scenario's sweep it runs once rather than ten times.
+    expect(report.processed).toEqual(["sweep.hourly", STORAGE_RECLAIM_WORK_ID]);
 
     const state = await stub.schedulerState();
     expect(state.dueWork.find((item) => item.id === "sweep.hourly")).toMatchObject({
@@ -190,6 +195,7 @@ describe("workspace alarm scheduler", () => {
         expect(state.pendingOutbox).toBe(0);
         expect(state.deadOutbox).toBe(0);
         expect(state.dueWork.map((item) => item.id)).toEqual([
+          STORAGE_RECLAIM_WORK_ID,
           AUDIT_ANCHOR_WORK_ID,
           RETENTION_SWEEP_WORK_ID,
           RUNTIME_RECONCILIATION_WORK_ID,
