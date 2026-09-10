@@ -34,6 +34,7 @@ import {
   type RetentionSweepReport,
 } from "./workspace-scheduler";
 import type { AuditChainVerification, AuditEntryInput, StoredAuditEntry } from "../domain/audit-chain";
+import { forecastMonthly, normalizeUsageDelta, usageBucket, type UsageDelta, type UsageTotals } from "../domain/cost-telemetry";
 import {
   DAY_MS,
   HOUR_MS,
@@ -1360,6 +1361,39 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       status: state.status,
       error: state.error,
     };
+  }
+
+  /** Internal aggregated metering. Many events share one five-minute row. */
+  recordUsage(input: { at: number; delta: UsageDelta }): void {
+    const bucket = usageBucket(input.at);
+    const value = normalizeUsageDelta(input.delta);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO usage_buckets(bucket_at, requests, rows_read, rows_written, cpu_ms, active_ms, socket_connected_ms,
+         runner_connected_ms, queue_messages, r2_reads, r2_writes, r2_stored_byte_ms, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(bucket_at) DO UPDATE SET requests = requests + excluded.requests, rows_read = rows_read + excluded.rows_read,
+         rows_written = rows_written + excluded.rows_written, cpu_ms = cpu_ms + excluded.cpu_ms, active_ms = active_ms + excluded.active_ms,
+         socket_connected_ms = socket_connected_ms + excluded.socket_connected_ms, runner_connected_ms = runner_connected_ms + excluded.runner_connected_ms,
+         queue_messages = queue_messages + excluded.queue_messages, r2_reads = r2_reads + excluded.r2_reads,
+         r2_writes = r2_writes + excluded.r2_writes, r2_stored_byte_ms = r2_stored_byte_ms + excluded.r2_stored_byte_ms,
+         updated_at = excluded.updated_at`,
+      bucket, value.requests, value.rowsRead, value.rowsWritten, value.cpuMs, value.activeMs, value.socketConnectedMs,
+      value.runnerConnectedMs, value.queueMessages, value.r2Reads, value.r2Writes, value.r2StoredByteMs, input.at,
+    );
+  }
+
+  usageReport(input: { actor: Actor; from: number; to: number }): { observed: UsageTotals; forecast: ReturnType<typeof forecastMonthly>; bucketCount: number } {
+    this.authorizeActor(input.actor);
+    if (!Number.isSafeInteger(input.from) || !Number.isSafeInteger(input.to) || input.from < 0 || input.to <= input.from) throw new Error("usage range is invalid");
+    const rows = this.ctx.storage.sql.exec<Record<string, number>>(`SELECT requests, rows_read, rows_written, cpu_ms, active_ms, socket_connected_ms,
+      runner_connected_ms, queue_messages, r2_reads, r2_writes, r2_stored_byte_ms FROM usage_buckets WHERE bucket_at >= ? AND bucket_at < ?`, input.from, input.to).toArray();
+    const observed = normalizeUsageDelta(rows.reduce<UsageDelta>((sum, row) => ({
+      requests: (sum.requests ?? 0) + row.requests, rowsRead: (sum.rowsRead ?? 0) + row.rows_read, rowsWritten: (sum.rowsWritten ?? 0) + row.rows_written,
+      cpuMs: (sum.cpuMs ?? 0) + row.cpu_ms, activeMs: (sum.activeMs ?? 0) + row.active_ms, socketConnectedMs: (sum.socketConnectedMs ?? 0) + row.socket_connected_ms,
+      runnerConnectedMs: (sum.runnerConnectedMs ?? 0) + row.runner_connected_ms, queueMessages: (sum.queueMessages ?? 0) + row.queue_messages,
+      r2Reads: (sum.r2Reads ?? 0) + row.r2_reads, r2Writes: (sum.r2Writes ?? 0) + row.r2_writes, r2StoredByteMs: (sum.r2StoredByteMs ?? 0) + row.r2_stored_byte_ms,
+    }), {}));
+    return { observed, forecast: forecastMonthly(observed, input.to - input.from), bucketCount: rows.length };
   }
 
   async fetch(request: Request): Promise<Response> {

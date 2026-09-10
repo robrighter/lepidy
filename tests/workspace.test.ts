@@ -12,7 +12,7 @@ describe("Workspace Durable Object migrations", () => {
 
     await expect(stub.health()).resolves.toEqual({
       ok: true,
-      schemaVersion: 36,
+      schemaVersion: 37,
       status: "ready",
       error: null,
     });
@@ -30,7 +30,7 @@ describe("Workspace Durable Object migrations", () => {
         .toArray()
         .map(({ name }) => name);
 
-      expect(schemaRows).toEqual([{ singleton: 1, version: 36, status: "ready" }]);
+      expect(schemaRows).toEqual([{ singleton: 1, version: 37, status: "ready" }]);
       expect(tables).toEqual(
         expect.arrayContaining([
           "members",
@@ -48,6 +48,8 @@ describe("Workspace Durable Object migrations", () => {
           "purge_stages",
           "export_runs",
           "export_chunks",
+          "usage_buckets",
+          "resource_limit_events",
           "due_work_failures",
           "audit_events",
           "audit_anchors",
@@ -108,6 +110,21 @@ describe("Workspace Durable Object migrations", () => {
     });
   });
 
+  it("O02-INT-001 aggregates tenant usage without a row per event and keeps forecasts distinct", async () => {
+    const stub = env.WORKSPACE.getByName("workspace-usage-rollup");
+    await stub.health();
+    await runInDurableObject<Workspace, void>(stub, (_instance, state) => {
+      state.storage.sql.exec(`INSERT INTO members(id, account_id, handle, display_name, role, status, authorization_epoch, control_version, created_at, updated_at)
+        VALUES ('member-usage', 'account-usage', 'usage-owner', 'Usage Owner', 'owner', 'active', 1, 1, 0, 0)`);
+    });
+    await stub.recordUsage({ at: 300_001, delta: { requests: 2, rowsRead: 7, rowsWritten: 1, activeMs: 20 } });
+    await stub.recordUsage({ at: 301_000, delta: { requests: 3, rowsRead: 4, runnerConnectedMs: 1_000 } });
+    const report = await stub.usageReport({ actor: { memberId: "member-usage", authorizationEpoch: 1 }, from: 300_000, to: 600_000 });
+    expect(report.bucketCount).toBe(1);
+    expect(report.observed).toMatchObject({ requests: 5, rowsRead: 11, rowsWritten: 1, activeMs: 20, runnerConnectedMs: 1_000 });
+    expect(report.forecast.confidence).toBe("low");
+  });
+
   it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])("MIGRATION-INT-001 upgrades a historical version-%s workspace", async (version) => {
     const stub = env.MIGRATION_FIXTURE.getByName(`historical-v${version}`);
 
@@ -117,12 +134,12 @@ describe("Workspace Durable Object migrations", () => {
       error: null,
     });
     await expect(stub.migrateCurrent()).resolves.toEqual({
-      version: 36,
+      version: 37,
       status: "ready",
       error: null,
     });
     await expect(stub.migrateCurrent()).resolves.toEqual({
-      version: 36,
+      version: 37,
       status: "ready",
       error: null,
     });
@@ -152,7 +169,7 @@ describe("Workspace Durable Object migrations", () => {
     });
 
     await expect(healthy.migrateCurrent()).resolves.toEqual({
-      version: 36,
+      version: 37,
       status: "ready",
       error: null,
     });

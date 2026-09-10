@@ -1553,6 +1553,35 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX export_chunks_run_idx ON export_chunks(export_id, table_name, offset_rows)`,
     ],
   },
+  {
+    version: 37,
+    name: "aggregated workspace usage telemetry",
+    statements: [
+      `CREATE TABLE usage_buckets (
+         bucket_at INTEGER PRIMARY KEY,
+         requests INTEGER NOT NULL DEFAULT 0 CHECK (requests >= 0),
+         rows_read INTEGER NOT NULL DEFAULT 0 CHECK (rows_read >= 0),
+         rows_written INTEGER NOT NULL DEFAULT 0 CHECK (rows_written >= 0),
+         cpu_ms INTEGER NOT NULL DEFAULT 0 CHECK (cpu_ms >= 0),
+         active_ms INTEGER NOT NULL DEFAULT 0 CHECK (active_ms >= 0),
+         socket_connected_ms INTEGER NOT NULL DEFAULT 0 CHECK (socket_connected_ms >= 0),
+         runner_connected_ms INTEGER NOT NULL DEFAULT 0 CHECK (runner_connected_ms >= 0),
+         queue_messages INTEGER NOT NULL DEFAULT 0 CHECK (queue_messages >= 0),
+         r2_reads INTEGER NOT NULL DEFAULT 0 CHECK (r2_reads >= 0),
+         r2_writes INTEGER NOT NULL DEFAULT 0 CHECK (r2_writes >= 0),
+         r2_stored_byte_ms INTEGER NOT NULL DEFAULT 0 CHECK (r2_stored_byte_ms >= 0),
+         updated_at INTEGER NOT NULL
+       ) STRICT`,
+      `CREATE TABLE resource_limit_events (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         kind TEXT NOT NULL,
+         observed INTEGER NOT NULL CHECK (observed >= 0),
+         limit_value INTEGER NOT NULL CHECK (limit_value > 0),
+         occurred_at INTEGER NOT NULL
+       ) STRICT`,
+      `CREATE INDEX resource_limit_events_time_idx ON resource_limit_events(occurred_at DESC)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {
