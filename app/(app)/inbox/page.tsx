@@ -1,4 +1,5 @@
 import { ApprovalInbox } from "@/components/shell/approval-inbox";
+import { NotificationPermission } from "@/components/shell/notification-permission";
 import { ActivityFeed } from "@/components/shell/activity-feed";
 import { workspaceApprovals } from "@/src/shell/approvals-context";
 import { workspaceActivity } from "@/src/shell/activity-context";
@@ -62,6 +63,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ v
       {activityState.status === "ready" && shell.status === "ready" ? <section className="panel" aria-labelledby="notification-settings-heading">
         <h2 id="notification-settings-heading">Notification settings</h2>
         <p>Agent messages are quieter by default. Approvals remain visible through their dedicated urgent path.</p>
+        <NotificationPermission />
         <form action={configureNotificationsAction} className="settings-form">
           <input type="hidden" name="csrfToken" value={csrfToken ?? ""} />
           <label>Room

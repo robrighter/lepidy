@@ -8,12 +8,19 @@ import type { ReactNode } from "react";
 
 import { DesktopPlatform } from "@/components/shell/desktop-platform";
 import { DesktopTitlebar } from "@/components/desktop-titlebar";
+import { InstalledApp } from "@/components/shell/installed-app";
 import { ThemeScript } from "@/components/shell/theme-script";
 
 export const metadata: Metadata = {
   title: "Lepidy",
   description: "A shared workspace for people, agents, and credentials.",
-  icons: [{ rel: "icon", url: "/mark.svg" }],
+  icons: [
+    { rel: "icon", url: "/mark.svg" },
+    // iOS takes its home-screen icon from here and not from the manifest, so a
+    // manifest-only icon set installs as a screenshot of the page.
+    { rel: "apple-touch-icon", url: "/icon-192.png" },
+  ],
+  appleWebApp: { capable: true, title: "Lepidy", statusBarStyle: "default" },
 };
 
 export const viewport: Viewport = {
@@ -35,6 +42,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         </a>
         <DesktopPlatform />
         <DesktopTitlebar />
+        <InstalledApp />
         {children}
       </body>
     </html>

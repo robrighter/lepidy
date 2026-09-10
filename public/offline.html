@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lepidy — offline</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { min-height: 100vh; display: grid; place-items: center; margin: 0; background: #fff9f4; color: #1e1b4b; font: 15px/1.6 system-ui, sans-serif; }
+      @media (prefers-color-scheme: dark) { body { background: #14122e; color: #ece9ff; } p { color: #a5a1c4; } }
+      main { max-width: 30rem; padding: 2rem; text-align: center; }
+      img { width: 3.5rem; }
+      h1 { margin: 0.5rem 0; font-size: 1.25rem; }
+      p { color: #64748b; }
+      ul { text-align: left; margin: 1.25rem auto 0; max-width: 24rem; color: #64748b; }
+      li { margin-bottom: 0.35rem; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img src="/mark.svg" alt="" />
+      <h1>Lepidy can’t reach your workspace</h1>
+      <!--
+        Deliberately specific about what is *not* true. This page is shown
+        because the network failed, and the temptation is to reassure. But a
+        person reading it may have an agent waiting on an approval, so the one
+        thing it must not do is imply that anything here is being held for
+        them: nothing typed on this device while offline has been saved, and
+        nothing has been sent.
+      -->
+      <p>Your workspace is online; this device cannot currently reach it.</p>
+      <ul>
+        <li>Nothing you type here while offline is saved or sent.</li>
+        <li>Credential approvals expire after five minutes whether or not this device sees them — answer one from another device if it matters now.</li>
+        <li>Agents on other machines keep working; they do not go through this browser.</li>
+      </ul>
+      <p>This page reloads itself when the connection returns.</p>
+    </main>
+    <script>
+      // The one script here, and it does one thing. `online` fires on a
+      // regained connection; a reload then either reaches the workspace or
+      // lands back here, which is the honest outcome either way.
+      addEventListener("online", () => location.reload());
+    </script>
+  </body>
+</html>

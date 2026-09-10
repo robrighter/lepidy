@@ -171,6 +171,14 @@ evidence the cloud can have that somebody was actually at that computer, so it
 is the only thing that clears the request. `lepidy-agentd status` prints the
 same pending asks on the machine itself.
 
+## The installed web app
+
+Lepidy is installable from any modern browser. `app/manifest.ts` describes it, `public/sw.js` is the service worker, and `public/offline.html` is what a device sees when it cannot reach the workspace.
+
+The service worker **caches nothing that came back from a signed-in request** — not a page, not an API response, not a message. A workspace is shared, its content is other people's, and a cache is a copy that outlives a sign-out and survives an offboarding. The offline experience this buys is worse than a caching worker's, and that is the trade. It also never intercepts anything but a GET navigation, because every form in this product posts to a Server Action and a worker that failed one would lose a message somebody wrote.
+
+**Lepidy never promises a notification will arrive.** Permission belongs to the browser and to the operating system underneath it, both of which can refuse, silence or drop one for reasons the application cannot see. Every state of the permission surface names the Inbox as where things wait instead, and the denied state offers no button, because a browser that has been told no does not re-prompt.
+
 ## Desktop shell
 
 Run `npm run desktop:dev` after installing the Tauri system prerequisites. The desktop window follows the current Slipchat platform pattern:
