@@ -2,6 +2,7 @@
 // @ts-expect-error -- the adapter creates this module before bundling the Worker.
 import openNextWorker from "./.open-next/worker.js";
 
+import { handleBillingGatewayRequest } from "./src/cloudflare/billing-gateway";
 import { handleFileTransferRequest } from "./src/cloudflare/file-gateway";
 import { handleRunnerSocketRequest } from "./src/cloudflare/runner-socket";
 import { handleRuntimeGatewayRequest } from "./src/cloudflare/runtime-gateway";
@@ -12,6 +13,8 @@ export { Workspace } from "./src/cloudflare/workspace";
 
 export default {
   async fetch(request: Request, env: ShellEnvironment, ctx: unknown): Promise<Response> {
+    const billingGateway = await handleBillingGatewayRequest(env as CloudflareEnv, request);
+    if (billingGateway !== null) return billingGateway;
     const runtimeGateway = await handleRuntimeGatewayRequest(env as CloudflareEnv, request);
     if (runtimeGateway !== null) return runtimeGateway;
     // The runner's socket is answered before Next sees the request. Next's own

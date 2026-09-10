@@ -258,3 +258,12 @@ The desktop rendering tests cover web content under the same platform marker inj
 - Durable Object testing: <https://developers.cloudflare.com/durable-objects/examples/testing-with-durable-objects/>
 - Playwright local web server: <https://playwright.dev/docs/test-webserver>
 - Tauri WebDriver testing: <https://v2.tauri.app/develop/tests/webdriver/>
+B02 billing and reconciliation coverage:
+
+- `B02-RULE-001` fixes the launch commerce matrix: Stripe for web/direct/Windows, while the Mac App Store build reflects web entitlement and exposes no in-app purchase rail.
+- `B02-RULE-002` requires an added seat to use immediate invoiced proration and a removed seat to take effect at renewal without a refund.
+- `B02-RULE-003` maps active, delinquent and canceled provider states into the same provider-independent entitlement states.
+- `B02-INT-001` verifies the exact raw Stripe test event, applies it once and treats delivery replay as success without replaying authority.
+- `B02-INT-002` rejects out-of-order provider state and proves nonpayment retains purchased seats and storage.
+- `B02-INT-003` refuses altered signatures, live-mode events and non-exact webhook routes.
+- `B02-INT-004` refreshes due provider state and applies bounded retry backoff when the provider is unavailable.
