@@ -30,14 +30,14 @@
     {
       "binding": "CONTROL_DB",
       "database_name": "lepidy-control",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "87fa475a-4ac5-4769-ad1d-3ad0c504110e",
       "migrations_dir": "migrations/control"
     }
   ],
   "kv_namespaces": [
     {
       "binding": "RATE_LIMITS",
-      "id": "00000000000000000000000000000000"
+      "id": "525dfac4372f474b9086faf4eab35e14"
     }
   ],
   "r2_buckets": [
@@ -62,8 +62,14 @@
       }
     ]
   },
+  "routes": [
+    {
+      "pattern": "lepidy.com",
+      "custom_domain": true
+    }
+  ],
   "vars": {
-    "ENVIRONMENT": "development"
+    "ENVIRONMENT": "production"
   },
   "observability": {
     "enabled": true,
