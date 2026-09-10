@@ -234,6 +234,11 @@ export const PURGE_TABLES: Record<PurgeStage, readonly string[]> = {
     // behind would leave the content behind with it.
     "export_chunks",
     "export_runs",
+    // O02's telemetry. Aggregates about a workspace are still that workspace's,
+    // so a purge takes them: leaving them would leave a record of how busy a
+    // deleted company was.
+    "usage_buckets",
+    "resource_limit_events",
     "pending_events",
     "due_work",
     "due_work_failures",

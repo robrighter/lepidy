@@ -123,6 +123,10 @@ export const RECORD_KINDS: Record<string, RecordDisposition> = {
   push_subscriptions: "authority",
 
   // Transient: a moment that has passed.
+  // Telemetry describes a moment that has passed, and a restored workspace's
+  // cost history would be somebody else's meter reading.
+  usage_buckets: "transient",
+  resource_limit_events: "transient",
   export_runs: "transient",
   export_chunks: "transient",
   idempotency_keys: "transient",
