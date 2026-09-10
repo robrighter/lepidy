@@ -190,4 +190,13 @@ run("Bundle", process.execPath, [
   // Tauri CLI resolves `--config` from the working directory, which is the
   // repository root here, while the variant configs live beside the crate.
   path.join("src-tauri", variantConfig),
+  // An unsigned build produces no updater artifact, because signing one is
+  // exactly what it cannot do: `createUpdaterArtifacts` makes Tauri demand
+  // `TAURI_SIGNING_PRIVATE_KEY` after the installer is already written, and
+  // fail the build over a file this variant must not publish anyway. The gate
+  // has said the same thing one step earlier — what this produces "is not an
+  // update". Later `--config` values win, so this overrides the base.
+  ...(unsigned
+    ? ["--config", JSON.stringify({ bundle: { createUpdaterArtifacts: false } })]
+    : []),
 ]);
