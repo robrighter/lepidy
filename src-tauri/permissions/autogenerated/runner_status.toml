@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-runner-status"
+description = "Enables the runner_status command without any pre-configured scope."
+commands.allow = ["runner_status"]
+
+[[permission]]
+identifier = "deny-runner-status"
+description = "Denies the runner_status command without any pre-configured scope."
+commands.deny = ["runner_status"]

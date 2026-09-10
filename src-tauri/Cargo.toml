@@ -43,6 +43,7 @@ tauri = { version = "2", features = ["tray-icon", "image-png", "dynamic-acl"] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-updater = "2"
 thiserror = "1"
 
 # Password hashing and the vault's own primitives are deliberately expensive.

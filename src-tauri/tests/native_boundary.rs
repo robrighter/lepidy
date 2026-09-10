@@ -54,6 +54,24 @@ fn native_int_001_exposes_exactly_the_listed_commands() {
             "{command} is registered but not defined",
         );
     }
+
+    // The same list, declared to the access-control layer. A command missing
+    // here is a command a remote origin is refused — silently, at runtime, in
+    // a window nobody compiles.
+    let build = read("build.rs");
+    let declared = build
+        .split_once("const COMMANDS: &[&str] = &[")
+        .expect("build.rs declares the command surface")
+        .1
+        .split_once("];")
+        .expect("the declaration closes")
+        .0;
+    let declared: Vec<String> = declared
+        .split(',')
+        .map(|name| name.trim().trim_matches('"').to_string())
+        .filter(|name| !name.is_empty() && !name.starts_with("//"))
+        .collect();
+    assert_eq!(declared, COMMANDS, "build.rs and the handler disagree");
 }
 
 #[test]
@@ -134,12 +152,28 @@ fn native_int_003_grants_no_capability_that_reaches_past_the_window() {
             "the capability file grants {forbidden}: {permissions:?}",
         );
     }
-    assert!(
-        permissions
-            .iter()
-            .all(|permission| permission.starts_with("core:")),
-        "a non-core permission appeared: {permissions:?}",
-    );
+    // Everything granted is either window chrome or one of this shell's own
+    // commands, named one at a time. A permission that is neither is a plugin
+    // reaching past the window.
+    let commands: Vec<String> = COMMANDS
+        .iter()
+        .map(|command| format!("allow-{}", command.replace('_', "-")))
+        .collect();
+    for permission in &permissions {
+        assert!(
+            permission.starts_with("core:") || commands.contains(permission),
+            "an unexpected permission appeared: {permission}",
+        );
+    }
+    // And every command is granted, or it is a command the page cannot reach —
+    // which is how `platform_name` came to be unreachable until a real window
+    // was driven at one.
+    for command in &commands {
+        assert!(
+            permissions.contains(command),
+            "{command} is registered but never granted",
+        );
+    }
     // Scoped to the one window, so a future window does not inherit this.
     assert_eq!(capability["windows"], serde_json::json!(["main"]));
 }
@@ -237,10 +271,13 @@ fn native_int_006_grants_the_workspace_origin_exactly_what_the_file_grants_loopb
         .split_once(']')
         .expect("the list closes")
         .0;
+    // Line by line, keeping only the entries: the list is commented, and a
+    // comma inside a comment is not a permission.
     let granted: Vec<String> = listed
-        .split(',')
-        .map(|entry| entry.trim().trim_matches('"').to_string())
-        .filter(|entry| !entry.is_empty())
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('"'))
+        .map(|line| line.trim_end_matches(',').trim_matches('"').to_string())
         .collect();
 
     let capability: Value = serde_json::from_str(&read("capabilities/default.json"))
@@ -360,4 +397,165 @@ fn native_int_009_the_kill_switch_only_ever_stops() {
         !ipc.contains("Chord"),
         "a command reaches the kill-switch chord"
     );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Signed builds and the updater (P01b)                                        */
+/* -------------------------------------------------------------------------- */
+
+#[test]
+fn native_int_010_fetches_updates_over_nothing_but_https() {
+    let config: Value = serde_json::from_str(&read("tauri.conf.json")).expect("the config is json");
+    let updater = &config["plugins"]["updater"];
+
+    let endpoints: Vec<String> = updater["endpoints"]
+        .as_array()
+        .expect("the updater declares its endpoints")
+        .iter()
+        .map(|value| value.as_str().expect("an endpoint").to_string())
+        .collect();
+    assert!(!endpoints.is_empty(), "an updater with no endpoint");
+    for endpoint in &endpoints {
+        // The signature is what makes an update trustworthy, so plain http
+        // would not let somebody forge one. It would let them see which version
+        // every machine in a company runs, and withhold the release that fixes
+        // something.
+        assert!(endpoint.starts_with("https://"), "{endpoint}");
+    }
+
+    // The three escape hatches Tauri offers, none of them taken. Each one is a
+    // single boolean away from an update path that trusts the network.
+    for dangerous in [
+        "dangerousInsecureTransportProtocol",
+        "dangerousAcceptInvalidCerts",
+        "dangerousAcceptInvalidHostnames",
+    ] {
+        assert!(
+            updater[dangerous].is_null() || updater[dangerous] == Value::Bool(false),
+            "the updater sets {dangerous}",
+        );
+    }
+}
+
+#[test]
+fn native_int_011_keeps_the_verifying_key_out_of_the_files_beside_the_application() {
+    let config: Value = serde_json::from_str(&read("tauri.conf.json")).expect("the config is json");
+    // Empty on purpose. The real key is compiled in from the environment, so
+    // changing it is a rebuild rather than something anybody who can write a
+    // file next to the application can do — which is the whole attack the
+    // signature exists to stop.
+    assert_eq!(
+        config["plugins"]["updater"]["pubkey"],
+        Value::String(String::new())
+    );
+
+    let updater = read("src/updater.rs");
+    assert!(
+        updater.contains("option_env!(\"LEPIDY_UPDATER_PUBKEY\")"),
+        "the key is not read at build time",
+    );
+    // And a build that was given none registers no updater at all, rather than
+    // one that trusts whatever answers the endpoint.
+    let shell = read("src/lib.rs");
+    assert!(
+        shell.contains("if updater::is_configured()"),
+        "the updater plugin is registered unconditionally",
+    );
+}
+
+#[test]
+fn native_int_012_never_lets_a_page_cause_a_restart() {
+    let shell = read("src/lib.rs");
+    // Updating replaces the process supervising somebody's agents. There is no
+    // command that checks, downloads, installs or restarts, and the pending
+    // update is module-private with no accessor.
+    let handler = shell
+        .split_once("generate_handler![")
+        .expect("an invoke handler")
+        .1
+        .split_once(']')
+        .expect("the handler list closes")
+        .0;
+    for forbidden in ["update", "restart", "install"] {
+        assert!(
+            !handler.contains(forbidden),
+            "a command mentions {forbidden}: {handler}",
+        );
+    }
+    assert!(
+        !shell.contains("pub fn install_pending_update")
+            && !shell.contains("pub fn pending_update"),
+        "the update path is reachable from outside the shell",
+    );
+
+    // And the tray's update item stops the runner before anything is
+    // downloaded. Stopping afterwards would be stopping nothing, because this
+    // process is already gone.
+    let arm = shell
+        .split_once("\"update\" => {")
+        .expect("the tray has an update item")
+        .1
+        .split_once("\n            }")
+        .expect("a match arm")
+        .0;
+    let stop_at = arm
+        .find("prepare_to_install")
+        .expect("the update item stops the runner");
+    let install_at = arm
+        .find("install_pending_update")
+        .expect("the update item installs");
+    assert!(
+        stop_at < install_at,
+        "the install happens before the stop: {arm}"
+    );
+}
+
+#[test]
+fn native_int_013_the_direct_download_carries_the_injection_engine() {
+    let config: Value = serde_json::from_str(&read("tauri.conf.json")).expect("the config is json");
+    assert_eq!(config["bundle"]["active"], Value::Bool(true));
+    // An updater artifact is produced, which is what makes the signing key a
+    // requirement rather than an option — see `distribution::missing`.
+    assert_eq!(
+        config["bundle"]["createUpdaterArtifacts"],
+        Value::Bool(true)
+    );
+    // The base configuration must not declare the sidecars: Tauri validates
+    // them when the crate is compiled, and the local gate compiles this crate
+    // on every run without building a release CLI.
+    assert!(
+        config["bundle"]["externalBin"].is_null(),
+        "the base configuration declares sidecars, which breaks `cargo check`",
+    );
+
+    let direct: Value =
+        serde_json::from_str(&read("bundle.direct.json")).expect("the direct bundle config");
+    let sidecars: Vec<String> = direct["bundle"]["externalBin"]
+        .as_array()
+        .expect("the direct build declares its sidecars")
+        .iter()
+        .map(|value| value.as_str().expect("a sidecar").to_string())
+        .collect();
+    // PRD §10.1: the direct download is the full product, CLI included. A
+    // bundle without these installs an application that cannot inject a
+    // credential, which nobody notices until `lepidy run` on a fresh machine.
+    for binary in ["lepidy", "lepidy-agentd"] {
+        assert!(
+            sidecars
+                .iter()
+                .any(|entry| entry.ends_with(&format!("/{binary}"))),
+            "the direct build does not carry {binary}: {sidecars:?}",
+        );
+    }
+
+    // Every icon the bundle names is actually there. A missing one fails the
+    // bundle late, on the machine that publishes.
+    for icon in config["bundle"]["icon"].as_array().expect("icons") {
+        let relative = icon.as_str().expect("an icon path");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        assert!(
+            path.is_file(),
+            "the bundle names a missing icon: {relative}"
+        );
+    }
 }

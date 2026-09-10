@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+
+  "//": "The direct-download build's extras, merged over tauri.conf.json by `npm run desktop:build`. They live in their own file for two reasons. Tauri validates externalBin when the crate is compiled, so a sidecar declared in the base configuration would make `cargo check` require a release build of the CLI — and the local gate compiles this crate on every run. And PRD §10.1 splits this product into a direct build that carries the injection engine and a Mac App Store build that cannot, so the direct build's extras belonging to the direct build is the shape that split will need; P02 owns the store variant.",
+
+  "bundle": {
+    "externalBin": ["binaries/lepidy", "binaries/lepidy-agentd"]
+  }
+}

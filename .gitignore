@@ -16,3 +16,6 @@ test-results/
 playwright-report/
 .DS_Store
 Thumbs.db
+
+# Staged sidecar binaries for a desktop bundle. Built, never committed.
+src-tauri/binaries/

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-runner-start"
+description = "Enables the runner_start command without any pre-configured scope."
+commands.allow = ["runner_start"]
+
+[[permission]]
+identifier = "deny-runner-start"
+description = "Denies the runner_start command without any pre-configured scope."
+commands.deny = ["runner_start"]

@@ -16,9 +16,43 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": [
+      "nsis",
+      "app",
+      "dmg",
+      "deb",
+      "appimage"
+    ],
+    "createUpdaterArtifacts": true,
     "category": "Business",
-    "shortDescription": "A shared workspace for people and agents"
+    "publisher": "Lepidy",
+    "copyright": "Lepidy",
+    "shortDescription": "A shared workspace for people and agents",
+    "longDescription": "Lepidy is a shared workspace for people, agents and credentials. The desktop build carries the lepidy command-line injection engine alongside the application.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0"
+        ]
+      }
+    }
   },
   "plugins": {
     "deep-link": {
@@ -27,6 +61,12 @@
           "lepidy"
         ]
       }
+    },
+    "updater": {
+      "endpoints": [
+        "https://updates.lepidy.app/v1/{{target}}/{{arch}}/{{current_version}}"
+      ],
+      "pubkey": ""
     }
   }
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-runner-stop"
+description = "Enables the runner_stop command without any pre-configured scope."
+commands.allow = ["runner_stop"]
+
+[[permission]]
+identifier = "deny-runner-stop"
+description = "Denies the runner_stop command without any pre-configured scope."
+commands.deny = ["runner_stop"]

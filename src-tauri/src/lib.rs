@@ -1,6 +1,7 @@
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub mod deeplink;
+pub mod distribution;
 pub mod hotkey;
 pub mod ipc;
 pub mod local_store;
@@ -8,11 +9,12 @@ pub mod offline;
 pub mod origin;
 pub mod presence;
 pub mod supervisor;
+pub mod updater;
 pub mod verification;
 
 /// Everything a window in this shell is allowed to do that is not a command.
 ///
-/// Window chrome, and that is the whole list: no `shell`, no `fs`, no
+/// Window chrome and the command list, and that is the whole of it: no `shell`, no `fs`, no
 /// `process`, no `http`, no `updater`, no `notification`, no `global-shortcut`,
 /// no `deep-link`, no `clipboard`, no `dialog`. The three plugins this shell
 /// uses are Rust dependencies, driven from this file — a page reaches a
@@ -21,7 +23,7 @@ pub mod verification;
 /// Mirrored in `capabilities/default.json`, which is what a development
 /// loopback window gets; [`grant_workspace_capability`] gives the same list to
 /// the configured workspace origin. `native_boundary.rs` asserts the two agree.
-const WINDOW_PERMISSIONS: [&str; 7] = [
+const WINDOW_PERMISSIONS: [&str; 14] = [
     "core:default",
     "core:window:allow-start-dragging",
     "core:window:allow-minimize",
@@ -29,6 +31,18 @@ const WINDOW_PERMISSIONS: [&str; 7] = [
     "core:window:allow-close",
     "core:window:allow-show",
     "core:window:allow-set-focus",
+    // The seven commands, named one at a time. Tauri refuses a custom command
+    // to a remote origin unless a capability names it, and this workspace is
+    // remote — so without these the shell's own commands are unreachable from
+    // the only page that is ever meant to call them. P01b's GUI harness found
+    // that, because it is the only test that goes through the real webview.
+    "allow-runner-status",
+    "allow-runner-stop",
+    "allow-runner-start",
+    "allow-local-verify",
+    "allow-platform-name",
+    "allow-notify",
+    "allow-set-badge",
 ];
 
 /// Grant the configured workspace origin the window chrome it needs.
@@ -167,7 +181,7 @@ fn build_tray(
     app: &tauri::AppHandle,
     state: std::sync::Arc<ipc::NativeState>,
     chord: Option<&hotkey::Chord>,
-) -> tauri::Result<()> {
+) -> tauri::Result<tauri::menu::MenuItem<tauri::Wry>> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::TrayIconBuilder;
 
@@ -188,6 +202,10 @@ fn build_tray(
     };
     let stop = MenuItem::with_id(app, "stop", stop_label, true, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open Lepidy", true, None::<&str>)?;
+    // Present and disabled until an update has actually been found, so the tray
+    // reads the same whether or not this build has an updater at all. An item
+    // that appeared and disappeared would be a thing people learn to distrust.
+    let update = MenuItem::with_id(app, "update", "No update waiting", false, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
@@ -196,11 +214,13 @@ fn build_tray(
             &PredefinedMenuItem::separator(app)?,
             &stop,
             &open,
+            &update,
             &quit,
         ],
     )?;
 
     let handle = app.clone();
+    let waiting = update.clone();
     TrayIconBuilder::with_id("lepidy")
         .tooltip("Lepidy")
         .menu(&menu)
@@ -218,11 +238,28 @@ fn build_tray(
                     let _ = window.set_focus();
                 }
             }
+            "update" => {
+                // The order is the point. An update swaps out the process
+                // supervising a harness that may be holding injected
+                // credentials, so the runner stops first — every time, before
+                // a byte is downloaded — and the tray says what happened.
+                let interrupted =
+                    updater::prepare_to_install(&mut state.supervisor.lock().expect("supervisor"));
+                let _ = status.set_text(format!(
+                    "Updating — {}",
+                    if interrupted.is_running() {
+                        "runner stopped first"
+                    } else {
+                        "nothing was running"
+                    },
+                ));
+                install_pending_update(&handle);
+            }
             "quit" => handle.exit(0),
             _ => {}
         })
         .build(app)?;
-    Ok(())
+    Ok(waiting)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -269,6 +306,18 @@ pub fn run() {
         );
     }
 
+    // No key, no updater. A build that was given no public key at compile time
+    // has no update mechanism at all, rather than one that trusts whatever
+    // answers the endpoint.
+    #[cfg(desktop)]
+    if updater::is_configured() {
+        builder = builder.plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(updater::PUBKEY.expect("a configured build has a key"))
+                .build(),
+        );
+    }
+
     builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -295,11 +344,16 @@ pub fn run() {
             let registered: Option<hotkey::Chord> = None;
 
             #[cfg(desktop)]
-            build_tray(
-                app.handle(),
-                std::sync::Arc::clone(&state),
-                registered.as_ref(),
-            )?;
+            {
+                let waiting = build_tray(
+                    app.handle(),
+                    std::sync::Arc::clone(&state),
+                    registered.as_ref(),
+                )?;
+                if updater::is_configured() {
+                    watch_for_updates(app.handle(), waiting);
+                }
+            }
 
             #[cfg(desktop)]
             listen_for_deep_links(app.handle(), std::sync::Arc::clone(&state));
@@ -499,6 +553,88 @@ fn apply_badge(app: &tauri::AppHandle, unread: u64, label: Option<&str>) {
         let _ = tray.set_tooltip(Some(tooltip));
     }
     let _ = label;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Replacing this application (P01b)                                           */
+/* -------------------------------------------------------------------------- */
+
+/// The update that has been found and not yet installed.
+///
+/// One slot, module-private, and never reachable from a page: there is no
+/// command that reads it, sets it or acts on it. Updating is something the
+/// person at the machine chooses from the tray, and a page that could cause an
+/// update could cause a restart of the process supervising somebody's agents.
+#[cfg(desktop)]
+fn pending_update() -> &'static std::sync::Mutex<Option<tauri_plugin_updater::Update>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<Option<tauri_plugin_updater::Update>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Ask, on a schedule, whether there is a newer Lepidy.
+///
+/// Not at startup — see `updater::FIRST_CHECK_DELAY_MS` — and not often. A
+/// failed check is reported and forgotten: the machine tries again in six
+/// hours, and an update check that could stop the application from working
+/// would be a worse bargain than a stale version.
+#[cfg(desktop)]
+fn watch_for_updates(app: &tauri::AppHandle, waiting: tauri::menu::MenuItem<tauri::Wry>) {
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(
+            updater::FIRST_CHECK_DELAY_MS,
+        ));
+        loop {
+            check_for_an_update(&handle, &waiting);
+            std::thread::sleep(std::time::Duration::from_millis(updater::CHECK_INTERVAL_MS));
+        }
+    });
+}
+
+#[cfg(desktop)]
+fn check_for_an_update(app: &tauri::AppHandle, waiting: &tauri::menu::MenuItem<tauri::Wry>) {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let found = tauri::async_runtime::block_on(async {
+        match app.updater() {
+            Ok(updater) => updater.check().await,
+            Err(error) => Err(error),
+        }
+    });
+    match found {
+        Ok(Some(update)) => {
+            let version = update.version.clone();
+            *pending_update().lock().expect("pending update") = Some(update);
+            // The label carries the consequence, because a person supervising
+            // agents needs it before they choose the item, not after.
+            let _ = waiting.set_text(updater::ready_label(&version));
+            let _ = waiting.set_enabled(true);
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("lepidy: could not check for an update ({error})"),
+    }
+}
+
+/// Download and install the update the tray is offering.
+///
+/// The runner has already been stopped by the tray handler, through
+/// `updater::prepare_to_install`, before this is reached. That order is not an
+/// implementation detail: an update swaps out the process supervising a harness
+/// that may be holding injected credentials, and stopping afterwards would be
+/// stopping nothing, because this process is already gone.
+#[cfg(desktop)]
+fn install_pending_update(app: &tauri::AppHandle) {
+    let Some(update) = pending_update().lock().expect("pending update").take() else {
+        return;
+    };
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match update.download_and_install(|_, _| {}, || {}).await {
+            Ok(()) => handle.restart(),
+            Err(error) => eprintln!("lepidy: the update did not install ({error})"),
+        }
+    });
 }
 
 /* -------------------------------------------------------------------------- */

@@ -1,10 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Window chrome and the five native commands, for the workspace origin only.",
-  "windows": ["main"],
+  "description": "Window chrome and the seven native commands, for the workspace origin only.",
+  "windows": [
+    "main"
+  ],
   "remote": {
-    "urls": ["http://localhost:3000"]
+    "urls": [
+      "http://localhost:3000"
+    ]
   },
   "permissions": [
     "core:default",
@@ -13,6 +17,13 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
     "core:window:allow-show",
-    "core:window:allow-set-focus"
+    "core:window:allow-set-focus",
+    "allow-runner-status",
+    "allow-runner-stop",
+    "allow-runner-start",
+    "allow-local-verify",
+    "allow-platform-name",
+    "allow-notify",
+    "allow-set-badge"
   ]
 }

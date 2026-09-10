@@ -183,7 +183,11 @@ The window opens on the workspace in every build. `LEPIDY_ORIGIN` names it — l
 
 The shell also registers the `lepidy://` scheme, raises native notifications, carries an unread badge, and registers one global kill-switch chord (`CommandOrControl+Alt+Shift+K` by default, overridable per machine with `LEPIDY_KILL_SWITCH`). A deep link can only *show* a place in this workspace — it names a destination from a closed set, never a URL, and no link approves anything, releases anything or starts anything. The offline page has no native privileges, so it says where the stop actually is: the tray, `lepidy agentd stop`, or the web app on another device. The normative boundary is [`docs/desktop-presence-contract.md`](./docs/desktop-presence-contract.md).
 
-Signed installers and the updater are not built yet; `bundle.active` is still `false`.
+Build the direct-download bundle with `npm run desktop:build`. It builds the CLI and the daemon, stages them as sidecars, and then refuses to bundle unless this environment has the signing material the artifacts need — a Windows certificate thumbprint, an Apple Developer ID plus notarisation credentials, and the updater key pair, per platform. `npm run desktop:build:unsigned` builds for the current machine and says loudly that what it produced must not be published. The normative boundary is [`docs/desktop-distribution-contract.md`](./docs/desktop-distribution-contract.md).
+
+The updater verifies a minisign signature against a public key compiled in from `LEPIDY_UPDATER_PUBKEY`; a build given none registers no updater at all rather than one that trusts whatever answers. Checking is automatic, installing is a tray item, and installing stops the runner first — an update replaces the process supervising a harness that may hold injected credentials. No command reaches any of it.
+
+`npm run test:desktop-gui` drives the compiled application in a real window through `tauri-driver`. It is not part of `verify:local` because it needs `tauri-driver` and a platform WebDriver matching the installed WebView2 runtime; see [TESTING.md](TESTING.md).
 
 The placeholder Cloudflare resource identifiers in `wrangler.jsonc` support local type generation and dry-run builds. Provisioned environment IDs belong in deployment-specific configuration, never in source secrets.
 
