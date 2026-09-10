@@ -149,8 +149,6 @@ export const RECORD_KINDS: Record<string, RecordDisposition> = {
   channel_read_state: "transient",
   thread_read_state: "transient",
   audit_retention: "transient",
-  usage_buckets: "transient",
-  resource_limit_events: "transient",
   // The search indexes are rebuilt from the content they index, so exporting
   // them would be exporting the same words twice.
   workspace_search: "transient",
