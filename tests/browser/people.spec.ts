@@ -69,6 +69,9 @@ test("C07-UI-INT-002 saves timezone, working hours and custom status on the real
 });
 
 test("C07-UI-INT-003 holds a Solo invitation and supports explicit cancellation", async ({ page }) => {
+  const session = (await page.context().cookies()).find((cookie) => cookie.name === "lepidy_session");
+  const solo = await page.request.post("/__fixture/solo-entitlement", { headers: { authorization: session!.value } });
+  expect(solo.ok(), await solo.text()).toBe(true);
   await page.goto("/people");
   const admin = page.locator("section").filter({ has: page.getByRole("heading", { name: "Workspace administration" }) });
   await admin.getByLabel("Email").fill("next-person@example.test");

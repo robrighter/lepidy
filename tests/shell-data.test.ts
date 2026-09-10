@@ -52,12 +52,14 @@ describe("workspace shell data adapter", () => {
       handle: "maya",
       jurisdiction: "global",
     });
+    await env.CONTROL_DB.prepare(
+      "UPDATE subscriptions SET plan = 'team', seat_quantity = 5, updated_at = ? WHERE workspace_id = ?",
+    ).bind(NOW + 1, workspaceId).run();
     const invitation = await onboarding.inviteMember({
       workspaceId,
       invitedByMemberId: memberId,
       email: "shell-guest@example.test",
       role: "member",
-      billingConfirmed: true,
     });
     const guest = await onboarding.acceptInvitation({
       invitationId: invitation.id,

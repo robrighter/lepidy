@@ -10,7 +10,7 @@ import { freshAccount, signUp } from "./auth-helpers";
 test.beforeEach(async ({ page }) => {
   await signUp(page, freshAccount());
   // A fresh workspace is Solo, whose attachments live on its own host. Cloud
-  // attachments are a Team capability, and real checkout is B01-B03.
+  // attachments are a Team capability, and real checkout is B02-B03.
   const session = (await page.context().cookies()).find((cookie) => cookie.name === "lepidy_session");
   const seeded = await page.request.post("/__fixture/team-storage", { headers: { authorization: session!.value } });
   expect(seeded.ok(), await seeded.text()).toBe(true);
@@ -117,6 +117,7 @@ test("C08B-UI-INT-001 lists workspace files and applies metadata filters at desk
 
   await page.goto("/files");
   await expect(page.getByRole("heading", { name: "Files", level: 2 })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Attachment storage" })).toContainText("25 GB total");
   await expect(page.locator(".file-ribbon")).toHaveCount(2);
   await expect(page.locator(".file-ribbon").filter({ hasText: "Relay runbook.txt" })).toContainText("#general");
 

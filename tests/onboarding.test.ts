@@ -252,6 +252,7 @@ describe("identity and workspace onboarding", () => {
       slug: "invitation-workspace",
       handle: "invite-owner",
       jurisdiction: "global",
+      storageMode: "cloud",
     });
     await expect(
       service.inviteMember({
@@ -266,7 +267,6 @@ describe("identity and workspace onboarding", () => {
       invitedByMemberId: owner.memberId,
       email: "Lee@example.com",
       role: "member",
-      billingConfirmed: true,
     });
 
     const wrong = { accountId: await register("other@example.com", "Wrong Person") };

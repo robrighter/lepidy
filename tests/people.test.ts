@@ -83,6 +83,9 @@ describe("people, groups and administration", () => {
     await expect(administration.inviteMember({ workspaceId: workspace.workspaceId, invitedByMemberId: workspace.memberId, email: " C07-TARGET@example.com ", role: "member" })).rejects.toThrow("pending invitation");
     const targetAccount = await register(service, "c07-target@example.com", "C07 Target");
     await expect(service.acceptInvitation({ invitationId: invite.id, token: invite.token, accountId: targetAccount, handle: "target" })).rejects.toThrow("invalid or expired");
+    await env.CONTROL_DB.prepare(
+      "UPDATE subscriptions SET plan = 'team', seat_quantity = 5, updated_at = ? WHERE workspace_id = ?",
+    ).bind(NOW + 1, workspace.workspaceId).run();
     await administration.confirmInvitationPlan(workspace.workspaceId, workspace.memberId, invite.id);
     const target = await service.acceptInvitation({ invitationId: invite.id, token: invite.token, accountId: targetAccount, handle: "target" });
 

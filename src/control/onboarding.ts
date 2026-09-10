@@ -399,16 +399,20 @@ export class OnboardingService {
     await this.db.batch([
       this.db
         .prepare(
-          `INSERT INTO workspaces(id, slug, durable_object_id, name, jurisdiction, status, membership_version, storage_mode, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, 'provisioning', ?, ?, ?, ?)`,
+          `INSERT INTO workspaces(id, slug, durable_object_id, name, jurisdiction, plan, status, membership_version, storage_mode, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'provisioning', ?, ?, ?, ?)`,
         )
-        .bind(workspaceId, slug, doId.toString(), input.name.trim(), input.jurisdiction, version, storageMode, now, now),
+        .bind(workspaceId, slug, doId.toString(), input.name.trim(), input.jurisdiction, storageMode === "cloud" ? "team" : "solo", version, storageMode, now, now),
       this.db
         .prepare(
           `INSERT INTO memberships(member_id, workspace_id, account_id, role, status, authorization_epoch, version, created_at, updated_at)
            VALUES (?, ?, ?, 'owner', 'pending', 1, ?, ?, ?)`,
         )
         .bind(memberId, workspaceId, input.accountId, version, now, now),
+      this.db.prepare(
+        `INSERT INTO subscriptions(workspace_id, provider, status, seat_quantity, storage_pack_gb, updated_at, plan, source)
+         VALUES (?, 'none', 'active', ?, 0, ?, ?, 'none')`,
+      ).bind(workspaceId, storageMode === "cloud" ? 5 : 1, now, storageMode === "cloud" ? "team" : "solo"),
       this.operationStatement(workspaceId, operationId, "membership_upsert", memberId, version, member, now),
     ]);
 

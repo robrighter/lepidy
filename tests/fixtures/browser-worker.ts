@@ -236,7 +236,7 @@ export default {
         credentialId: await onboarding.finishPasskeyRegistration({ accountId, ...body }),
       });
     }
-    if (["/__fixture/seed", "/__fixture/activity", "/__fixture/people", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/team-storage", "/__fixture/session-token", "/__fixture/vault", "/__fixture/device-origin", "/__fixture/runner-queue", "/__fixture/runner-enqueue", "/__fixture/runner-revoke"].includes(url.pathname) && request.method === "POST") {
+    if (["/__fixture/seed", "/__fixture/activity", "/__fixture/people", "/__fixture/bulk", "/__fixture/workspace-counts", "/__fixture/solo-entitlement", "/__fixture/team-storage", "/__fixture/session-token", "/__fixture/vault", "/__fixture/device-origin", "/__fixture/runner-queue", "/__fixture/runner-enqueue", "/__fixture/runner-revoke"].includes(url.pathname) && request.method === "POST") {
       const authorization = new AuthorizationService(env.CONTROL_DB, env.WORKSPACE);
       const resolved = await resolveViewerWorkspace({ db: env.CONTROL_DB, workspaces: env.WORKSPACE, authenticateSession: (token) => authorization.authenticateBrowserSession(token) }, request.headers.get("authorization"));
       if (resolved.status !== "ok") return new Response("Unauthorized", { status: 401 });
@@ -257,14 +257,24 @@ export default {
         await stub.applyMembership({ operationId: `browser-people-${suffix}`, memberId, accountId, handle, displayName: "Grace Hopper", role: "member", status: "active", authorizationEpoch: 1, version, now });
         return Response.json({ memberId, handle });
       }
+      if (url.pathname.endsWith("solo-entitlement")) {
+        const now = Date.now();
+        await env.CONTROL_DB.batch([
+          env.CONTROL_DB.prepare("UPDATE workspaces SET plan = 'solo', updated_at = ? WHERE id = ?").bind(now, resolved.row.id),
+          env.CONTROL_DB.prepare(
+            "UPDATE subscriptions SET plan = 'solo', seat_quantity = 1, storage_pack_gb = 0, updated_at = ? WHERE workspace_id = ?",
+          ).bind(now, resolved.row.id),
+        ]);
+        return Response.json({ ok: true });
+      }
       if (url.pathname.endsWith("team-storage")) {
         const now = Date.now();
         await env.CONTROL_DB.batch([
           env.CONTROL_DB.prepare("UPDATE workspaces SET plan = 'team', updated_at = ? WHERE id = ?").bind(now, resolved.row.id),
           env.CONTROL_DB.prepare(
-            `INSERT INTO subscriptions(workspace_id, provider, status, seat_quantity, storage_pack_gb, updated_at)
-             VALUES (?, 'fixture', 'active', 5, 0, ?)
-             ON CONFLICT(workspace_id) DO UPDATE SET seat_quantity = 5, storage_pack_gb = 0, updated_at = excluded.updated_at`,
+            `INSERT INTO subscriptions(workspace_id, provider, status, seat_quantity, storage_pack_gb, updated_at, plan, source)
+             VALUES (?, 'fixture', 'active', 5, 0, ?, 'team', 'none')
+             ON CONFLICT(workspace_id) DO UPDATE SET plan = 'team', seat_quantity = 5, storage_pack_gb = 0, updated_at = excluded.updated_at`,
           ).bind(resolved.row.id, now),
         ]);
         return Response.json(await stub.seedCloudStorage());

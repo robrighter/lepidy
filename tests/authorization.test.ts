@@ -171,12 +171,14 @@ describe("session and device authorization", () => {
       jurisdiction: "global",
     });
     const secondAccountId = await account("second-owner@example.com");
+    await env.CONTROL_DB.prepare(
+      "UPDATE subscriptions SET plan = 'team', seat_quantity = 5, updated_at = ? WHERE workspace_id = ?",
+    ).bind(NOW + 1, workspace.workspaceId).run();
     const invite = await onboarding.inviteMember({
       workspaceId: workspace.workspaceId,
       invitedByMemberId: workspace.memberId,
       email: "second-owner@example.com",
       role: "member",
-      billingConfirmed: true,
     });
     const second = await onboarding.acceptInvitation({
       invitationId: invite.id,

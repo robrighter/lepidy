@@ -18,12 +18,11 @@ export class AdministrationService {
 
   async inviteMember(input: { workspaceId: string; invitedByMemberId: string; email: string; role: Exclude<WorkspaceRole, "owner">; billingConfirmed?: boolean }): Promise<IssuedInvitation> {
     const inviter = await this.db.prepare(
-      `SELECT m.role, m.status, w.plan,
-              (SELECT COUNT(*) FROM memberships seats WHERE seats.workspace_id = m.workspace_id AND seats.status = 'active') AS active_seats,
-              COALESCE((SELECT seat_quantity FROM subscriptions s WHERE s.workspace_id = m.workspace_id), CASE WHEN w.plan = 'team' THEN 5 ELSE 1 END) AS paid_seats
+      `SELECT m.role, m.status,
+              (SELECT seat_quantity FROM subscriptions s WHERE s.workspace_id = m.workspace_id) AS paid_seats
        FROM memberships m JOIN workspaces w ON w.id = m.workspace_id
        WHERE m.workspace_id = ? AND m.member_id = ?`,
-    ).bind(input.workspaceId, input.invitedByMemberId).first<{ role: WorkspaceRole; status: string; active_seats: number; paid_seats: number }>();
+    ).bind(input.workspaceId, input.invitedByMemberId).first<{ role: WorkspaceRole; status: string; paid_seats: number | null }>();
     if (!inviter || inviter.status !== "active" || (inviter.role !== "owner" && inviter.role !== "admin")) throw new Error("active owner or admin required to invite");
     const email = normalizeEmail(input.email);
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error("invitation email is invalid");
@@ -38,12 +37,30 @@ export class AdministrationService {
     const token = randomToken();
     const createdAt = this.now();
     const expiresAt = createdAt + 7 * 24 * 60 * 60_000;
-    const heldForPlan = inviter.active_seats >= inviter.paid_seats && input.billingConfirmed !== true;
+    if (inviter.paid_seats === null) throw new Error("workspace entitlement not found");
     await this.db.prepare(
       `INSERT INTO invitations(id, workspace_id, email_normalized, token_hash, role, invited_by_member_id,
-         expires_at, created_at, delivery_state, last_sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         expires_at, created_at, delivery_state, last_sent_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?,
+         CASE WHEN
+           (SELECT COUNT(*) FROM memberships WHERE workspace_id = ? AND status = 'active')
+           + (SELECT COUNT(*) FROM invitations WHERE workspace_id = ? AND delivery_state = 'ready'
+               AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?)
+           >= (SELECT seat_quantity FROM subscriptions WHERE workspace_id = ?)
+         THEN 'held_for_plan' ELSE 'ready' END,
+         CASE WHEN
+           (SELECT COUNT(*) FROM memberships WHERE workspace_id = ? AND status = 'active')
+           + (SELECT COUNT(*) FROM invitations WHERE workspace_id = ? AND delivery_state = 'ready'
+               AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?)
+           >= (SELECT seat_quantity FROM subscriptions WHERE workspace_id = ?)
+         THEN NULL ELSE ? END`,
     ).bind(id, input.workspaceId, email, await hashOpaqueToken(token), input.role, input.invitedByMemberId,
-      expiresAt, createdAt, heldForPlan ? "held_for_plan" : "ready", heldForPlan ? null : createdAt).run();
+      expiresAt, createdAt,
+      input.workspaceId, input.workspaceId, createdAt, input.workspaceId,
+      input.workspaceId, input.workspaceId, createdAt, input.workspaceId, createdAt).run();
+    const inserted = await this.db.prepare("SELECT delivery_state FROM invitations WHERE id = ?")
+      .bind(id).first<{ delivery_state: "ready" | "held_for_plan" }>();
+    const heldForPlan = inserted?.delivery_state === "held_for_plan";
     return { id, token, expiresAt, heldForPlan };
   }
 
@@ -72,14 +89,33 @@ export class AdministrationService {
 
   async confirmInvitationPlan(workspaceId: string, actorMemberId: string, invitationId: string): Promise<void> {
     await this.requireAdministrator(workspaceId, actorMemberId);
-    const result = await this.db.prepare("UPDATE invitations SET delivery_state = 'ready', last_sent_at = ? WHERE id = ? AND workspace_id = ? AND delivery_state = 'held_for_plan' AND accepted_at IS NULL AND revoked_at IS NULL").bind(this.now(), invitationId, workspaceId).run();
-    if (result.meta.changes !== 1) throw new Error("held invitation not found");
+    const result = await this.db.prepare(
+      `UPDATE invitations SET delivery_state = 'ready', last_sent_at = ?
+       WHERE id = ? AND workspace_id = ? AND delivery_state = 'held_for_plan'
+         AND accepted_at IS NULL AND revoked_at IS NULL
+         AND (SELECT COUNT(*) FROM memberships WHERE workspace_id = ? AND status = 'active')
+           + (SELECT COUNT(*) FROM invitations WHERE workspace_id = ? AND delivery_state = 'ready'
+               AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?)
+           < (SELECT seat_quantity FROM subscriptions WHERE workspace_id = ?)`,
+    ).bind(this.now(), invitationId, workspaceId, workspaceId, workspaceId, this.now(), workspaceId).run();
+    if (result.meta.changes === 1) return;
+    const held = await this.db.prepare(
+      "SELECT 1 AS present FROM invitations WHERE id = ? AND workspace_id = ? AND delivery_state = 'held_for_plan' AND accepted_at IS NULL AND revoked_at IS NULL",
+    ).bind(invitationId, workspaceId).first<{ present: number }>();
+    if (held) throw new Error("increase the workspace seat capacity before releasing this invitation");
+    throw new Error("held invitation not found");
   }
 
   async administerMember(input: { workspaceId: string; actorMemberId: string; memberId: string; role?: WorkspaceRole; status?: Exclude<MemberStatus, "pending"> }): Promise<void> {
     const actor = await this.requireAdministrator(input.workspaceId, input.actorMemberId);
     const target = await this.memberRow(input.workspaceId, input.memberId);
     if (!mayAdministerMember({ actorRole: actor.role, actorId: actor.memberId, targetRole: target.role, targetId: target.memberId, nextRole: input.role, nextStatus: input.status })) throw new Error("that role cannot administer this member");
+    if (target.status !== "active" && input.status === "active") {
+      const capacity = await this.seatCapacity(input.workspaceId);
+      if (capacity.activeSeats + capacity.readyInvitations >= capacity.seatQuantity) {
+        throw new Error("increase the workspace seat capacity before restoring this person");
+      }
+    }
     await this.changeMemberProjection(input.workspaceId, input.memberId, input.role ?? target.role, input.status ?? target.status);
   }
 
@@ -122,6 +158,20 @@ export class AdministrationService {
     const row = await this.db.prepare("SELECT member_id, role FROM memberships WHERE workspace_id = ? AND member_id = ? AND status = 'active'").bind(workspaceId, memberId).first<{ member_id: string; role: WorkspaceRole }>();
     if (!row || (row.role !== "owner" && row.role !== "admin")) throw new Error("active owner or admin required");
     return { memberId: row.member_id, role: row.role };
+  }
+
+  private async seatCapacity(workspaceId: string): Promise<{ activeSeats: number; readyInvitations: number; seatQuantity: number }> {
+    const row = await this.db.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM memberships WHERE workspace_id = ? AND status = 'active') AS active_seats,
+         (SELECT COUNT(*) FROM invitations WHERE workspace_id = ? AND delivery_state = 'ready'
+            AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?) AS ready_invitations,
+         (SELECT seat_quantity FROM subscriptions WHERE workspace_id = ?) AS seat_quantity`,
+    ).bind(workspaceId, workspaceId, this.now(), workspaceId).first<{
+      active_seats: number; ready_invitations: number; seat_quantity: number | null;
+    }>();
+    if (!row || row.seat_quantity === null) throw new Error("workspace entitlement not found");
+    return { activeSeats: row.active_seats, readyInvitations: row.ready_invitations, seatQuantity: row.seat_quantity };
   }
 
   private async memberRow(workspaceId: string, memberId: string): Promise<{ memberId: string; accountId: string; displayName: string; role: WorkspaceRole; status: MemberStatus; authorizationEpoch: number; membershipVersion: number; durableObjectId: string }> {

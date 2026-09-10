@@ -1,7 +1,7 @@
 import { File, FileArchive, FileImage, FileText } from "lucide-react";
 
 import type { StoredFile } from "@/src/cloudflare/workspace";
-import { workspaceFileIndex } from "@/src/shell/files-context";
+import { storageStatus, workspaceFileIndex } from "@/src/shell/files-context";
 import { workspacePeople } from "@/src/shell/people-context";
 import { shellState } from "@/src/shell/shell-context";
 import { channelLabel } from "@/src/shell/shell-model";
@@ -18,7 +18,9 @@ export default async function FilesPage({ searchParams }: { searchParams: Promis
     createdAtOrAfter: dateBoundary(params.after, false),
     createdBefore: dateBoundary(params.before, true),
   };
-  const [index, shell, people] = await Promise.all([workspaceFileIndex(filters), shellState(), workspacePeople()]);
+  const [index, shell, people, storage] = await Promise.all([
+    workspaceFileIndex(filters), shellState(), workspacePeople(), storageStatus(),
+  ]);
 
   if (index.status !== "ready") return (
     <section className="empty-state">
@@ -39,6 +41,19 @@ export default async function FilesPage({ searchParams }: { searchParams: Promis
         </div>
         <span className="file-count">{index.files.length}<small>shown</small></span>
       </section>
+
+      {storage && storage.quotaBytes > 0 ? (
+        <section className="storage-shelf" aria-label="Attachment storage">
+          <div className="storage-shelf-copy">
+            <strong>{formatBytes(storage.usedBytes)} used</strong>
+            <span>{formatBytes(storage.quotaBytes)} total</span>
+          </div>
+          <meter min={0} max={storage.quotaBytes} value={Math.min(storage.usedBytes, storage.quotaBytes)}>
+            {Math.round((storage.usedBytes / storage.quotaBytes) * 100)}%
+          </meter>
+          {storage.warn ? <p role="status">Storage is more than 80% full. New uploads stop when it is full; existing files stay here.</p> : null}
+        </section>
+      ) : null}
 
       <section className="panel file-filter-panel" aria-label="File filters">
         <form className="file-filters" action="/files" method="get">
@@ -94,7 +109,8 @@ function dateBoundary(value: string | undefined, exclusiveNextDay: boolean): num
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(bytes % (1024 * 1024 * 1024) === 0 ? 0 : 1)} GB`;
 }
 
 function formatDate(timestamp: number): string {
