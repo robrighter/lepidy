@@ -71,6 +71,12 @@ pub fn fallback_status(runner: RunnerState) -> String {
             "The runner on this machine stopped unexpectedly. Nothing here is \
              answering for your agents."
         }
+        // A package that could never host one. Saying "stopped" here would be
+        // saying something was interrupted, and nothing was.
+        RunnerState::Unavailable => {
+            "No agent runs on this Mac: an App Store application may not start \
+             one. Nothing here was answering for your agents."
+        }
     };
     format!(
         "Lepidy cannot reach your workspace from this computer. {local} \
@@ -285,6 +291,7 @@ mod tests {
             RunnerState::Running,
             RunnerState::Stopped,
             RunnerState::Exited { code: 1 },
+            RunnerState::Unavailable,
         ] {
             let status = fallback_status(state);
             assert!(status.contains("tray"), "{status}");

@@ -187,6 +187,8 @@ Build the direct-download bundle with `npm run desktop:build`. It builds the CLI
 
 The updater verifies a minisign signature against a public key compiled in from `LEPIDY_UPDATER_PUBKEY`; a build given none registers no updater at all rather than one that trusts whatever answers. Checking is automatic, installing is a tray item, and installing stops the runner first — an update replaces the process supervising a harness that may hold injected credentials. No command reaches any of it.
 
+Three channels are configured, and one store rule cuts through the middle of the product. A sandboxed Mac App Store application may not spawn a child process with an injected environment, so `npm run desktop:build -- --variant mas` produces the collaboration and approvals client: no `lepidy` CLI in the package, and no ability to host a local runner either — it can configure a local agent and watch its sessions. That build reports the runner as unavailable rather than stopped, and says in one line where the CLI actually is. Windows is unconstrained, so `--variant msix` is the whole product. The matrix, the identifiers, the external requirements each channel is blocked on, and the store disclosure text are in [`docs/store-capability-matrix.md`](./docs/store-capability-matrix.md).
+
 `npm run test:desktop-gui` drives the compiled application in a real window through `tauri-driver`. It is not part of `verify:local` because it needs `tauri-driver` and a platform WebDriver matching the installed WebView2 runtime; see [TESTING.md](TESTING.md).
 
 The placeholder Cloudflare resource identifiers in `wrangler.jsonc` support local type generation and dry-run builds. Provisioned environment IDs belong in deployment-specific configuration, never in source secrets.

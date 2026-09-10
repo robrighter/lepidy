@@ -559,3 +559,136 @@ fn native_int_013_the_direct_download_carries_the_injection_engine() {
         );
     }
 }
+
+/* -------------------------------------------------------------------------- */
+/* Store variants (P02)                                                        */
+/* -------------------------------------------------------------------------- */
+
+#[test]
+fn native_int_014_gives_each_channel_a_configuration_and_only_the_direct_one_self_updates() {
+    let base: Value = serde_json::from_str(&read("tauri.conf.json")).expect("the config is json");
+    assert_eq!(base["bundle"]["createUpdaterArtifacts"], Value::Bool(true));
+
+    for (file, self_updates) in [
+        ("bundle.direct.json", true),
+        ("bundle.mas.json", false),
+        ("bundle.msix.json", false),
+    ] {
+        let config: Value =
+            serde_json::from_str(&read(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
+        let produces = config["bundle"]["createUpdaterArtifacts"]
+            .as_bool()
+            // The direct build inherits the base configuration's `true`.
+            .unwrap_or(true);
+        assert_eq!(
+            produces, self_updates,
+            "{file} disagrees about whether this channel updates itself",
+        );
+        // A store package takes its updates from the store. Shipping a
+        // self-updater inside one is a rejection, and a way to strand somebody
+        // on a version the store believes it already replaced.
+        if !self_updates {
+            assert_eq!(
+                config["bundle"]["createUpdaterArtifacts"],
+                Value::Bool(false),
+                "{file} must say so rather than inherit",
+            );
+        }
+    }
+}
+
+#[test]
+fn native_int_015_keeps_the_injection_engine_out_of_the_package_that_may_not_spawn_one() {
+    let sidecars = |file: &str| -> Vec<String> {
+        let config: Value =
+            serde_json::from_str(&read(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
+        config["bundle"]["externalBin"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_str().expect("a sidecar").to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Windows is unconstrained: an MSIX package declares runFullTrust, so the
+    // Microsoft Store build is the whole product (PRD §10.1).
+    for file in ["bundle.direct.json", "bundle.msix.json"] {
+        let declared = sidecars(file);
+        for binary in ["lepidy", "lepidy-agentd"] {
+            assert!(
+                declared
+                    .iter()
+                    .any(|entry| entry.ends_with(&format!("/{binary}"))),
+                "{file} does not carry {binary}: {declared:?}",
+            );
+        }
+    }
+
+    // And the one that may not spawn a child process carries neither. Shipping
+    // the injection engine in a sandboxed App Store build is a review rejection
+    // at best, and at worst an accepted build with a tool in it that cannot
+    // work — which is worse, because somebody would rely on it.
+    assert!(
+        sidecars("bundle.mas.json").is_empty(),
+        "the Mac App Store build carries the injection engine",
+    );
+}
+
+#[test]
+fn native_int_016_asks_for_no_entitlement_that_would_reach_for_the_forbidden_capability() {
+    let mas: Value = serde_json::from_str(&read("bundle.mas.json")).expect("the mas config");
+    let entitlements = mas["bundle"]["macOS"]["entitlements"]
+        .as_str()
+        .expect("the Mac App Store build names its entitlements");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(entitlements);
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    // Comments stripped first: the file explains at length which entitlements
+    // it deliberately does not ask for, and a check that read the explanation
+    // as a declaration would fail on the very documentation that makes the
+    // decision legible.
+    let plist = strip_xml_comments(&raw);
+
+    // The sandbox itself, and outgoing network. That is the client.
+    assert!(plist.contains("com.apple.security.app-sandbox"), "{plist}");
+    assert!(
+        plist.contains("com.apple.security.network.client"),
+        "{plist}"
+    );
+
+    // What must never appear: every one of these is a way of reaching for the
+    // capability the sandbox exists to withhold — starting a child process with
+    // an environment we chose — and asking for one is how a build ends up
+    // rejected, or shipped pretending it can inject a credential.
+    for forbidden in [
+        "com.apple.security.inherit",
+        "com.apple.security.cs.allow-jit",
+        "com.apple.security.cs.allow-unsigned-executable-memory",
+        "com.apple.security.cs.allow-dyld-environment-variables",
+        "com.apple.security.cs.disable-library-validation",
+        "com.apple.security.temporary-exception",
+    ] {
+        assert!(
+            !plist.contains(forbidden),
+            "the entitlements ask for {forbidden}"
+        );
+    }
+}
+
+/// Everything outside `<!-- … -->`.
+fn strip_xml_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}

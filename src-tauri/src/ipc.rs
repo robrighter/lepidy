@@ -25,6 +25,7 @@
 
 use std::sync::Mutex;
 
+use crate::distribution::Variant;
 use crate::offline::LoadWatch;
 use crate::origin::TrustedOrigin;
 use crate::presence::{self, Notification, PresenceError};
@@ -88,9 +89,24 @@ pub fn require_trusted_caller(state: &NativeState, caller_url: &str) -> Result<(
     }
 }
 
+/// What the supervisor says, unless this package could never host a runner.
+///
+/// The substitution lives here rather than in the supervisor because it is a
+/// fact about the *package*, not about the machine: the same code, built for a
+/// different channel, supervises a real daemon.
+fn observed(supervisor: RunnerState) -> RunnerState {
+    if Variant::current().can_host_a_runner() {
+        supervisor
+    } else {
+        RunnerState::Unavailable
+    }
+}
+
 pub fn runner_status(state: &NativeState, caller_url: &str) -> Result<RunnerState, IpcError> {
     require_trusted_caller(state, caller_url)?;
-    Ok(state.supervisor.lock().expect("supervisor").state())
+    Ok(observed(
+        state.supervisor.lock().expect("supervisor").state(),
+    ))
 }
 
 /// Stop, unconditionally.
@@ -101,7 +117,12 @@ pub fn runner_status(state: &NativeState, caller_url: &str) -> Result<RunnerStat
 /// credentials, that is not a close call.
 pub fn runner_stop(state: &NativeState, caller_url: &str) -> Result<RunnerState, IpcError> {
     require_trusted_caller(state, caller_url)?;
-    Ok(state.supervisor.lock().expect("supervisor").stop())
+    // Still unconditional, and still not gated on the variant. A stop on a
+    // package that cannot start anything is a harmless no-op, and making the
+    // protective direction conditional on anything is how it stops working on
+    // the one build where somebody needed it.
+    let stopped = state.supervisor.lock().expect("supervisor").stop();
+    Ok(observed(stopped))
 }
 
 /// Start, only with a fresh confirmation for exactly this action.
@@ -111,6 +132,12 @@ pub fn runner_start(
     now_ms: u64,
 ) -> Result<RunnerState, IpcError> {
     require_trusted_caller(state, caller_url)?;
+    // Refused before the confirmation, not after: asking somebody for a
+    // fingerprint and then telling them the build cannot do it either way is a
+    // worse experience than saying so first, and it would spend a gesture.
+    if !Variant::current().can_host_a_runner() {
+        return Err(IpcError::Refused(crate::distribution::runner_unavailable()));
+    }
     state
         .ledger
         .lock()
@@ -341,5 +368,31 @@ mod tests {
             set_badge(&state, "https://lepidy.example/", 250),
             Ok(Some("99+".to_string())),
         );
+    }
+
+    #[test]
+    fn a_package_that_could_never_host_a_runner_says_so_rather_than_reading_as_stopped() {
+        // `observed` is the substitution, exercised directly because the
+        // variant is decided when the binary is built and this suite is one
+        // binary. "Stopped" would invite somebody to start it.
+        assert_eq!(observed(RunnerState::Running), {
+            if Variant::current().can_host_a_runner() {
+                RunnerState::Running
+            } else {
+                RunnerState::Unavailable
+            }
+        });
+        let label = RunnerState::Unavailable.label();
+        assert!(label.contains("App Store"), "{label}");
+        assert!(label.contains("configure a local agent"), "{label}");
+    }
+
+    #[test]
+    fn stopping_is_never_conditional_on_which_package_this_is() {
+        // The protective direction has no variant check in it at all. A stop
+        // that worked on three channels and not the fourth would be a stop
+        // nobody could rely on.
+        let state = state();
+        assert!(runner_stop(&state, "https://lepidy.example/").is_ok());
     }
 }

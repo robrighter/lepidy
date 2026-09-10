@@ -32,6 +32,13 @@ pub enum RunnerState {
     Exited {
         code: i32,
     },
+    /// This build cannot host a runner at all.
+    ///
+    /// Never produced by the supervisor — `ipc` substitutes it on a package
+    /// whose sandbox forbids starting a child process (PRD §10.1). It exists as
+    /// its own state rather than reusing `Stopped` because "stopped" invites
+    /// somebody to start it, and on that build nothing ever will.
+    Unavailable,
 }
 
 impl RunnerState {
@@ -40,6 +47,7 @@ impl RunnerState {
             Self::Stopped => "Runner stopped".to_string(),
             Self::Running => "Runner answering".to_string(),
             Self::Exited { code } => format!("Runner stopped unexpectedly (status {code})"),
+            Self::Unavailable => crate::distribution::runner_unavailable(),
         }
     }
 

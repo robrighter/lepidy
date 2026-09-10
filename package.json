@@ -28,7 +28,9 @@
     "desktop:dev": "tauri dev",
     "desktop:build": "node scripts/bundle-desktop.mjs",
     "desktop:build:unsigned": "node scripts/bundle-desktop.mjs --unsigned",
-    "test:desktop-gui": "node scripts/desktop-gui.mjs"
+    "test:desktop-gui": "node scripts/desktop-gui.mjs",
+    "desktop:build:mas": "node scripts/bundle-desktop.mjs --variant mas",
+    "desktop:build:msix": "node scripts/bundle-desktop.mjs --variant msix"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.124.0",

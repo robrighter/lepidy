@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The Mac App Store build's entitlements.
+
+  The interesting thing about this file is what is not in it. There is no
+  `com.apple.security.inherit`, no JIT, no unsigned executable memory, no
+  `allow-dyld-environment-variables` and no temporary exception of any kind,
+  because the capability those would be reaching for is the one the sandbox
+  exists to withhold: starting a child process with an environment we chose.
+  That capability is the whole of `lepidy run`, so this build does not have it
+  and does not pretend to (PRD §10.1).
+
+  What is here is the minimum this client needs: the sandbox itself, outgoing
+  network for the workspace and the vault, and keychain access for the device
+  credential.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.app-sandbox</key>
+  <true/>
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <key>keychain-access-groups</key>
+  <array>
+    <string>$(AppIdentifierPrefix)com.lepidy.desktop</string>
+  </array>
+</dict>
+</plist>
