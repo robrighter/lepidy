@@ -12,7 +12,7 @@ describe("Workspace Durable Object migrations", () => {
 
     await expect(stub.health()).resolves.toEqual({
       ok: true,
-      schemaVersion: 32,
+      schemaVersion: 33,
       status: "ready",
       error: null,
     });
@@ -30,7 +30,7 @@ describe("Workspace Durable Object migrations", () => {
         .toArray()
         .map(({ name }) => name);
 
-      expect(schemaRows).toEqual([{ singleton: 1, version: 32, status: "ready" }]);
+      expect(schemaRows).toEqual([{ singleton: 1, version: 33, status: "ready" }]);
       expect(tables).toEqual(
         expect.arrayContaining([
           "members",
@@ -112,12 +112,12 @@ describe("Workspace Durable Object migrations", () => {
       error: null,
     });
     await expect(stub.migrateCurrent()).resolves.toEqual({
-      version: 32,
+      version: 33,
       status: "ready",
       error: null,
     });
     await expect(stub.migrateCurrent()).resolves.toEqual({
-      version: 32,
+      version: 33,
       status: "ready",
       error: null,
     });
@@ -147,7 +147,7 @@ describe("Workspace Durable Object migrations", () => {
     });
 
     await expect(healthy.migrateCurrent()).resolves.toEqual({
-      version: 32,
+      version: 33,
       status: "ready",
       error: null,
     });

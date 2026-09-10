@@ -27,12 +27,14 @@ export function MessageActions({
   isOwnMessage,
   forwardTargets,
   viewerMemberId,
+  rankingEmoji,
 }: {
   message: MessageRow;
   canAct: boolean;
   isOwnMessage: boolean;
   forwardTargets: readonly ForwardTarget[];
   viewerMemberId: string;
+  rankingEmoji?: string | null;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -54,6 +56,9 @@ export function MessageActions({
     message.reactions.some(
       (reaction) => reaction.emoji === emoji && reaction.memberIds.includes(viewerMemberId),
     );
+  const availableReactions = rankingEmoji
+    ? [rankingEmoji, ...QUICK_REACTIONS.filter((emoji) => emoji !== rankingEmoji)]
+    : QUICK_REACTIONS;
 
   if (editing) {
     return (
@@ -109,7 +114,7 @@ export function MessageActions({
     <div className="message-actions">
       {canAct ? (
         <div className="quick-reactions" role="group" aria-label="React">
-          {QUICK_REACTIONS.map((emoji) => (
+          {availableReactions.map((emoji) => (
             <button
               key={emoji}
               type="button"

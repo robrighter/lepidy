@@ -788,6 +788,9 @@ export type McpToolName =
   | "read_channel"
   | "read_thread"
   | "post_message"
+  | "list_queue"
+  | "set_item_status"
+  | "submit_form"
   | "list_agents"
   | "agent_inbox"
   | "agent_next"
@@ -876,6 +879,38 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     ),
     requiredScope: "chat:write",
     sessionCapable: false,
+  },
+  {
+    name: "list_queue",
+    description: "List one ranked room bucket with vote counts and only the status tabs visible to this operator.",
+    inputSchema: objectSchema({
+      channel_id: string("Joined, in-scope ranked room id"),
+      status_id: { type: ["string", "null"], maxLength: 64 },
+      limit: integer(1, 100),
+    }, ["channel_id"]),
+    requiredScope: "chat:read",
+    sessionCapable: true,
+  },
+  {
+    name: "set_item_status",
+    description: "Move a ranked queue item under the operating owner's live room-admin rights and agent scope.",
+    inputSchema: objectSchema({
+      message_id: string("Top-level queue item id"),
+      status_id: { type: ["string", "null"], maxLength: 64 },
+    }, ["message_id", "status_id"]),
+    requiredScope: "chat:write",
+    sessionCapable: true,
+  },
+  {
+    name: "submit_form",
+    description: "Submit a validated structured entry to a joined form room.",
+    inputSchema: objectSchema({
+      channel_id: string("Joined, in-scope form room id"),
+      values: { type: "object" },
+      idempotency_key: string("Stable retry key", 200),
+    }, ["channel_id", "values", "idempotency_key"]),
+    requiredScope: "chat:write",
+    sessionCapable: true,
   },
   {
     name: "list_agents",

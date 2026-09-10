@@ -3,10 +3,12 @@ import { CornerUpRight, MessageSquare, Paperclip, Pencil, Pin, Trash2 } from "lu
 import type { MessageRow } from "@/src/cloudflare/workspace-rooms";
 import type { MessageLinkUnfurl, StoredFile } from "@/src/cloudflare/workspace";
 import type { MentionCard } from "@/src/domain/people";
+import type { QueueStatus } from "@/src/domain/work-queues";
 import { AgentAvatar, Avatar } from "./avatar";
 import { Markdown } from "./markdown";
 import { MessageActions, type ForwardTarget } from "./message-actions";
 import { Snippet } from "./snippet";
+import { QueueStatusControl } from "./queue-status-control";
 
 function formatTime(timestamp: number): string {
   return new Date(timestamp).toISOString().slice(11, 16);
@@ -26,6 +28,10 @@ export function MessageList({
   mentionCards,
   attachments,
   unfurls,
+  rankingEmoji,
+  queueStatuses = [],
+  mainStatusLabel = "Main",
+  canManageQueue = false,
 }: {
   messages: readonly MessageRow[];
   viewerMemberId?: string;
@@ -36,6 +42,10 @@ export function MessageList({
   attachments?: ReadonlyMap<string, readonly StoredFile[]>;
   /** Remote markup has already been reduced to bounded text by the workspace. */
   unfurls?: ReadonlyMap<string, readonly MessageLinkUnfurl[]>;
+  rankingEmoji?: string | null;
+  queueStatuses?: readonly QueueStatus[];
+  mainStatusLabel?: string;
+  canManageQueue?: boolean;
 }) {
   return (
     <ol className="messages">
@@ -65,6 +75,8 @@ export function MessageList({
                     <Pencil size={11} aria-hidden="true" /> edited
                   </span>
                 ) : null}
+                {rankingEmoji ? <span className="rank-count" title={`Votes by ${rankingEmoji}`}><span aria-hidden="true">{rankingEmoji}</span> {message.voteCount}</span> : null}
+                {canManageQueue && !deleted ? <QueueStatusControl messageId={message.id} current={message.statusId} statuses={queueStatuses} mainLabel={mainStatusLabel} /> : null}
               </p>
 
               {message.forwardedFrom && !deleted ? (
@@ -83,7 +95,7 @@ export function MessageList({
                 </p>
               ) : (
                 <>
-                  <Markdown body={message.bodyMarkdown} cards={mentionCards} idPrefix={message.id} />
+                  {message.formSubmission ? <div className="form-submission-card"><span className="tag">form submission</span><dl>{message.formSubmission.answers.filter((answer) => Array.isArray(answer.value) ? answer.value.length > 0 : answer.value.length > 0).map((answer) => <div key={answer.fieldId}><dt>{answer.label}</dt><dd>{Array.isArray(answer.value) ? answer.value.join(", ") : answer.value}</dd></div>)}</dl></div> : <Markdown body={message.bodyMarkdown} cards={mentionCards} idPrefix={message.id} />}
                   <LinkPreviews previews={unfurls?.get(message.id) ?? []} />
                   <MessageAttachments files={attachments?.get(message.id) ?? []} />
                   {message.snippet ? <Snippet snippet={message.snippet} /> : null}
@@ -118,6 +130,7 @@ export function MessageList({
                   isOwnMessage={message.authorKind === "member" && message.authorId === viewerMemberId}
                   forwardTargets={forwardTargets}
                   viewerMemberId={viewerMemberId}
+                  rankingEmoji={rankingEmoji}
                 />
               ) : null}
             </div>

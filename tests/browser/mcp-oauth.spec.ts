@@ -295,7 +295,7 @@ test("MCP-INT-011 lists and executes scoped chat and agent tools with stable att
   expect(listedResponse.status()).toBe(200);
   const listed = (await listedResponse.json()) as { result: { tools: { name: string }[] } };
   expect(listed.result.tools.map((tool) => tool.name)).toEqual(
-    expect.arrayContaining(["whoami", "read_channel", "post_message", "agent_next", "agent_post", "list_credentials", "describe_credential"]),
+    expect.arrayContaining(["whoami", "read_channel", "post_message", "list_queue", "set_item_status", "submit_form", "agent_next", "agent_post", "list_credentials", "describe_credential"]),
   );
   // D08e: no callable agent surface can manufacture a human vote.
   expect(listed.result.tools.map((tool) => tool.name)).not.toContain("vote");

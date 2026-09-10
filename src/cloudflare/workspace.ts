@@ -186,6 +186,18 @@ import {
 import { commandMessageBody, parseComposerInput } from "../domain/slash-commands";
 import { parseAgentHandle } from "../domain/mention-handle";
 import {
+  buildFormSubmission,
+  maySeeQueueStatus,
+  parseFormDefinition,
+  parseQueueStatuses,
+  queuePreset,
+  renderFormSubmission,
+  type FormDefinition,
+  type FormSubmission,
+  type QueuePreset,
+  type QueueStatus,
+} from "../domain/work-queues";
+import {
   addChannelMembers,
   addReaction,
   annotateMessages,
@@ -199,6 +211,7 @@ import {
   insertAgentSessionMessageAttribution,
   isChannelMember,
   listChannelHistory,
+  listQueueHistory,
   listThreadHistory,
   agentOwnerIds,
   visibleAgentQueueDepth,
@@ -427,6 +440,13 @@ export type ShellChannel = {
   slug: string | null;
   name: string | null;
   isMember: boolean;
+  postMode: "open" | "form";
+  formDefinition: FormDefinition | null;
+  sortMode: "chronological" | "ranked";
+  sortEmoji: string | null;
+  statusDefinitions: readonly QueueStatus[];
+  mainStatusLabel: string;
+  canManageQueue: boolean;
 };
 
 export type ShellAgent = {
@@ -450,6 +470,14 @@ export type WorkspaceShellSnapshot = {
   agents: readonly ShellAgent[];
   storageMode: WorkspaceStorageMode | null;
   schemaVersion: number;
+};
+
+export type WorkQueueSnapshot = {
+  channel: ChannelRow;
+  canManage: boolean;
+  tabs: readonly { id: string | null; label: string; count: number }[];
+  selectedStatusId: string | null;
+  page: MessagePage;
 };
 
 export type NotificationActivityItem = {
@@ -1779,8 +1807,16 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         slug: string | null;
         name: string | null;
         is_member: number;
+        post_mode: "open" | "form";
+        form_definition_json: string | null;
+        sort_mode: "chronological" | "ranked";
+        sort_emoji: string | null;
+        status_definitions_json: string;
+        main_status_label: string;
+        created_by_member_id: string | null;
       }>(
-        `SELECT c.id, c.kind, c.slug, c.name,
+        `SELECT c.id, c.kind, c.slug, c.name, c.post_mode, c.form_definition_json,
+                c.sort_mode, c.sort_emoji, c.status_definitions_json, c.main_status_label, c.created_by_member_id,
                 CASE WHEN cm.member_id IS NULL THEN 0 ELSE 1 END AS is_member
          FROM channels c
          LEFT JOIN channel_members cm ON cm.channel_id = c.id AND cm.member_id = ?
@@ -1789,13 +1825,25 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         input.memberId,
       )
       .toArray()
-      .map((row) => ({
-        id: row.id,
-        kind: row.kind,
-        slug: row.slug,
-        name: row.name,
-        isMember: row.is_member === 1,
-      }));
+      .map((row) => {
+        const roomOwner = viewerRow.role === "owner" || row.created_by_member_id === viewerRow.id;
+        const statuses = (JSON.parse(row.status_definitions_json) as QueueStatus[])
+          .filter((status) => maySeeQueueStatus(status, viewerRow.id, roomOwner));
+        return {
+          id: row.id,
+          kind: row.kind,
+          slug: row.slug,
+          name: row.name,
+          isMember: row.is_member === 1,
+          postMode: row.post_mode,
+          formDefinition: row.form_definition_json === null ? null : JSON.parse(row.form_definition_json) as FormDefinition,
+          sortMode: row.sort_mode,
+          sortEmoji: row.sort_emoji,
+          statusDefinitions: statuses,
+          mainStatusLabel: row.main_status_label,
+          canManageQueue: viewerRow.role === "owner" || viewerRow.role === "admin" || row.created_by_member_id === viewerRow.id,
+        };
+      });
 
     const agents = this.ctx.storage.sql
       .exec<{ id: string; handle: string; display_name: string; status: ShellAgent["status"] }>(
@@ -2128,6 +2176,14 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       SELECT 1 FROM channel_members cm WHERE cm.channel_id = f.channel_id AND cm.member_id = ?
     ))`);
     values.push(actor.id);
+    where.push(`(queue_message.status_id IS NULL OR c.created_by_member_id = ? OR ? = 'owner' OR EXISTS (
+      SELECT 1 FROM json_each(c.status_definitions_json) status
+      WHERE json_extract(status.value, '$.id') = queue_message.status_id
+        AND (json_extract(status.value, '$.visibility') = 'public' OR EXISTS (
+          SELECT 1 FROM json_each(status.value, '$.allowedMemberIds') allowed WHERE allowed.value = ?
+        ))
+    ))`);
+    values.push(actor.id, actor.role, actor.id);
     const query = input.query?.trim().slice(0, 200) ?? "";
     const mediaTypePrefix = input.mediaTypePrefix?.trim().toLowerCase().slice(0, 100) ?? "";
     if (query) { where.push("instr(lower(f.file_name), lower(?)) > 0"); values.push(query); }
@@ -2143,6 +2199,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                 c.name AS channel_name, c.slug AS channel_slug
          FROM files f
          LEFT JOIN members m ON m.id = f.uploaded_by_member_id
+         LEFT JOIN messages queue_message ON queue_message.id = f.message_id
          JOIN channels c ON c.id = f.channel_id
          WHERE ${where.join(" AND ")}
          ORDER BY f.created_at DESC, f.id LIMIT ?`,
@@ -2262,8 +2319,14 @@ export class Workspace extends DurableObject<CloudflareEnv> {
 
     const messageWhere = ["m.deleted_at IS NULL", "c.archived_at IS NULL", `(c.kind = 'public' OR EXISTS (
       SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_id = ?
+    ))`, `(m.status_id IS NULL OR c.created_by_member_id = ? OR ? = 'owner' OR EXISTS (
+      SELECT 1 FROM json_each(c.status_definitions_json) status
+      WHERE json_extract(status.value, '$.id') = m.status_id
+        AND (json_extract(status.value, '$.visibility') = 'public' OR EXISTS (
+          SELECT 1 FROM json_each(status.value, '$.allowedMemberIds') allowed WHERE allowed.value = ?
+        ))
     ))`];
-    const messageValues: (string | number)[] = [actor.id];
+    const messageValues: (string | number)[] = [actor.id, actor.id, actor.role, actor.id];
     if (match) { messageWhere.push("workspace_search MATCH ?"); messageValues.push(match); }
     if (query.from.length > 0) {
       messageWhere.push(`lower(COALESCE(author_member.handle, author_agent.handle, m.author_display_snapshot, m.author_id)) IN (${placeholders(query.from)})`);
@@ -2305,8 +2368,14 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     if (!query.isThread && !query.has.includes("link") && !query.has.includes("code")) {
       const fileWhere = ["f.state = 'stored'", `(c.kind = 'public' OR EXISTS (
         SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_id = ?
+      ))`, `(f.message_id IS NULL OR message.status_id IS NULL OR c.created_by_member_id = ? OR ? = 'owner' OR EXISTS (
+        SELECT 1 FROM json_each(c.status_definitions_json) status
+        WHERE json_extract(status.value, '$.id') = message.status_id
+          AND (json_extract(status.value, '$.visibility') = 'public' OR EXISTS (
+            SELECT 1 FROM json_each(status.value, '$.allowedMemberIds') allowed WHERE allowed.value = ?
+          ))
       ))`];
-      const fileValues: (string | number)[] = [actor.id];
+      const fileValues: (string | number)[] = [actor.id, actor.id, actor.role, actor.id];
       if (match) { fileWhere.push("file_search MATCH ?"); fileValues.push(match); }
       if (query.from.length > 0) {
         fileWhere.push(`lower(COALESCE(u.handle, f.uploaded_by_member_id, '')) IN (${placeholders(query.from)})`);
@@ -2326,6 +2395,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
                 f.byte_length, u.display_name AS uploader_display_name, f.created_at,
                 ${match ? "bm25(file_search)" : "0"} AS score
          FROM files f JOIN channels c ON c.id = f.channel_id
+         LEFT JOIN messages message ON message.id = f.message_id
          LEFT JOIN members u ON u.id = f.uploaded_by_member_id
          ${match ? "JOIN file_search ON file_search.rowid = f.rowid" : ""}
          WHERE ${fileWhere.join(" AND ")}
@@ -2443,6 +2513,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     if (row === null || row.state !== "stored") throw new Error("file not found");
     const channel = readChannel(this.ctx.storage, row.channel_id);
     if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))) throw new Error("file not found");
+    if (row.message_id !== null) {
+      const message = readMessage(this.ctx.storage, row.message_id);
+      if (message === null || !this.mayReadQueueItem(message, channel, actor.id)) throw new Error("file not found");
+    }
     assertKeyBelongsToWorkspace(row.object_key, this.workspaceKeyId());
     return { objectKey: row.object_key, file: this.projectFile(row) };
   }
@@ -2460,6 +2534,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       // that they merely lack permission would confirm the file exists.
       const channel = readChannel(this.ctx.storage, row.channel_id);
       if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))) throw new Error("file not found");
+      if (row.message_id !== null) {
+        const message = readMessage(this.ctx.storage, row.message_id);
+        if (message === null || !this.mayReadQueueItem(message, channel, actor.id)) throw new Error("file not found");
+      }
       const isUploader = row.uploaded_by_member_id === actor.id;
       if (!isUploader && actor.role !== "owner" && actor.role !== "admin") throw new Error("only the uploader or an administrator may delete this file");
       fileStateTransition(row.state, "deleted");
@@ -2669,7 +2747,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const actor = this.authorizeActor(input.actor);
     const root = readMessage(this.ctx.storage, input.threadRootId);
     if (root === null || root.threadRootId !== null || root.deletedAt !== null) throw new Error("thread not found");
-    this.requireVisibleChannel(root.channelId, actor.id);
+    const channel = this.requireVisibleChannel(root.channelId, actor.id);
+    this.requireReadableQueueItem(root, channel, actor.id);
     if (input.subscribed) {
       this.ctx.storage.sql.exec(
         `INSERT INTO thread_subscriptions(thread_root_id, member_id, subscribed_at) VALUES (?, ?, ?)
@@ -2858,7 +2937,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const actor = this.authorizeActor(input.actor);
     const root = readMessage(this.ctx.storage, input.threadRootId);
     if (root === null || root.threadRootId !== null) throw new Error("thread not found");
-    this.requireVisibleChannel(root.channelId, actor.id);
+    const channel = this.requireVisibleChannel(root.channelId, actor.id);
+    this.requireReadableQueueItem(root, channel, actor.id);
     const sequence = this.advanceThreadCursor(root.id, actor.id, input.sequence, input.now);
     this.broadcastToMember(actor.id, { type: "thread_read", threadRootId: root.id, sequence });
     return { sequence };
@@ -3316,6 +3396,224 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     return outcome.result;
   }
 
+  /** Replace a room's queue definition atomically; old form definitions survive disabling. */
+  async configureWorkQueue(input: {
+    actor: Actor;
+    channelId: string;
+    postMode?: "open" | "form";
+    formDefinition?: unknown;
+    sortMode?: "chronological" | "ranked";
+    sortEmoji?: string | null;
+    statuses?: unknown;
+    mainStatusLabel?: string;
+    preset?: QueuePreset;
+    now: number;
+  }): Promise<{ channel: ChannelRow }> {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireVisibleChannel(input.channelId, actor.id);
+    this.requireQueueManager(channel, actor);
+    if (channel.kind !== "public" && channel.kind !== "private") throw new Error("work queues require a named room");
+    if (channel.archivedAt !== null) throw new Error("this room is archived");
+
+    const preset = input.preset ? queuePreset(input.preset) : null;
+    const postMode = preset ? "form" : input.postMode ?? channel.postMode;
+    const sortMode = preset ? "ranked" : input.sortMode ?? channel.sortMode;
+    const formDefinition = preset?.form ?? (input.formDefinition === undefined ? channel.formDefinition : parseFormDefinition(input.formDefinition));
+    if (postMode === "form" && formDefinition === null) throw new Error("form mode needs a valid form definition");
+    const sortEmoji = preset?.rankingEmoji ?? input.sortEmoji ?? channel.sortEmoji ?? "🔥";
+    if (sortMode === "ranked" && parseReactionEmoji(sortEmoji) === null) throw new Error("ranked mode needs one emoji");
+    const statuses = preset?.statuses ?? (input.statuses === undefined ? [...channel.statusDefinitions] : parseQueueStatuses(input.statuses));
+    if (statuses === null) throw new Error("invalid status definitions");
+    if (statuses.length > 0 && sortMode !== "ranked") throw new Error("statuses require a ranked room");
+    const mainStatusLabel = parseChannelName(input.mainStatusLabel, channel.mainStatusLabel);
+    const formChanged = JSON.stringify(formDefinition) !== JSON.stringify(channel.formDefinition);
+    const removed = new Set(channel.statusDefinitions.map((status) => status.id));
+    for (const status of statuses) removed.delete(status.id);
+
+    await this.commitMutation({ scope: "queue.configure", now: input.now }, () => {
+      this.ctx.storage.sql.exec(
+        `UPDATE channels SET post_mode = ?, form_definition_json = ?,
+           form_version = form_version + ?, sort_mode = ?, sort_emoji = ?,
+           status_definitions_json = ?, main_status_label = ?, updated_at = ? WHERE id = ?`,
+        postMode,
+        formDefinition === null ? null : JSON.stringify(formDefinition),
+        formChanged ? 1 : 0,
+        sortMode,
+        sortMode === "ranked" ? sortEmoji : null,
+        JSON.stringify(statuses),
+        mainStatusLabel,
+        input.now,
+        channel.id,
+      );
+      if (removed.size > 0) {
+        const placeholders = [...removed].map(() => "?").join(",");
+        this.ctx.storage.sql.exec(
+          `UPDATE notifications SET private_item = 0, allowed_member_ids_json = '[]'
+           WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ? AND status_id IN (${placeholders}))`,
+          channel.id,
+          ...removed,
+        );
+        this.ctx.storage.sql.exec(
+          `UPDATE messages SET status_id = NULL, status_set_by_member_id = NULL, status_set_at = NULL
+           WHERE channel_id = ? AND status_id IN (${placeholders})`,
+          channel.id,
+          ...removed,
+        );
+      }
+      const ownerIds = this.ctx.storage.sql.exec<{ id: string }>(
+        "SELECT id FROM members WHERE role = 'owner' AND status = 'active'",
+      ).toArray().map((row) => row.id);
+      for (const status of statuses) {
+        const allowed = status.visibility === "private"
+          ? [...new Set([...status.allowedMemberIds, ...ownerIds])]
+          : [];
+        this.ctx.storage.sql.exec(
+          `UPDATE notifications SET private_item = ?, allowed_member_ids_json = ?
+           WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ? AND status_id = ?)`,
+          status.visibility === "private" ? 1 : 0,
+          JSON.stringify(allowed), channel.id, status.id,
+        );
+      }
+      return {
+        result: { channel: readChannel(this.ctx.storage, channel.id)! },
+        effects: this.channelEffects("queue.configured", channel.id, actor, {
+          post_mode: postMode,
+          sort_mode: sortMode,
+          status_count: statuses.length,
+          preset: input.preset ?? null,
+        }),
+      };
+    });
+    return { channel: readChannel(this.ctx.storage, channel.id)! };
+  }
+
+  /** Form submissions remain ordinary messages with an immutable structured snapshot. */
+  async submitForm(input: {
+    actor: Actor;
+    idempotencyKey: string;
+    channelId: string;
+    values: Readonly<Record<string, unknown>>;
+    now: number;
+  }): Promise<SentMessage> {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireChannelParticipant(input.channelId, actor.id);
+    if (channel.postMode !== "form" || channel.formDefinition === null) throw new Error("this room is not accepting form entries");
+    const definition = parseFormDefinition(channel.formDefinition);
+    if (definition === null) throw new Error("this form is not ready");
+    const submission = buildFormSubmission(definition, channel.formVersion, input.values);
+    for (const answer of submission.answers) {
+      if (answer.type !== "person" || typeof answer.value !== "string" || answer.value.length === 0) continue;
+      const person = answer.value.startsWith("@") ? answer.value.slice(1) : answer.value;
+      const exists = this.ctx.storage.sql.exec<{ present: number }>(
+        `SELECT 1 AS present FROM members
+         WHERE status = 'active' AND (id = ? OR handle = ? COLLATE NOCASE)`,
+        person, person,
+      ).toArray()[0]?.present === 1;
+      if (!exists) throw new Error(`${answer.label} must name an active member`);
+    }
+    return this.sendMessage({
+      actor: input.actor,
+      idempotencyKey: input.idempotencyKey,
+      channelId: channel.id,
+      bodyMarkdown: renderFormSubmission(submission),
+      contentJson: submission,
+      viaForm: true,
+      now: input.now,
+    });
+  }
+
+  /** Read one visible bucket. Private-status filtering occurs before rows leave SQLite. */
+  readWorkQueue(input: {
+    actor: Actor;
+    channelId: string;
+    statusId?: string | null;
+    limit?: number;
+  }): WorkQueueSnapshot {
+    const actor = this.authorizeActor(input.actor);
+    const channel = this.requireVisibleChannel(input.channelId, actor.id);
+    if (channel.sortMode !== "ranked" || channel.sortEmoji === null) throw new Error("this room is not ranked");
+    const owner = actor.role === "owner" || channel.createdByMemberId === actor.id;
+    const visible = channel.statusDefinitions.filter((status) => maySeeQueueStatus(status, actor.id, owner));
+    const visibleIds = visible.map((status) => status.id);
+    const selected = input.statusId ?? null;
+    const counts = this.ctx.storage.sql.exec<{ status_id: string | null; total: number }>(
+      `SELECT status_id, COUNT(*) AS total FROM messages
+       WHERE channel_id = ? AND thread_root_id IS NULL AND deleted_at IS NULL
+         AND (status_id IS NULL OR status_id IN (SELECT value FROM json_each(?)))
+       GROUP BY status_id`,
+      channel.id,
+      JSON.stringify(visibleIds),
+    ).toArray();
+    const count = new Map(counts.map((row) => [row.status_id, row.total]));
+    const populatedStatuses = visible.filter((status) => (count.get(status.id) ?? 0) > 0);
+    const tabs = [
+      { id: null, label: channel.mainStatusLabel, count: count.get(null) ?? 0 },
+      ...populatedStatuses.map((status) => ({ id: status.id, label: status.label, count: count.get(status.id) ?? 0 })),
+    ];
+    return {
+      channel,
+      canManage: this.mayManageQueue(channel, actor),
+      tabs,
+      selectedStatusId: selected,
+      page: this.decorateMessages(
+        listQueueHistory(this.ctx.storage, channel.id, channel.sortEmoji, visibleIds, selected, input.limit).messages,
+        actor.id,
+      ),
+    };
+  }
+
+  async setItemStatus(input: {
+    actor: Actor;
+    messageId: string;
+    statusId: string | null;
+    now: number;
+  }): Promise<{ changed: boolean }> {
+    const actor = this.authorizeActor(input.actor);
+    const message = readMessage(this.ctx.storage, input.messageId);
+    if (message === null || message.deletedAt !== null || message.threadRootId !== null) throw new Error("queue item not found");
+    const channel = this.requireVisibleChannel(message.channelId, actor.id);
+    this.requireQueueManager(channel, actor);
+    if (channel.sortMode !== "ranked") throw new Error("statuses require a ranked room");
+    const status = input.statusId === null ? null : channel.statusDefinitions.find((candidate) => candidate.id === input.statusId);
+    if (input.statusId !== null && status === undefined) throw new Error("queue status not found");
+    if (message.statusId === input.statusId) return { changed: false };
+    await this.commitMutation({ scope: "queue.status", now: input.now }, () => {
+      if (status?.visibility === "private" && !status.allowedMemberIds.includes(actor.id)) {
+        const next = channel.statusDefinitions.map((candidate) => candidate.id === status.id
+          ? { ...candidate, allowedMemberIds: [...candidate.allowedMemberIds, actor.id] }
+          : candidate);
+        this.ctx.storage.sql.exec(
+          "UPDATE channels SET status_definitions_json = ?, updated_at = ? WHERE id = ?",
+          JSON.stringify(next), input.now, channel.id,
+        );
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE messages SET status_id = ?, status_set_by_member_id = ?, status_set_at = ? WHERE id = ?`,
+        input.statusId, input.statusId === null ? null : actor.id, input.statusId === null ? null : input.now, message.id,
+      );
+      const ownerIds = this.ctx.storage.sql.exec<{ id: string }>(
+        "SELECT id FROM members WHERE role = 'owner' AND status = 'active'",
+      ).toArray().map((row) => row.id);
+      const allowed = status?.visibility === "private"
+        ? [...new Set([...status.allowedMemberIds, actor.id, ...ownerIds])]
+        : [];
+      this.ctx.storage.sql.exec(
+        "UPDATE notifications SET private_item = ?, allowed_member_ids_json = ? WHERE message_id = ?",
+        status?.visibility === "private" ? 1 : 0,
+        JSON.stringify(allowed),
+        message.id,
+      );
+      return {
+        result: { changed: true },
+        effects: this.channelEffects("queue.status_changed", channel.id, actor, {
+          message_id: message.id,
+          status_id: input.statusId,
+        }),
+      };
+    });
+    return { changed: true };
+  }
+
   /**
    * Write a message. This is the plan authority check: on a Solo workspace the
    * designated host owns content and this object must refuse, because storing
@@ -3332,6 +3630,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     channelId: string;
     bodyMarkdown: string;
     threadParentId?: string | null;
+    /** Internal form path only; browser composer and integrations never set it. */
+    viaForm?: boolean;
+    contentJson?: FormSubmission | null;
     confirmedBroadcastRecipients?: number;
     now: number;
   }): Promise<SentMessage> {
@@ -3354,6 +3655,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const placement = resolveThreadPlacement(parent, channel.id);
     if (placement.kind === "invalid") throw new Error(placement.reason);
     const threadRootId = placement.kind === "reply" ? placement.threadRootId : null;
+    if (channel.postMode === "form" && threadRootId === null && input.viaForm !== true) {
+      throw new Error("this room only accepts form entries");
+    }
 
     const outcome = await this.commitMutation(
       {
@@ -3392,8 +3696,19 @@ export class Workspace extends DurableObject<CloudflareEnv> {
           authorDisplaySnapshot: actor.displayName,
           bodyMarkdown: body,
           channelSequence,
+          contentJson: input.contentJson ? JSON.stringify(input.contentJson) : null,
           now: input.now,
         });
+        if (input.contentJson?.kind === "form_submission") {
+          const searchable = input.contentJson.answers
+            .map((answer) => `${answer.label} ${Array.isArray(answer.value) ? answer.value.join(" ") : answer.value}`)
+            .join("\n");
+          this.ctx.storage.sql.exec(
+            "INSERT INTO form_submission_content(message_id, searchable_text) VALUES (?, ?)",
+            messageId,
+            searchable,
+          );
+        }
         replaceMentions(this.ctx.storage, messageId, mentions, input.now);
         // A mention becomes work in the same transaction as the message, so a
         // queue item can never exist for a message that was rolled back.
@@ -3671,6 +3986,7 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const message = readMessage(this.ctx.storage, messageId);
     if (message === null || message.deletedAt !== null) throw new Error("message not found");
     const channel = this.requireChannelParticipant(message.channelId, memberId);
+    this.requireReadableQueueItem(message, channel, memberId);
     if (channel.archivedAt !== null) throw new Error("this room is archived");
     return { message, channel };
   }
@@ -3761,7 +4077,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   listPins(input: { actor: Actor; channelId: string; limit?: number }): { messages: readonly MessageRow[] } {
     const actor = this.authorizeActor(input.actor);
     const channel = this.requireVisibleChannel(input.channelId, actor.id);
-    const messages = listPinnedMessages(this.ctx.storage, channel.id, clampHistoryLimit(input.limit));
+    const messages = listPinnedMessages(this.ctx.storage, channel.id, clampHistoryLimit(input.limit))
+      .filter((message) => this.mayReadQueueItem(message, channel, actor.id));
     return {
       messages: this.decorateMessages(messages, actor.id).messages,
     };
@@ -3781,7 +4098,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const message = readMessage(this.ctx.storage, input.messageId);
     if (message === null || message.deletedAt !== null) throw new Error("message not found");
     // Visible, not necessarily joined: you may save something from an open room.
-    this.requireVisibleChannel(message.channelId, actor.id);
+    const channel = this.requireVisibleChannel(message.channelId, actor.id);
+    this.requireReadableQueueItem(message, channel, actor.id);
 
     const saved = this.ctx.storage.transactionSync(() =>
       saveMessageForMember(this.ctx.storage, actor.id, message.id, input.now),
@@ -3827,7 +4145,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
         continue;
       }
       const channel = readChannel(this.ctx.storage, pointer.message.channelId);
-      if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))) {
+      if (channel === null || !canSeeChannel(this.channelVisibility(channel, actor.id))
+        || !this.mayReadQueueItem(pointer.message, channel, actor.id)) {
         unavailable += 1;
         continue;
       }
@@ -9356,6 +9675,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const placement = resolveThreadPlacement(parent, channel.id);
     if (placement.kind === "invalid") throw new Error(placement.reason);
     const threadRootId = placement.kind === "reply" ? placement.threadRootId : null;
+    if (channel.postMode === "form" && threadRootId === null) {
+      throw new Error("this room only accepts form entries; use submit_form");
+    }
 
     const outcome = await this.commitMutation(
       {
@@ -9770,6 +10092,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }): MessagePage {
     const actor = this.authorizeActor(input.actor);
     const channel = this.requireVisibleChannel(input.channelId, actor.id);
+    if (channel.sortMode === "ranked" && channel.sortEmoji !== null) {
+      return this.readWorkQueue({ actor: input.actor, channelId: channel.id, statusId: null, limit: input.limit }).page;
+    }
     const page = listChannelHistory(this.ctx.storage, channel.id, input.cursor ?? null, input.limit);
     return { ...this.decorateMessages(page.messages, actor.id), nextCursor: page.nextCursor };
   }
@@ -9783,7 +10108,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const actor = this.authorizeActor(input.actor);
     const root = readMessage(this.ctx.storage, input.threadRootId);
     if (root === null || root.threadRootId !== null) throw new Error("thread not found");
-    this.requireVisibleChannel(root.channelId, actor.id);
+    const channel = this.requireVisibleChannel(root.channelId, actor.id);
+    this.requireReadableQueueItem(root, channel, actor.id);
     const page = listThreadHistory(this.ctx.storage, root.id, input.cursor ?? null, input.limit);
     return { ...this.decorateMessages(page.messages, actor.id), nextCursor: page.nextCursor };
   }
@@ -9797,6 +10123,9 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }): MessagePage {
     const actor = this.authorizeActor(input.actor);
     const channel = this.requireChannelParticipant(input.channelId, actor.id);
+    if (channel.sortMode === "ranked" && channel.sortEmoji !== null) {
+      return this.readWorkQueue({ actor: input.actor, channelId: channel.id, statusId: null, limit: input.limit }).page;
+    }
     const page = listChannelHistory(this.ctx.storage, channel.id, input.cursor ?? null, input.limit);
     return { ...this.decorateMessages(page.messages, actor.id), nextCursor: page.nextCursor };
   }
@@ -9810,7 +10139,8 @@ export class Workspace extends DurableObject<CloudflareEnv> {
     const actor = this.authorizeActor(input.actor);
     const root = readMessage(this.ctx.storage, input.threadRootId);
     if (root === null || root.threadRootId !== null) throw new Error("thread not found");
-    this.requireChannelParticipant(root.channelId, actor.id);
+    const channel = this.requireChannelParticipant(root.channelId, actor.id);
+    this.requireReadableQueueItem(root, channel, actor.id);
     const page = listThreadHistory(this.ctx.storage, root.id, input.cursor ?? null, input.limit);
     return {
       ...this.decorateMessages([root, ...page.messages], actor.id),
@@ -10431,6 +10761,28 @@ export class Workspace extends DurableObject<CloudflareEnv> {
       throw new Error("join this room before posting in it");
     }
     return channel;
+  }
+
+  private mayManageQueue(channel: ChannelRow, actor: ActiveMember): boolean {
+    return actor.role === "owner" || actor.role === "admin" || channel.createdByMemberId === actor.id;
+  }
+
+  private requireQueueManager(channel: ChannelRow, actor: ActiveMember): void {
+    if (!this.mayManageQueue(channel, actor)) throw new Error("only room or workspace admins may manage this queue");
+  }
+
+  private mayReadQueueItem(message: MessageRow, channel: ChannelRow, memberId: string): boolean {
+    if (message.statusId === null) return true;
+    const status = channel.statusDefinitions.find((candidate) => candidate.id === message.statusId);
+    if (status === undefined) return true;
+    const role = this.ctx.storage.sql.exec<{ role: MemberProjection["role"] }>(
+      "SELECT role FROM members WHERE id = ?", memberId,
+    ).toArray()[0]?.role;
+    return maySeeQueueStatus(status, memberId, role === "owner" || channel.createdByMemberId === memberId);
+  }
+
+  private requireReadableQueueItem(message: MessageRow, channel: ChannelRow, memberId: string): void {
+    if (!this.mayReadQueueItem(message, channel, memberId)) throw new Error("message not found");
   }
 
   private resolveActiveMemberIds(memberIds: readonly string[]): string[] {

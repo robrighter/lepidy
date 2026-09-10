@@ -163,6 +163,48 @@ async function dispatchTool(
       });
       return postResult(posted);
     }
+    case "list_queue": {
+      await assertSessionChannel(workspace, principal, actor, args.channel_id as string);
+      const queue = await workspace.readWorkQueue({
+        actor,
+        channelId: args.channel_id as string,
+        statusId: (args.status_id as string | null | undefined) ?? null,
+        limit: args.limit as number | undefined,
+      });
+      return {
+        channel: { id: queue.channel.id, name: queue.channel.slug ?? queue.channel.name ?? queue.channel.id, ranking_emoji: queue.channel.sortEmoji },
+        tabs: queue.tabs.map((tab) => ({ status_id: tab.id, label: tab.label, count: tab.count })),
+        selected_status_id: queue.selectedStatusId,
+        items: queue.page.messages.map((message) => ({
+          message_id: message.id,
+          author: message.authorDisplaySnapshot,
+          content: message.bodyMarkdown,
+          vote_count: message.voteCount,
+          status_id: message.statusId,
+          reply_count: message.replyCount,
+          created_at: message.createdAt,
+          form: message.formSubmission,
+        })),
+      };
+    }
+    case "set_item_status": {
+      const readable = await workspace.readMcpThreadHistory({ actor, threadRootId: args.message_id as string, limit: 1 });
+      const item = readable.messages[0];
+      if (!item) throw new Error("queue item not found");
+      await assertSessionChannel(workspace, principal, actor, item.channelId);
+      const changed = await workspace.setItemStatus({
+        actor, messageId: args.message_id as string, statusId: args.status_id as string | null, now: Date.now(),
+      });
+      return { message_id: args.message_id, status_id: args.status_id, changed: changed.changed };
+    }
+    case "submit_form": {
+      await assertSessionChannel(workspace, principal, actor, args.channel_id as string);
+      const sent = await workspace.submitForm({
+        actor, channelId: args.channel_id as string, values: args.values as Record<string, unknown>,
+        idempotencyKey: args.idempotency_key as string, now: Date.now(),
+      });
+      return postResult(sent);
+    }
     case "list_agents": {
       const listed = await workspace.listAgents({ actor });
       return {

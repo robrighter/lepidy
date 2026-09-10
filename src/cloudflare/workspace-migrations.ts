@@ -1376,6 +1376,55 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
       `CREATE INDEX saved_searches_member_idx ON saved_searches(member_id, updated_at DESC)`,
     ],
   },
+  {
+    version: 33,
+    name: "form rooms and ranked work queues",
+    statements: [
+      `ALTER TABLE channels ADD COLUMN post_mode TEXT NOT NULL DEFAULT 'open'
+         CHECK (post_mode IN ('open', 'form'))`,
+      `ALTER TABLE channels ADD COLUMN form_definition_json TEXT CHECK (
+         form_definition_json IS NULL OR json_valid(form_definition_json)
+       )`,
+      `ALTER TABLE channels ADD COLUMN form_version INTEGER NOT NULL DEFAULT 0 CHECK (form_version >= 0)`,
+      `ALTER TABLE channels ADD COLUMN sort_mode TEXT NOT NULL DEFAULT 'chronological'
+         CHECK (sort_mode IN ('chronological', 'ranked'))`,
+      `ALTER TABLE channels ADD COLUMN sort_emoji TEXT`,
+      `ALTER TABLE channels ADD COLUMN status_definitions_json TEXT NOT NULL DEFAULT '[]'
+         CHECK (json_valid(status_definitions_json))`,
+      `ALTER TABLE channels ADD COLUMN main_status_label TEXT NOT NULL DEFAULT 'Main'`,
+      `ALTER TABLE messages ADD COLUMN content_json TEXT CHECK (content_json IS NULL OR json_valid(content_json))`,
+      `ALTER TABLE messages ADD COLUMN status_id TEXT`,
+      `ALTER TABLE messages ADD COLUMN status_set_by_member_id TEXT REFERENCES members(id) ON DELETE SET NULL`,
+      `ALTER TABLE messages ADD COLUMN status_set_at INTEGER`,
+      `CREATE INDEX messages_queue_idx ON messages(channel_id, status_id, created_at DESC, id DESC)
+         WHERE thread_root_id IS NULL AND deleted_at IS NULL`,
+      // Structured answers have their own index even though the canonical
+      // markdown remains in messages. That preserves a clean seam for future
+      // field-aware search without changing what existing message search means.
+      `CREATE TABLE form_submission_content (
+         message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+         searchable_text TEXT NOT NULL
+       ) STRICT`,
+      `CREATE VIRTUAL TABLE form_submission_search USING fts5(
+         searchable_text,
+         content = 'form_submission_content',
+         content_rowid = 'rowid',
+         tokenize = 'unicode61 remove_diacritics 2'
+       )`,
+      `CREATE TRIGGER form_submission_search_insert AFTER INSERT ON form_submission_content BEGIN
+         INSERT INTO form_submission_search(rowid, searchable_text) VALUES (new.rowid, new.searchable_text);
+       END`,
+      `CREATE TRIGGER form_submission_search_update AFTER UPDATE OF searchable_text ON form_submission_content BEGIN
+         INSERT INTO form_submission_search(form_submission_search, rowid, searchable_text)
+           VALUES ('delete', old.rowid, old.searchable_text);
+         INSERT INTO form_submission_search(rowid, searchable_text) VALUES (new.rowid, new.searchable_text);
+       END`,
+      `CREATE TRIGGER form_submission_search_delete AFTER DELETE ON form_submission_content BEGIN
+         INSERT INTO form_submission_search(form_submission_search, rowid, searchable_text)
+           VALUES ('delete', old.rowid, old.searchable_text);
+       END`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

@@ -618,6 +618,11 @@ describe("MCP-RULE-017 tool calls are total and scope-bound", () => {
       code: -32602,
       message: "missing argument channel_id",
     });
+    expect(parseMcpToolCall({ name: "list_queue", arguments: { channel_id: "channel-1", status_id: null } }))
+      .toMatchObject({ ok: true, requiredScope: "chat:read", call: { name: "list_queue" } });
+    expect(parseMcpToolCall({ name: "submit_form", arguments: {
+      channel_id: "channel-1", values: { title: "Bug" }, idempotency_key: "mcp:form:submit:0001",
+    } })).toMatchObject({ ok: true, requiredScope: "chat:write", call: { name: "submit_form" } });
   });
 
   it("refuses unknown tools, fields, enum members and oversized values", () => {

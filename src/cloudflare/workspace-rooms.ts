@@ -4,6 +4,7 @@ import {
   parseHistoryCursor,
   type ChannelKind,
 } from "../domain/rooms";
+import type { FormDefinition, FormSubmission, QueueStatus } from "../domain/work-queues";
 
 /**
  * Storage-level reads and writes for rooms and messages.
@@ -25,6 +26,13 @@ export type ChannelRow = {
   createdAt: number;
   messageCount: number;
   lastActivityAt: number | null;
+  postMode: "open" | "form";
+  formDefinition: FormDefinition | null;
+  formVersion: number;
+  sortMode: "chronological" | "ranked";
+  sortEmoji: string | null;
+  statusDefinitions: readonly QueueStatus[];
+  mainStatusLabel: string;
 };
 
 export type MessageReaction = { emoji: string; memberIds: readonly string[] };
@@ -57,6 +65,11 @@ export type MessageRow = {
   snippet?: SnippetRow | null;
   /** Server-authored provenance for a write made through an MCP connection. */
   mcpAttribution?: McpMessageAttribution | null;
+  formSubmission: FormSubmission | null;
+  statusId: string | null;
+  statusSetByMemberId: string | null;
+  statusSetAt: number | null;
+  voteCount: number;
 };
 
 export type McpMessageAttribution = {
@@ -86,7 +99,8 @@ export type MessagePage = {
 };
 
 const CHANNEL_COLUMNS = `id, kind, slug, name, topic, dm_key, archived_at, created_by_member_id,
-                         created_at, message_count, last_activity_at`;
+                         created_at, message_count, last_activity_at, post_mode, form_definition_json,
+                         form_version, sort_mode, sort_emoji, status_definitions_json, main_status_label`;
 
 type RawChannel = {
   id: string;
@@ -100,6 +114,13 @@ type RawChannel = {
   created_at: number;
   message_count: number;
   last_activity_at: number | null;
+  post_mode: "open" | "form";
+  form_definition_json: string | null;
+  form_version: number;
+  sort_mode: "chronological" | "ranked";
+  sort_emoji: string | null;
+  status_definitions_json: string;
+  main_status_label: string;
 };
 
 function toChannel(row: RawChannel): ChannelRow {
@@ -115,13 +136,21 @@ function toChannel(row: RawChannel): ChannelRow {
     createdAt: row.created_at,
     messageCount: row.message_count,
     lastActivityAt: row.last_activity_at,
+    postMode: row.post_mode,
+    formDefinition: row.form_definition_json === null ? null : JSON.parse(row.form_definition_json) as FormDefinition,
+    formVersion: row.form_version,
+    sortMode: row.sort_mode,
+    sortEmoji: row.sort_emoji,
+    statusDefinitions: JSON.parse(row.status_definitions_json) as QueueStatus[],
+    mainStatusLabel: row.main_status_label,
   };
 }
 
 const MESSAGE_COLUMNS = `id, channel_id, thread_root_id, author_kind, author_id,
                          author_display_snapshot, body_markdown, created_at, edited_at,
                          deleted_at, channel_sequence, reply_count, last_reply_at, edit_count,
-                         forwarded_from_message_id, forwarded_from_channel_id, forwarded_author_snapshot`;
+                         forwarded_from_message_id, forwarded_from_channel_id, forwarded_author_snapshot,
+                         content_json, status_id, status_set_by_member_id, status_set_at`;
 
 type RawMessage = {
   id: string;
@@ -141,6 +170,11 @@ type RawMessage = {
   forwarded_from_message_id: string | null;
   forwarded_from_channel_id: string | null;
   forwarded_author_snapshot: string | null;
+  content_json: string | null;
+  status_id: string | null;
+  status_set_by_member_id: string | null;
+  status_set_at: number | null;
+  vote_count?: number;
 };
 
 function toMessage(row: RawMessage): MessageRow {
@@ -172,6 +206,11 @@ function toMessage(row: RawMessage): MessageRow {
             sourceVisible: false,
             sourceChannelLabel: null,
           },
+    formSubmission: row.content_json === null ? null : JSON.parse(row.content_json) as FormSubmission,
+    statusId: row.status_id,
+    statusSetByMemberId: row.status_set_by_member_id,
+    statusSetAt: row.status_set_at,
+    voteCount: row.vote_count ?? 0,
   };
 }
 
@@ -375,6 +414,7 @@ export function insertMessage(
     bodyMarkdown: string;
     channelSequence: number;
     forwardedFrom?: { messageId: string; channelId: string; authorDisplaySnapshot: string } | null;
+    contentJson?: string | null;
     now: number;
   },
 ): { threadSequence: number | null } {
@@ -392,8 +432,8 @@ export function insertMessage(
     `INSERT INTO messages(
        id, channel_id, thread_root_id, author_kind, author_id, author_display_snapshot,
        body_markdown, created_at, channel_sequence, thread_sequence,
-       forwarded_from_message_id, forwarded_from_channel_id, forwarded_author_snapshot
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       forwarded_from_message_id, forwarded_from_channel_id, forwarded_author_snapshot, content_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     message.id,
     message.channelId,
     message.threadRootId,
@@ -407,6 +447,7 @@ export function insertMessage(
     message.forwardedFrom?.messageId ?? null,
     message.forwardedFrom?.channelId ?? null,
     message.forwardedFrom?.authorDisplaySnapshot ?? null,
+    message.contentJson ?? null,
   );
   storage.sql.exec(
     `UPDATE channels SET message_count = message_count + 1, last_activity_at = ?, updated_at = ?
@@ -464,6 +505,37 @@ export function listChannelHistory(
         .toArray();
 
   return page(rows, size);
+}
+
+/** A queue is a bounded leaderboard; status visibility is part of this SQL. */
+export function listQueueHistory(
+  storage: DurableObjectStorage,
+  channelId: string,
+  rankingEmoji: string,
+  visibleStatusIds: readonly string[],
+  selectedStatusId: string | null,
+  limit: unknown,
+): MessagePage {
+  const size = clampHistoryLimit(limit);
+  if (selectedStatusId !== null && !visibleStatusIds.includes(selectedStatusId)) {
+    throw new Error("queue status not found");
+  }
+  const statusClause = selectedStatusId === null ? "m.status_id IS NULL" : "m.status_id = ?";
+  const args: (string | number)[] = [rankingEmoji, channelId];
+  if (selectedStatusId !== null) args.push(selectedStatusId);
+  args.push(size);
+  const rows = storage.sql.exec<RawMessage>(
+    `SELECT ${MESSAGE_COLUMNS.split(",").map((column) => `m.${column.trim()}`).join(", ")},
+            (SELECT COUNT(*) FROM message_reactions mr
+             WHERE mr.message_id = m.id AND mr.emoji = ?) AS vote_count
+       FROM messages m
+      WHERE m.channel_id = ? AND m.thread_root_id IS NULL AND m.deleted_at IS NULL
+        AND ${statusClause}
+      ORDER BY vote_count DESC, m.created_at DESC, m.id DESC
+      LIMIT ?`,
+    ...args,
+  ).toArray();
+  return { messages: rows.map(toMessage), nextCursor: null };
 }
 
 /** Oldest first: a thread is read forwards from the message that started it. */

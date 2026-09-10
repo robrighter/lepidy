@@ -504,6 +504,63 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
   .content { padding: 16px 14px 48px; }
 }
 
+/* ---------------- form rooms and ranked queues (C10) ---------------- */
+.room-mode-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.queue-settings { padding: 0; overflow: hidden; }
+.queue-settings summary { display: flex; align-items: center; justify-content: space-between; padding: 13px 16px; cursor: pointer; font-weight: 650; list-style: none; }
+.queue-settings summary span { display: inline-flex; align-items: center; gap: 8px; }
+.queue-settings[open] summary { border-bottom: 1px solid var(--line); }
+.queue-settings-body { display: grid; gap: 20px; padding: 18px; }
+.queue-settings-body section { display: grid; gap: 10px; }
+.queue-settings-body h3 { margin: 0; font: 650 13px/1.3 var(--font-display); }
+.queue-settings-body label, .queue-builder > label { display: grid; gap: 5px; color: var(--text-2); font-size: 12px; font-weight: 600; }
+.queue-settings-body input, .queue-settings-body textarea, .queue-settings-body select,
+.form-field input, .form-field textarea, .form-field select, .queue-status-control {
+  min-width: 0; padding: 8px 9px; border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  background: var(--surface-2); color: var(--text); font: inherit;
+}
+.preset-row, .segmented, .queue-save, .form-submit-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.preset-row button, .segmented button, .builder-add, .form-submit-actions button { padding: 7px 11px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--text-2); }
+.segmented button[aria-pressed="true"] { border-color: var(--accent); background: var(--periwinkle); color: var(--accent); }
+.queue-builder { display: grid; gap: 8px; }
+.field-builder, .status-builder { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(120px, .7fr) auto auto; align-items: center; gap: 8px; padding: 9px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--sunken); }
+.field-builder > input[aria-label="Options"], .status-builder > input[aria-label="Allowed member IDs"] { grid-column: 1 / -2; }
+.inline-check { display: flex !important; grid-auto-flow: column; align-items: center; }
+.field-builder button, .status-builder button { display: grid; width: 32px; height: 32px; place-items: center; border: 0; background: transparent; color: var(--text-3); }
+.emoji-setting { max-width: 180px; }
+.queue-save { padding-top: 14px; border-top: 1px solid var(--line); }
+.queue-save .primary, .form-composer .primary { display: inline-flex; align-items: center; gap: 7px; padding: 8px 14px; border: 0; border-radius: var(--r-sm); background: var(--accent); color: var(--on-accent); font-weight: 650; }
+.queue-tabs { display: flex; gap: 4px; padding: 6px; overflow-x: auto; }
+.queue-tabs a { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: var(--r-sm); color: var(--text-2); white-space: nowrap; }
+.queue-tabs a[aria-current="page"] { background: var(--periwinkle); color: var(--accent); font-weight: 650; }
+.queue-tabs span { min-width: 20px; padding: 1px 5px; border-radius: 999px; background: var(--sunken); color: var(--text-3); font-size: 11px; text-align: center; }
+.rank-count { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; color: var(--accent); font-weight: 700; }
+.queue-status-control { padding: 3px 6px; font-size: 11.5px; }
+.form-composer { display: grid; gap: 14px; padding: 16px; border: 1px solid var(--line-strong); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--sh-1); }
+.form-instructions { max-width: 70ch; margin: 0; color: var(--text-2); white-space: pre-wrap; }
+.form-open { justify-self: start; }
+.form-entry-details > summary { width: max-content; cursor: pointer; list-style: none; }
+.form-entry-details[open] > summary { margin-bottom: 14px; }
+.form-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
+.form-field { display: grid; align-content: start; gap: 5px; color: var(--text-2); font-size: 12px; font-weight: 650; }
+.form-field:has(textarea), .form-field:has(.form-options) { grid-column: 1 / -1; }
+.form-field b { color: var(--coral); }
+.form-options { display: flex; flex-wrap: wrap; gap: 8px 14px; padding: 8px; border: 1px solid var(--line); border-radius: var(--r-sm); }
+.form-options label { display: inline-flex; align-items: center; gap: 5px; }
+.form-submit-actions { justify-content: flex-end; margin-top: 14px; }
+.form-submission-card { margin: 7px 0 4px; padding: 12px 14px; border-left: 3px solid var(--accent); border-radius: 0 var(--r-md) var(--r-md) 0; background: var(--surface-2); }
+.form-submission-card dl { display: grid; gap: 10px; margin: 10px 0 0; }
+.form-submission-card dl div { display: grid; grid-template-columns: minmax(90px, 150px) minmax(0, 1fr); gap: 12px; }
+.form-submission-card dt { color: var(--text-3); font-size: 11.5px; font-weight: 650; }
+.form-submission-card dd { margin: 0; color: var(--text); white-space: pre-wrap; }
+@media (max-width: 700px) {
+  .field-builder, .status-builder, .form-fields { grid-template-columns: 1fr; }
+  .field-builder > input[aria-label="Options"], .status-builder > input[aria-label="Allowed member IDs"], .form-field:has(textarea), .form-field:has(.form-options) { grid-column: auto; }
+  .message-meta { flex-wrap: wrap; }
+  .rank-count { margin-left: 0; }
+  .form-submission-card dl div { grid-template-columns: 1fr; gap: 2px; }
+}
+
 /* ---------------- workspace search (C09) ----------------
    A retrieval desk: one decisive query line, a chronological evidence ledger,
    and personal shortcuts held apart from the result stream. */
