@@ -7,6 +7,7 @@ import { usePathname } from "next/navigation";
 
 import type { ShellAgent, ShellChannel, ShellViewer } from "@/src/cloudflare/workspace";
 import { sectionTitle } from "@/src/shell/shell-model";
+import { DesktopPresence } from "./desktop-presence";
 import { ProfileMenu } from "./profile-menu";
 import { Rail } from "./rail";
 import { ThemeToggle } from "./theme-toggle";
@@ -44,6 +45,7 @@ export function ShellFrame({
 
   return (
     <div className="app-shell" data-rail-open={railOpen ? "true" : "false"}>
+      <DesktopPresence unreadCount={unreadCount} />
       <Rail
         workspaceName={workspaceName}
         viewer={viewer}

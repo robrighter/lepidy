@@ -3,13 +3,36 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Lepidy</title>
+    <title>Lepidy — offline</title>
     <style>
-      body { min-height: 100vh; display: grid; place-items: center; margin: 0; background: #fff9f4; color: #1e1b4b; font: 14px/1.5 system-ui, sans-serif; }
-      main { max-width: 360px; padding: 32px; text-align: center; } img { width: 56px; } h1 { margin-bottom: 8px; } p { color: #64748b; }
+      :root { color-scheme: light dark; }
+      body { min-height: 100vh; display: grid; place-items: center; margin: 0; background: #fff9f4; color: #1e1b4b; font: 14px/1.6 system-ui, sans-serif; }
+      @media (prefers-color-scheme: dark) { body { background: #14121f; color: #ece9ff; } p { color: #a5a1c4 !important; } }
+      main { max-width: 420px; padding: 32px; text-align: center; }
+      img { width: 56px; }
+      h1 { margin-bottom: 8px; font-size: 20px; }
+      p { color: #64748b; }
+      #state { margin-top: 16px; }
+      .retry { margin-top: 20px; font-size: 13px; color: #94a3b8; }
     </style>
   </head>
   <body>
-    <main><img src="mark.svg" alt="" /><h1>Lepidy</h1><p>The desktop shell is ready. Connect to the Lepidy service to continue.</p></main>
+    <main>
+      <img src="mark.svg" alt="" />
+      <h1>Lepidy cannot reach your workspace</h1>
+      <!--
+        Filled in by the shell once this document has loaded, from the runner
+        supervisor's own state. It is deliberately empty here: a fixed sentence
+        about what is or is not running on this machine would eventually be the
+        wrong one, and the one thing worse than a window that cannot reach the
+        workspace is a window that says the agents are stopped when they are not.
+
+        This page is served from the application's own scheme, not from the
+        trusted origin, so no native command answers it — including the stop.
+        That is why the text the shell writes here names where the stop is.
+      -->
+      <p id="state" role="status" aria-live="polite"></p>
+      <p class="retry">Lepidy keeps trying, and reconnects on its own.</p>
+    </main>
   </body>
 </html>

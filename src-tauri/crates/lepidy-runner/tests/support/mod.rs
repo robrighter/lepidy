@@ -150,8 +150,15 @@ impl Double {
     }
 
     /// Wait for something to become true of the double, or give up.
+    ///
+    /// The deadline exists so a scenario fails rather than hangs; it is not a
+    /// performance assertion, and it must not be one. The slowest waits here
+    /// are behind a real spawned harness, and the whole suite runs those in
+    /// parallel — at twenty seconds the adversarial evaluation passed alone in
+    /// eleven and timed out under the full suite's load, which is a deadline
+    /// measuring the machine rather than the product.
     pub fn wait_for<T>(&self, what: &str, mut probe: impl FnMut(&DoubleState) -> Option<T>) -> T {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(90);
         while Instant::now() < deadline {
             if let Some(value) = probe(&self.state.lock().expect("the double's state")) {
                 return value;

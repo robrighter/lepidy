@@ -16,6 +16,8 @@
 //! | `runner_start` | Start it — only with a fresh native confirmation |
 //! | `local_verify` | Ask the operating system to confirm the person, for one named action |
 //! | `desktop_platform` | Report which platform this is, for layout |
+//! | `notify` | Show one sanitised notification, going to one closed-set place |
+//! | `set_badge` | Set the unread count. A count, never text |
 //!
 //! There is no command that reads a file, runs a program, or takes a path.
 //! Launch configuration is edited by the local CLI, on the machine, behind the
@@ -23,7 +25,9 @@
 
 use std::sync::Mutex;
 
+use crate::offline::LoadWatch;
 use crate::origin::TrustedOrigin;
+use crate::presence::{self, Notification, PresenceError};
 use crate::supervisor::{RunnerState, RunnerSupervisor};
 use crate::verification::{LocalAction, VerificationError, VerificationLedger};
 
@@ -32,6 +36,10 @@ pub struct NativeState {
     pub origin: TrustedOrigin,
     pub supervisor: Mutex<RunnerSupervisor>,
     pub ledger: Mutex<VerificationLedger>,
+    /// Whether the workspace is currently answering this window. See
+    /// [`crate::offline`] for why an unreachable workspace and a stopped runner
+    /// are kept as separate facts.
+    pub watch: Mutex<LoadWatch>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,6 +48,12 @@ pub enum IpcError {
     UntrustedOrigin,
     NotConfirmed(String),
     Refused(String),
+}
+
+impl From<PresenceError> for IpcError {
+    fn from(error: PresenceError) -> Self {
+        Self::Refused(error.to_string())
+    }
 }
 
 impl std::fmt::Display for IpcError {
@@ -127,6 +141,37 @@ pub fn local_verify(
     Ok(())
 }
 
+/// Show one native notification.
+///
+/// The page decides *whether* to notify — that is the workspace's notification
+/// rules, which it already evaluated to render the same event in the window.
+/// What this side decides is that the text is text and the click goes
+/// somewhere in this workspace, and it returns the path so the page can put
+/// itself there without a URL ever crossing back.
+pub fn notify(
+    state: &NativeState,
+    caller_url: &str,
+    title: &str,
+    body: &str,
+    destination: &str,
+) -> Result<Notification, IpcError> {
+    require_trusted_caller(state, caller_url)?;
+    Ok(presence::prepare(title, body, destination)?)
+}
+
+/// Set the unread badge.
+///
+/// A count. See [`presence::badge_label`] for why this interface has no string
+/// in it anywhere.
+pub fn set_badge(
+    state: &NativeState,
+    caller_url: &str,
+    unread: u64,
+) -> Result<Option<String>, IpcError> {
+    require_trusted_caller(state, caller_url)?;
+    Ok(presence::badge_label(unread))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +185,7 @@ mod tests {
                 None,
             )),
             ledger: Mutex::new(VerificationLedger::new()),
+            watch: Mutex::new(LoadWatch::new()),
         }
     }
 
@@ -170,6 +216,16 @@ mod tests {
             );
             assert_eq!(
                 local_verify(&state, url, LocalAction::StartRunner, 1_000),
+                Err(IpcError::UntrustedOrigin),
+                "{url}",
+            );
+            assert_eq!(
+                notify(&state, url, "Mention", "look", "lepidy://inbox"),
+                Err(IpcError::UntrustedOrigin),
+                "{url}",
+            );
+            assert_eq!(
+                set_badge(&state, url, 3),
                 Err(IpcError::UntrustedOrigin),
                 "{url}",
             );
@@ -245,5 +301,45 @@ mod tests {
         assert!(matches!(error, IpcError::Refused(_)), "{error:?}");
         // Fails closed: nothing was recorded, so nothing can be spent.
         assert_eq!(state.ledger.lock().expect("ledger").outstanding(), 0);
+    }
+
+    #[test]
+    fn a_notification_from_the_trusted_page_is_still_sanitised() {
+        let state = state();
+        let notification = notify(
+            &state,
+            "https://lepidy.example/c/deploys",
+            "#deploys\u{202e}",
+            "line one\nline two",
+            "lepidy://channel/deploys",
+        )
+        .expect("a notification");
+        assert_eq!(notification.title(), "#deploys");
+        assert_eq!(notification.body(), "line one line two");
+        assert_eq!(notification.destination().path(), "/c/deploys");
+    }
+
+    #[test]
+    fn a_notification_cannot_be_pointed_off_this_workspace() {
+        let state = state();
+        let error = notify(
+            &state,
+            "https://lepidy.example/",
+            "Mention",
+            "look",
+            "https://evil.test/",
+        )
+        .expect_err("an off-origin destination must be refused");
+        assert!(matches!(error, IpcError::Refused(_)), "{error:?}");
+    }
+
+    #[test]
+    fn the_badge_is_a_count_from_the_page_too() {
+        let state = state();
+        assert_eq!(set_badge(&state, "https://lepidy.example/", 0), Ok(None));
+        assert_eq!(
+            set_badge(&state, "https://lepidy.example/", 250),
+            Ok(Some("99+".to_string())),
+        );
     }
 }

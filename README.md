@@ -179,7 +179,11 @@ Run `npm run desktop:dev` after installing the Tauri system prerequisites. The d
 - Windows uses an undecorated window with the native shadow, a branded drag region, and web-rendered caption buttons.
 - Linux retains native window chrome.
 
-Only development localhost receives the narrow window capabilities needed by the custom Windows controls. Release builds currently show the bundled connection screen; the hosted production origin and its explicit capability scope will be added with the authenticated desktop bridge.
+The window opens on the workspace in every build. `LEPIDY_ORIGIN` names it — loopback in a development build, and a release build with nothing configured refuses to start rather than guessing — and the shell grants that one origin the same window-chrome capability the checked-in file grants loopback. The bundled document is now the offline fallback, shown when the workspace cannot be reached.
+
+The shell also registers the `lepidy://` scheme, raises native notifications, carries an unread badge, and registers one global kill-switch chord (`CommandOrControl+Alt+Shift+K` by default, overridable per machine with `LEPIDY_KILL_SWITCH`). A deep link can only *show* a place in this workspace — it names a destination from a closed set, never a URL, and no link approves anything, releases anything or starts anything. The offline page has no native privileges, so it says where the stop actually is: the tray, `lepidy agentd stop`, or the web app on another device. The normative boundary is [`docs/desktop-presence-contract.md`](./docs/desktop-presence-contract.md).
+
+Signed installers and the updater are not built yet; `bundle.active` is still `false`.
 
 The placeholder Cloudflare resource identifiers in `wrangler.jsonc` support local type generation and dry-run builds. Provisioned environment IDs belong in deployment-specific configuration, never in source secrets.
 

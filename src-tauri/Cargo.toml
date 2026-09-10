@@ -31,7 +31,18 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# `dynamic-acl` grants one capability at startup: the same window-chrome
+# permissions the checked-in capability file grants loopback, given to the
+# origin `LEPIDY_ORIGIN` named — which `TrustedOrigin` has already validated.
+# It is what lets the trusted origin be configuration rather than a constant
+# baked into the binary, and it adds no permission the file does not list.
+tauri = { version = "2", features = ["tray-icon", "image-png", "dynamic-acl"] }
+# Three plugins, and the reason each is a Rust dependency rather than a granted
+# capability is in `capabilities/default.json`: the shell performs these, and
+# the page reaches them only through the commands in `ipc.rs`.
+tauri-plugin-deep-link = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-global-shortcut = "2"
 thiserror = "1"
 
 # Password hashing and the vault's own primitives are deliberately expensive.

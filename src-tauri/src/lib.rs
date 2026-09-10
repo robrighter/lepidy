@@ -1,10 +1,60 @@
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+pub mod deeplink;
+pub mod hotkey;
 pub mod ipc;
 pub mod local_store;
+pub mod offline;
 pub mod origin;
+pub mod presence;
 pub mod supervisor;
 pub mod verification;
+
+/// Everything a window in this shell is allowed to do that is not a command.
+///
+/// Window chrome, and that is the whole list: no `shell`, no `fs`, no
+/// `process`, no `http`, no `updater`, no `notification`, no `global-shortcut`,
+/// no `deep-link`, no `clipboard`, no `dialog`. The three plugins this shell
+/// uses are Rust dependencies, driven from this file — a page reaches a
+/// notification or the kill switch through `ipc.rs` or not at all.
+///
+/// Mirrored in `capabilities/default.json`, which is what a development
+/// loopback window gets; [`grant_workspace_capability`] gives the same list to
+/// the configured workspace origin. `native_boundary.rs` asserts the two agree.
+const WINDOW_PERMISSIONS: [&str; 7] = [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+];
+
+/// Grant the configured workspace origin the window chrome it needs.
+///
+/// A capability file is decided when the binary is built, and the origin this
+/// shell trusts is decided when it starts — R03's decision, because a
+/// production origin baked into a binary is a default nobody notices is wrong.
+/// This is the join between the two, and it is deliberately narrow: one window,
+/// the list above, and the one origin `TrustedOrigin` already validated. It
+/// cannot admit a second origin, because there is only ever one.
+fn grant_workspace_capability(
+    app: &tauri::AppHandle,
+    origin: &origin::TrustedOrigin,
+) -> tauri::Result<()> {
+    let mut capability = tauri::ipc::CapabilityBuilder::new("workspace-origin")
+        // Remote only: the bundled offline document's grants come from the
+        // checked-in file, and it gets no command either way.
+        .local(false)
+        .window("main")
+        .remote(origin.as_str())
+        .remote(format!("{}/*", origin.as_str()));
+    for permission in WINDOW_PERMISSIONS {
+        capability = capability.permission(permission);
+    }
+    app.add_capability(capability)
+}
 
 fn desktop_platform() -> &'static str {
     #[cfg(target_os = "macos")]
@@ -15,33 +65,72 @@ fn desktop_platform() -> &'static str {
     return "linux";
 }
 
-fn build_main_window(app: &tauri::AppHandle, origin: origin::TrustedOrigin) -> tauri::Result<()> {
-    #[cfg(debug_assertions)]
+fn build_main_window(
+    app: &tauri::AppHandle,
+    state: std::sync::Arc<ipc::NativeState>,
+) -> tauri::Result<()> {
+    let origin = state.origin.clone();
+    // The window opens on the workspace, in every build. `workspace_origin`
+    // has already decided what that is — loopback in development, and a release
+    // build with nothing configured refused to start rather than guessing. The
+    // bundled document is no longer where a release build begins; it is where
+    // it lands when the workspace cannot be reached, which is what makes it an
+    // offline fallback rather than a permanent connection screen.
     let url = WebviewUrl::External(
-        "http://localhost:3000"
+        origin
+            .as_str()
             .parse()
-            .expect("valid development URL"),
+            .expect("a parsed origin is a parseable URL"),
     );
-    #[cfg(not(debug_assertions))]
-    let url = WebviewUrl::App("index.html".into());
 
     let initialization_script = format!(
         "(() => {{ const apply = () => document.documentElement.dataset.desktopPlatform = '{}'; if (document.documentElement) apply(); else addEventListener('DOMContentLoaded', apply, {{ once: true }}); }})();",
         desktop_platform()
     );
 
+    let watch_state = std::sync::Arc::clone(&state);
     let mut builder = WebviewWindowBuilder::new(app, "main", url)
         // The boundary, enforced rather than described. Messages in this
         // product are written by agents and by strangers, so a link that
         // navigates this window somewhere else is not hypothetical — and a
         // window that has navigated elsewhere is a window whose page can call
         // every native command below.
+        //
+        // Two things are admitted: the trusted origin, and the bundled offline
+        // document. The second is admitted so it can be *shown*; it is not the
+        // trusted origin, so `require_trusted_caller` refuses every command to
+        // it, which is why admitting it costs nothing.
         .on_navigation(move |url| {
-            let allowed = origin.allows(url.as_str());
+            let url = url.as_str();
+            let allowed = origin.allows(url) || offline::is_fallback_document(url);
             if !allowed {
                 eprintln!("lepidy: refused to navigate the desktop window to {url}");
             }
             allowed
+        })
+        // Whether the workspace is answering. A window that never finished
+        // loading is the only thing that puts this shell on the fallback: an
+        // HTTP error or a sign-in redirect is the workspace talking, and
+        // replacing that with "you are offline" would name the wrong problem.
+        .on_page_load(move |webview, payload| {
+            let url = payload.url().to_string();
+            let finished = matches!(payload.event(), tauri::webview::PageLoadEvent::Finished);
+            if watch_state.origin.allows(&url) {
+                let mut watch = watch_state.watch.lock().expect("watch");
+                if finished {
+                    watch.finished();
+                } else {
+                    watch.started(verification::now_ms());
+                }
+                return;
+            }
+            // The fallback document is static, so what it says about this
+            // machine is written into it here — after it has loaded, from the
+            // supervisor, so it cannot be stale and cannot overstate.
+            if finished && offline::is_fallback_document(&url) {
+                let runner = watch_state.supervisor.lock().expect("supervisor").state();
+                let _ = webview.eval(&offline::status_script(&offline::fallback_status(runner)));
+            }
         })
         .title("Lepidy")
         .inner_size(1320.0, 860.0)
@@ -77,6 +166,7 @@ fn build_main_window(app: &tauri::AppHandle, origin: origin::TrustedOrigin) -> t
 fn build_tray(
     app: &tauri::AppHandle,
     state: std::sync::Arc<ipc::NativeState>,
+    chord: Option<&hotkey::Chord>,
 ) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::TrayIconBuilder;
@@ -89,8 +179,14 @@ fn build_tray(
         None::<&str>,
     )?;
     // Stop is always enabled, and always first. A person reaching for the tray
-    // in a hurry is reaching for this.
-    let stop = MenuItem::with_id(app, "stop", "Stop the runner", true, None::<&str>)?;
+    // in a hurry is reaching for this. Its label names the global chord when
+    // one was registered, because the fastest path to a stop is worth teaching
+    // at the moment somebody is already looking for it.
+    let stop_label = match chord {
+        Some(chord) => format!("Stop the runner   {}", chord.accelerator()),
+        None => "Stop the runner".to_string(),
+    };
+    let stop = MenuItem::with_id(app, "stop", stop_label, true, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open Lepidy", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
@@ -143,11 +239,41 @@ pub fn run() {
             std::env::var_os("LEPIDY_HOME").map(std::path::PathBuf::from),
         )),
         ledger: std::sync::Mutex::new(verification::VerificationLedger::new()),
+        watch: std::sync::Mutex::new(offline::LoadWatch::new()),
     });
 
-    tauri::Builder::default()
+    // The kill-switch chord, chosen on this machine and never by a page. A
+    // mistyped override is fatal here rather than quietly replaced by the
+    // default: a person who believes they configured a kill switch and got a
+    // different key would find out at the worst possible moment.
+    let chord = hotkey::Chord::from_environment(std::env::var(hotkey::CHORD_ENV).ok().as_deref())
+        .unwrap_or_else(|error| panic!("{}: {error}", hotkey::CHORD_ENV));
+
+    let mut builder = tauri::Builder::default();
+
+    // The global shortcut. Its handler goes straight to the supervisor for
+    // exactly the reason the tray's does: a stop that can be refused is a stop
+    // that gets skipped at the moment it is needed.
+    #[cfg(desktop)]
+    {
+        let stop_state = std::sync::Arc::clone(&state);
+        builder = builder.plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(move |_app, _shortcut, event| {
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        let stopped = stop_state.supervisor.lock().expect("supervisor").stop();
+                        eprintln!("lepidy: kill switch pressed — {}", stopped.label());
+                    }
+                })
+                .build(),
+        );
+    }
+
+    builder
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_deep_link::init())
         .manage(std::sync::Arc::clone(&state))
-        // The whole native surface. Five commands, listed here so the list is
+        // The whole native surface. Seven commands, listed here so the list is
         // readable in one sitting: adding one is a deliberate act, not
         // something that happens by writing a function somewhere.
         .invoke_handler(tauri::generate_handler![
@@ -155,12 +281,30 @@ pub fn run() {
             runner_stop,
             runner_start,
             local_verify,
-            platform_name
+            platform_name,
+            notify,
+            set_badge
         ])
         .setup(move |app| {
-            build_main_window(app.handle(), state.origin.clone())?;
+            grant_workspace_capability(app.handle(), &state.origin)?;
+            build_main_window(app.handle(), std::sync::Arc::clone(&state))?;
+
             #[cfg(desktop)]
-            build_tray(app.handle(), std::sync::Arc::clone(&state))?;
+            let registered = register_kill_switch(app.handle(), &chord);
+            #[cfg(not(desktop))]
+            let registered: Option<hotkey::Chord> = None;
+
+            #[cfg(desktop)]
+            build_tray(
+                app.handle(),
+                std::sync::Arc::clone(&state),
+                registered.as_ref(),
+            )?;
+
+            #[cfg(desktop)]
+            listen_for_deep_links(app.handle(), std::sync::Arc::clone(&state));
+
+            watch_for_an_unreachable_workspace(app.handle(), std::sync::Arc::clone(&state));
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -198,6 +342,163 @@ fn agentd_path() -> std::path::PathBuf {
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join(name)))
         .unwrap_or_else(|| std::path::PathBuf::from(name))
+}
+
+/* -------------------------------------------------------------------------- */
+/* Deep links, the kill switch and the offline fallback (P01a)                  */
+/* -------------------------------------------------------------------------- */
+
+/// Register the one global chord, and say so either way.
+///
+/// Returns the chord when the operating system gave it up, so the tray can name
+/// it — and `None` when it did not, because a kill switch that is silently not
+/// registered is a kill switch that does not exist and the moment a person
+/// discovers that is the moment they needed it.
+#[cfg(desktop)]
+fn register_kill_switch(app: &tauri::AppHandle, chord: &hotkey::Chord) -> Option<hotkey::Chord> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    match app.global_shortcut().register(chord.accelerator()) {
+        Ok(()) => {
+            eprintln!("lepidy: {}", chord.describe());
+            Some(chord.clone())
+        }
+        Err(error) => {
+            eprintln!(
+                "lepidy: {}",
+                hotkey::registration_failed(chord, &error.to_string())
+            );
+            None
+        }
+    }
+}
+
+/// Listen for `lepidy://` links handed over by the operating system.
+#[cfg(desktop)]
+fn listen_for_deep_links(app: &tauri::AppHandle, state: std::sync::Arc<ipc::NativeState>) {
+    use tauri_plugin_deep_link::DeepLinkExt;
+
+    // Windows and Linux need the scheme claimed at runtime for a development
+    // build; an installed build has it from the installer. A failure here is
+    // reported and survivable: no deep link works, and everything else does.
+    #[cfg(any(windows, target_os = "linux"))]
+    if let Err(error) = app.deep_link().register(deeplink::SCHEME) {
+        eprintln!(
+            "lepidy: could not claim the {}: scheme ({error})",
+            deeplink::SCHEME
+        );
+    }
+
+    let handle = app.clone();
+    app.deep_link().on_open_url(move |event| {
+        for url in event.urls() {
+            open_deep_link(&handle, &state, url.as_str());
+        }
+    });
+}
+
+/// Open a `lepidy://` link, or refuse it out loud.
+///
+/// The address is built here, from the trusted origin and a validated
+/// destination's path. Nothing that arrived in the link is navigated to, which
+/// is what makes a registered URL scheme safe to have: the operating system
+/// hands this process input from anywhere, without asking anybody.
+fn open_deep_link(app: &tauri::AppHandle, state: &ipc::NativeState, link: &str) {
+    let destination = match deeplink::parse(link) {
+        Ok(destination) => destination,
+        Err(error) => {
+            eprintln!("lepidy: refused to open {link} ({error})");
+            return;
+        }
+    };
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let target = format!("{}{}", state.origin.as_str(), destination.path());
+    match target.parse::<tauri::Url>() {
+        // `on_navigation` checks this again. Deliberately: the check that makes
+        // the window safe should not depend on every caller having been careful.
+        Ok(url) => {
+            let _ = window.navigate(url);
+        }
+        Err(error) => eprintln!("lepidy: could not open {target} ({error})"),
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+/// Show the bundled fallback once the workspace has stopped answering, then
+/// keep trying.
+///
+/// A thread rather than an alarm because it must keep running while the window
+/// is showing a page that cannot ask for anything: the fallback document is not
+/// the trusted origin, so it has no native commands, and the retry has to come
+/// from this side.
+fn watch_for_an_unreachable_workspace(
+    app: &tauri::AppHandle,
+    state: std::sync::Arc<ipc::NativeState>,
+) {
+    let handle = app.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(1_000));
+        let attempts = {
+            let mut watch = state.watch.lock().expect("watch");
+            if !watch.timed_out(verification::now_ms()) {
+                continue;
+            }
+            watch.gave_up();
+            watch.attempts()
+        };
+        show_fallback(&handle, &state);
+        std::thread::sleep(std::time::Duration::from_millis(offline::retry_delay_ms(
+            attempts,
+        )));
+        if let Some(window) = handle.get_webview_window("main") {
+            if let Ok(url) = state.origin.as_str().parse::<tauri::Url>() {
+                let _ = window.navigate(url);
+            }
+        }
+    });
+}
+
+/// Put the window on the bundled document, carrying the true local state.
+fn show_fallback(app: &tauri::AppHandle, state: &ipc::NativeState) {
+    let runner = state.supervisor.lock().expect("supervisor").state();
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    // The document is bundled and static; what it says about this machine is
+    // written in by `on_page_load` once it has loaded, because the one thing
+    // worse than a window that cannot reach the workspace is a window that
+    // tells somebody their agents are stopped when they are not.
+    if let Ok(url) = offline::fallback_url().parse::<tauri::Url>() {
+        let _ = window.navigate(url);
+    }
+    #[cfg(desktop)]
+    if let Some(tray) = app.tray_by_id("lepidy") {
+        let _ = tray.set_tooltip(Some(offline::fallback_tooltip(runner)));
+    }
+}
+
+/// Put the unread count where the operating system shows one.
+///
+/// Three surfaces, because no single one of them exists everywhere: the dock
+/// badge on macOS and Linux, the tray tooltip on all three, and nothing on the
+/// Windows taskbar, whose badge is an overlay icon this shell does not draw.
+fn apply_badge(app: &tauri::AppHandle, unread: u64, label: Option<&str>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_badge_count(presence::badge_count(unread));
+        #[cfg(target_os = "macos")]
+        let _ = window.set_badge_label(label.map(str::to_string));
+    }
+    #[cfg(desktop)]
+    if let Some(tray) = app.tray_by_id("lepidy") {
+        let tooltip = match label {
+            Some(label) => format!("Lepidy — {label} unread"),
+            None => "Lepidy".to_string(),
+        };
+        let _ = tray.set_tooltip(Some(tooltip));
+    }
+    let _ = label;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -263,6 +564,51 @@ fn local_verify(
         verification::now_ms(),
     )
     .map_err(|error| error.to_string())
+}
+
+/// Show one native notification, and say where clicking it should lead.
+///
+/// The path that comes back is on this workspace by construction: it was built
+/// from a destination the deep-link parser accepted, and that parser is the
+/// same one the operating system's links go through. So the page navigates
+/// itself, and no URL it composed ever decided anything.
+#[tauri::command]
+fn notify(
+    webview: tauri::Webview,
+    app: tauri::AppHandle,
+    state: NativeHandle<'_>,
+    title: String,
+    body: String,
+    destination: String,
+) -> Result<String, String> {
+    let notification = ipc::notify(&state, &caller_url(&webview), &title, &body, &destination)
+        .map_err(|error| error.to_string())?;
+    #[cfg(desktop)]
+    {
+        use tauri_plugin_notification::NotificationExt;
+        app.notification()
+            .builder()
+            .title(notification.title())
+            .body(notification.body())
+            .show()
+            .map_err(|error| error.to_string())?;
+    }
+    let _ = &app;
+    Ok(notification.destination().path())
+}
+
+/// Set the unread badge. A count, never text — see `presence::badge_label`.
+#[tauri::command]
+fn set_badge(
+    webview: tauri::Webview,
+    app: tauri::AppHandle,
+    state: NativeHandle<'_>,
+    unread: u64,
+) -> Result<(), String> {
+    let label =
+        ipc::set_badge(&state, &caller_url(&webview), unread).map_err(|error| error.to_string())?;
+    apply_badge(&app, unread, label.as_deref());
+    Ok(())
 }
 
 #[tauri::command]

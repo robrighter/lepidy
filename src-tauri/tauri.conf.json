@@ -19,5 +19,14 @@
     "active": false,
     "category": "Business",
     "shortDescription": "A shared workspace for people and agents"
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "lepidy"
+        ]
+      }
+    }
   }
 }

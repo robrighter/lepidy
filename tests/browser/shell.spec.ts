@@ -289,3 +289,51 @@ test("DESKTOP-INT-003 keeps the rail below the reserved native titlebar", async 
   const desktopTop = await page.locator(".rail").evaluate((rail) => rail.getBoundingClientRect().top);
   expect(desktopTop).toBe(34);
 });
+
+test("DESKTOP-INT-004 hands the unread count to the desktop shell as a number", async ({ page }) => {
+  // The shell's badge interface takes a count and only a count, so the web half
+  // must never be the place a string could get in. This stands in for the Tauri
+  // runtime and records what the page actually asked for.
+  await page.addInitScript(() => {
+    const calls: { command: string; payload: unknown }[] = [];
+    (window as unknown as Record<string, unknown>).__lepidyBadgeCalls = calls;
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: (command: string, payload: unknown) => {
+        calls.push({ command, payload });
+        return Promise.resolve(null);
+      },
+      transformCallback: (callback: unknown) => callback,
+    };
+  });
+
+  await page.goto("/");
+  await page.waitForFunction(
+    () => ((window as unknown as { __lepidyBadgeCalls?: unknown[] }).__lepidyBadgeCalls ?? []).length > 0,
+  );
+
+  const calls = await page.evaluate(
+    () => (window as unknown as { __lepidyBadgeCalls: { command: string; payload: { unread: unknown } }[] }).__lepidyBadgeCalls,
+  );
+  expect(calls[0].command).toBe("set_badge");
+  const unread = calls[0].payload.unread;
+  expect(typeof unread).toBe("number");
+  expect(Number.isInteger(unread as number)).toBe(true);
+  expect(unread as number).toBeGreaterThanOrEqual(0);
+});
+
+test("DESKTOP-INT-005 asks the machine for nothing when it is a browser", async ({ page }) => {
+  // The same component renders on every page load in every browser. A shell
+  // bridge that ran outside the shell would be an unhandled rejection in a
+  // layout component, which takes the workspace down with it.
+  const failures: string[] = [];
+  page.on("pageerror", (error) => failures.push(error.message));
+
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
+
+  const reachedTheMachine = await page.evaluate(
+    () => "__TAURI_INTERNALS__" in window,
+  );
+  expect(reachedTheMachine).toBe(false);
+  expect(failures).toEqual([]);
+});

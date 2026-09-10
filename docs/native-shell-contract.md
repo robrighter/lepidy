@@ -1,8 +1,11 @@
 # The native shell contract
 
 Status: implemented 2026-09-07 (R03). Companion to the
-[local runner contract](./local-runner-contract.md) and the
-[harness preset contract](./harness-preset-contract.md).
+[local runner contract](./local-runner-contract.md), the
+[harness preset contract](./harness-preset-contract.md) and the
+[desktop presence contract](./desktop-presence-contract.md), which extends the
+command surface below to seven and owns deep links, notifications, badges, the
+kill-switch chord and the offline fallback.
 
 The desktop shell is a window onto a workspace plus four native abilities. This
 records what those are, what guards each of them, and what is deliberately not
@@ -34,11 +37,17 @@ The window loads exactly one origin and IPC is answered only for that origin.
   origin and is refused outright — those are exactly the pieces a look-alike
   relies on.
 - Enforced on navigation, not merely described: `on_navigation` refuses and logs
-  anything outside the origin.
+  anything outside the origin. Since P01a it admits one further thing — the
+  bundled offline document — which is admitted so it can be *shown* and is still
+  refused every command, because it is not the trusted origin.
+- Since P01a the window opens on that origin in every build, and the origin is
+  granted its window-chrome capability at startup from the same validated value.
 
 ## 3. The command surface
 
-Five commands. That is the whole list.
+Five commands at R03; seven since P01a added `notify` and `set_badge`, which the
+[desktop presence contract](./desktop-presence-contract.md) covers. That is the
+whole list.
 
 | Command | Guard |
 |---|---|
@@ -47,14 +56,18 @@ Five commands. That is the whole list.
 | `runner_start` | Origin, plus a fresh native confirmation for exactly this action |
 | `local_verify` | Origin. Asks the OS; the page cannot answer |
 | `platform_name` | Origin. Returns a constant |
+| `notify` | Origin. Sanitises the text; the click goes to a closed-set place |
+| `set_badge` | Origin. Takes a count and only a count |
 
 There is no command that reads a file, runs a program, or takes a path. Launch
 configuration is edited by the local CLI on the machine — never through this
 window.
 
 The capability file grants only window chrome: no `shell`, no `fs`, no
-`process`, no `http`, no `updater`, no `notification`, no `clipboard`, no
-`dialog`. `withGlobalTauri` is off, and the CSP has no `unsafe-eval`.
+`process`, no `http`, no `updater`, no `notification`, no `global-shortcut`, no
+`deep-link`, no `clipboard`, no `dialog`. `withGlobalTauri` is off, and the CSP
+has no `unsafe-eval`. P01a's three plugins are Rust dependencies driven from the
+shell, not permissions granted to a page.
 
 ## 4. Stopping never asks
 
