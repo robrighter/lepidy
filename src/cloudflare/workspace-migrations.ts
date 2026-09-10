@@ -1523,6 +1523,36 @@ export const WORKSPACE_MIGRATIONS: readonly WorkspaceMigration[] = [
        BEGIN SELECT RAISE(ABORT, 'workspace requires an active owner'); END`,
     ],
   },
+  {
+    version: 36,
+    name: "tenant export chunks",
+    statements: [
+      // The chunks a resumable export is assembled from. They are a copy of a
+      // workspace's content sitting outside the tables that hold it, so the
+      // expiry column is a liability window rather than housekeeping: D07 §3
+      // gives them 24 hours whether or not anybody downloaded them.
+      `CREATE TABLE export_runs (
+         id TEXT PRIMARY KEY,
+         version INTEGER NOT NULL,
+         requested_by_member_id TEXT NOT NULL,
+         requested_at INTEGER NOT NULL,
+         expires_at INTEGER NOT NULL,
+         completed_at INTEGER,
+         manifest_hash TEXT
+       ) STRICT`,
+      `CREATE TABLE export_chunks (
+         id TEXT PRIMARY KEY,
+         export_id TEXT NOT NULL REFERENCES export_runs(id) ON DELETE CASCADE,
+         table_name TEXT NOT NULL,
+         offset_rows INTEGER NOT NULL CHECK (offset_rows >= 0),
+         row_count INTEGER NOT NULL CHECK (row_count >= 0),
+         sha256 TEXT NOT NULL,
+         body TEXT NOT NULL,
+         created_at INTEGER NOT NULL
+       ) STRICT`,
+      `CREATE INDEX export_chunks_run_idx ON export_chunks(export_id, table_name, offset_rows)`,
+    ],
+  },
 ] as const;
 
 function errorMessage(error: unknown): string {

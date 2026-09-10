@@ -44,6 +44,18 @@ import {
 } from "../domain/due-work";
 import { parseIdempotencyKey } from "../domain/idempotency-key";
 import {
+  assertVaultRecordIsCiphertextOnly,
+  chunkId,
+  CHUNK_TTL_MS,
+  EXPORT_VERSION,
+  exportedTables,
+  manifestHash,
+  replacementRoutingEpoch,
+  restorableTables,
+  sha256,
+  type ChunkSummary,
+} from "../domain/tenant-export";
+import {
   assertReceiptCarriesNoContent,
   authorizePurge,
   nextPurgeStage,
@@ -10931,6 +10943,263 @@ export class Workspace extends DurableObject<CloudflareEnv> {
   }
 
   /* ------------------------------------------------------------------------ */
+  /* Taking this workspace out, and putting one back (O01b)                    */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Begin a portable export.
+   *
+   * Owner authority, because an export is every message in the workspace in one
+   * file. No step-up: unlike a deletion this is recoverable — the chunks expire
+   * on their own and produce nothing that cannot be produced again — and asking
+   * for a gesture on a read is how gestures stop meaning anything.
+   */
+  beginExport(input: { actor: Actor; now: number }): { exportId: string; expiresAt: number } {
+    const actor = this.authorizeActor(input.actor);
+    if (actor.role !== "owner") throw new Error("only an owner may export a workspace");
+    const exportId = `exp_${crypto.randomUUID()}`;
+    const expiresAt = input.now + CHUNK_TTL_MS;
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO export_runs(id, version, requested_by_member_id, requested_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        exportId, EXPORT_VERSION, actor.id, input.now, expiresAt,
+      );
+      appendAuditEntry(this.ctx.storage, this.workspaceKey(), {
+        eventType: "workspace.export_started",
+        outcome: "allowed",
+        requesterKind: "member",
+        requesterId: actor.id,
+        subjectKind: "workspace",
+        subjectId: this.workspaceKey(),
+        metadata: { export_id: exportId, version: EXPORT_VERSION },
+      }, input.now);
+    });
+    return { exportId, expiresAt };
+  }
+
+  /**
+   * Produce one chunk, or return the one already produced.
+   *
+   * Resumable by construction: the chunk's id is a function of the export, the
+   * table and the offset, so a client that lost its connection asks for the same
+   * id and gets **the same bytes** rather than a differently-sliced export it
+   * cannot stitch to what it already has. Re-requesting is a read, not a
+   * re-serialisation.
+   */
+  exportChunk(input: {
+    actor: Actor;
+    exportId: string;
+    table: string;
+    offset: number;
+    limit?: number;
+    now: number;
+  }): { chunk: ChunkSummary; body: string; done: boolean } {
+    const actor = this.authorizeActor(input.actor);
+    if (actor.role !== "owner") throw new Error("only an owner may export a workspace");
+    const run = this.requireExportRun(input.exportId, input.now);
+    if (!exportedTables().includes(input.table)) {
+      throw new Error(`${input.table} is not part of an export`);
+    }
+    const id = chunkId(run.id, input.table, input.offset);
+
+    const existing = this.ctx.storage.sql
+      .exec<{ row_count: number; sha256: string; body: string }>(
+        "SELECT row_count, sha256, body FROM export_chunks WHERE id = ?",
+        id,
+      )
+      .toArray()[0];
+    if (existing) {
+      return {
+        chunk: { id, rows: existing.row_count, sha256: existing.sha256 },
+        body: existing.body,
+        done: existing.row_count === 0,
+      };
+    }
+
+    const limit = Math.min(Math.max(input.limit ?? 500, 1), 2_000);
+    const rows = this.ctx.storage.sql
+      .exec<Record<string, SqlStorageValue>>(
+        `SELECT * FROM ${input.table} LIMIT ? OFFSET ?`,
+        limit,
+        input.offset,
+      )
+      .toArray();
+    // Checked on the way out, against the rows actually being written rather
+    // than against the function that was supposed to have produced them.
+    for (const row of rows) assertVaultRecordIsCiphertextOnly(input.table, row);
+
+    // JSONL, one record per line, each carrying its own immutable ids and
+    // timestamps so an import can preserve attribution without inventing any.
+    const body = rows.map((row) => JSON.stringify({ t: input.table, r: row })).join("\n");
+    return { chunk: { id, rows: rows.length, sha256: "" }, body, done: rows.length < limit };
+  }
+
+  /** Store a produced chunk so a resumed export returns identical bytes. */
+  async recordExportChunk(input: {
+    actor: Actor;
+    exportId: string;
+    table: string;
+    offset: number;
+    body: string;
+    rows: number;
+    now: number;
+  }): Promise<ChunkSummary> {
+    const actor = this.authorizeActor(input.actor);
+    if (actor.role !== "owner") throw new Error("only an owner may export a workspace");
+    const run = this.requireExportRun(input.exportId, input.now);
+    const id = chunkId(run.id, input.table, input.offset);
+    const digest = await sha256(input.body);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO export_chunks(id, export_id, table_name, offset_rows, row_count, sha256, body, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+      id, run.id, input.table, input.offset, input.rows, digest, input.body, input.now,
+    );
+    return { id, rows: input.rows, sha256: digest };
+  }
+
+  /** Seal the export with a hash over every chunk, in order. */
+  async finishExport(input: { actor: Actor; exportId: string; now: number }): Promise<{
+    version: number;
+    exportId: string;
+    chunks: readonly ChunkSummary[];
+    manifestHash: string;
+  }> {
+    const actor = this.authorizeActor(input.actor);
+    if (actor.role !== "owner") throw new Error("only an owner may export a workspace");
+    const run = this.requireExportRun(input.exportId, input.now);
+    const chunks = this.ctx.storage.sql
+      .exec<{ id: string; row_count: number; sha256: string }>(
+        "SELECT id, row_count, sha256 FROM export_chunks WHERE export_id = ? ORDER BY id",
+        run.id,
+      )
+      .toArray()
+      .map((row) => ({ id: row.id, rows: row.row_count, sha256: row.sha256 }));
+    const hash = await manifestHash(run.id, chunks);
+    this.ctx.storage.sql.exec(
+      "UPDATE export_runs SET completed_at = ?, manifest_hash = ? WHERE id = ?",
+      input.now, hash, run.id,
+    );
+    return { version: EXPORT_VERSION, exportId: run.id, chunks, manifestHash: hash };
+  }
+
+  private requireExportRun(exportId: string, now: number): { id: string; expires_at: number } {
+    const run = this.ctx.storage.sql
+      .exec<{ id: string; expires_at: number }>(
+        "SELECT id, expires_at FROM export_runs WHERE id = ?",
+        exportId,
+      )
+      .toArray()[0];
+    if (!run) throw new Error("that export does not exist");
+    // Expiry is enforced on read as well as swept, so a chunk cannot be
+    // collected from an export whose window has closed even if the sweep has
+    // not run yet.
+    if (run.expires_at <= now) throw new Error("that export has expired");
+    return run;
+  }
+
+  /** Drop expired export chunks, downloaded or not. */
+  sweepExpiredExports(now: number): { runs: number } {
+    return {
+      runs: this.ctx.storage.sql.exec("DELETE FROM export_runs WHERE expires_at <= ?", now)
+        .rowsWritten,
+    };
+  }
+
+  /**
+   * Restore an export into this workspace, which must be empty.
+   *
+   * Three properties, and the second is the one this whole task exists for.
+   *
+   * It **targets a replacement**: this object refuses unless it holds no
+   * content, so a restore can never merge into a live workspace and quietly
+   * mix somebody's old data with their current data.
+   *
+   * It **cannot resurrect authority**. Which tables are written is decided by
+   * `restoreDecision`, and a table classified as authority or transient has no
+   * branch that writes it — a session, a device, a delegation, a grant, an
+   * approval, an OAuth token, a queued wake and a nonce all arrive in the
+   * export and none of them lands. That is D07 §4's promise, and it is
+   * structural rather than a list of exclusions somebody remembers.
+   *
+   * It **takes a new routing epoch**, so anything still holding the old one —
+   * a socket, a signed device request, a runner lease — is refused rather than
+   * silently accepted against restored data.
+   */
+  async restoreFromExport(input: {
+    version: number;
+    lines: readonly string[];
+    manifestHash: string;
+    chunks: readonly ChunkSummary[];
+    exportId: string;
+    now: number;
+  }): Promise<{
+    routingEpoch: number;
+    restored: Record<string, number>;
+    refused: Record<string, number>;
+  }> {
+    if (input.version !== EXPORT_VERSION) {
+      throw new Error("this export was written by a version of Lepidy this one does not know");
+    }
+    const expected = await manifestHash(input.exportId, input.chunks);
+    if (expected !== input.manifestHash) {
+      // Verified before a single row is written. A partially restored workspace
+      // built from an export that had been reordered or truncated would be
+      // worse than none at all, because it would look complete.
+      throw new Error("the export manifest hash does not match its chunks");
+    }
+    const occupied = this.ctx.storage.sql
+      .exec<{ count: number }>("SELECT COUNT(*) AS count FROM members")
+      .one().count;
+    if (occupied > 0) throw new Error("a restore needs a replacement workspace, not a live one");
+
+    const restored: Record<string, number> = {};
+    const refused: Record<string, number> = {};
+    const allowed = new Set(restorableTables());
+
+    this.ctx.storage.transactionSync(() => {
+      // In insert order, which is the reverse of purge order, so a parent
+      // exists before the rows that reference it.
+      for (const table of restorableTables()) {
+        for (const line of input.lines) {
+          if (!line) continue;
+          const record = JSON.parse(line) as { t: string; r: Record<string, unknown> };
+          if (record.t !== table) continue;
+          const columns = Object.keys(record.r);
+          this.ctx.storage.sql.exec(
+            `INSERT INTO ${table}(${columns.join(", ")})
+             VALUES (${columns.map(() => "?").join(", ")}) ON CONFLICT DO NOTHING`,
+            ...columns.map((column) => record.r[column] as never),
+          );
+          restored[table] = (restored[table] ?? 0) + 1;
+        }
+      }
+      // Everything else is counted and dropped, so the caller can see what an
+      // export contained that a restore declined to bring back.
+      for (const line of input.lines) {
+        if (!line) continue;
+        const record = JSON.parse(line) as { t: string };
+        if (allowed.has(record.t)) continue;
+        refused[record.t] = (refused[record.t] ?? 0) + 1;
+      }
+
+      const previous = this.ctx.storage.sql
+        .exec<{ routing_epoch: number }>("SELECT routing_epoch FROM workspace_config WHERE singleton = 1")
+        .one().routing_epoch;
+      const routingEpoch = replacementRoutingEpoch(previous);
+      this.ctx.storage.sql.exec(
+        "UPDATE workspace_config SET routing_epoch = ?, updated_at = ? WHERE singleton = 1",
+        routingEpoch, input.now,
+      );
+    });
+
+    const routingEpoch = this.ctx.storage.sql
+      .exec<{ routing_epoch: number }>("SELECT routing_epoch FROM workspace_config WHERE singleton = 1")
+      .one().routing_epoch;
+    return { routingEpoch, restored, refused };
+  }
+
+  /* ------------------------------------------------------------------------ */
   /* Deleting this workspace (O01a)                                            */
   /* ------------------------------------------------------------------------ */
 
@@ -12306,6 +12575,10 @@ export class Workspace extends DurableObject<CloudflareEnv> {
             break;
           }
           case "storage_reclaim": {
+            // Export chunks expire on the same sweep: they are a copy of this
+            // workspace's content sitting outside the tables that hold it, so
+            // their lifetime is a liability window rather than housekeeping.
+            this.sweepExpiredExports(now);
             const report = await this.reclaimStorage({ now });
             storage = {
               abandoned: storage.abandoned + report.abandoned,

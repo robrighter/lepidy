@@ -161,58 +161,79 @@ export const PURGE_KEEPS: readonly string[] = [
  */
 export const PURGE_TABLES: Record<PurgeStage, readonly string[]> = {
   attachments: ["files", "file_search", "solo_upgrade_attachments"],
+  // Children before parents, always. The purge does not strictly need this —
+  // most of these cascade — but the **reverse** of this order is what a restore
+  // inserts in (see `tenant-export.ts`), and there a parent that does not exist
+  // yet is a foreign-key failure. One ordered list serving both directions is
+  // what keeps them from disagreeing about which table references which.
+  // Children before parents, always, and a full-text index after the table it
+  // indexes. The purge does not strictly need the first — most of these
+  // cascade — but the **reverse** of this order is what a restore inserts in
+  // (see `tenant-export.ts`), and there a parent that does not exist yet is a
+  // foreign-key failure. One ordered list serving both directions is what keeps
+  // them from disagreeing about which table references which.
   content: [
-    "messages",
+    // Everything that points at a message.
     "message_mentions",
     "message_reactions",
-    "message_drafts",
     "message_snippets",
     "message_unfurls",
-    "link_unfurls",
     "form_submission_content",
-    // The search indexes, and this is the one nobody thinks of: a purge that
-    // dropped every message and left the full-text index behind would leave a
-    // deleted workspace's content still searchable, in a table whose rows are
-    // the words themselves.
-    "workspace_search",
-    "form_submission_search",
-    "channels",
-    "channel_members",
+    "saved_items",
     "channel_pins",
-    "channel_read_state",
-    "channel_message_sequence",
-    "channel_notification_preferences",
     "thread_read_state",
     "thread_subscriptions",
     "scheduled_messages",
-    "saved_items",
-    "saved_searches",
-    "custom_emoji",
+    "message_drafts",
     "notifications",
+    "messages",
+    // The search indexes, and this is the one nobody thinks of: a purge that
+    // dropped every message and left the full-text index behind would leave a
+    // deleted workspace's content still searchable, in a table whose rows are
+    // the words themselves. They go after their content, because an
+    // external-content index cannot be emptied before the table it mirrors.
+    "workspace_search",
+    "form_submission_search",
+    // Everything that points at a channel.
+    "channel_members",
+    "channel_read_state",
+    "channel_message_sequence",
+    "channel_notification_preferences",
     "notification_keywords",
     "notification_preferences",
-    "solo_upgrade_channels",
+    "saved_searches",
+    "custom_emoji",
+    "link_unfurls",
     "solo_upgrade_messages",
+    "solo_upgrade_channels",
     "solo_upgrade_imports",
+    // An agent's scope names rooms, so it belongs with the rooms rather than
+    // with the agents: on the way back in, the channel has to exist first.
+    "agent_scope_channels",
+    "channels",
   ],
   vault: [
-    "vault_credentials",
+    "vault_canary_trips",
+    "vault_usage_events",
+    "vault_proxy_requests",
+    "vault_approval_approvers",
+    "vault_approval_items",
+    "vault_approvals",
+    "vault_grants",
+    "vault_credential_deletions",
     "vault_credential_acl",
     "vault_credential_key_wraps",
-    "vault_credential_deletions",
-    "vault_grants",
-    "vault_approvals",
-    "vault_approval_items",
-    "vault_approval_approvers",
-    "vault_member_keys",
-    "vault_proxy_requests",
-    "vault_usage_events",
-    "vault_canary_trips",
-    "vault_settings",
+    "vault_credentials",
     "credential_search",
+    "vault_member_keys",
+    "vault_settings",
   ],
   audit: ["audit_events", "audit_anchors", "audit_retention"],
   scheduler: [
+    // An export is a copy of this workspace's content; a purge that left one
+    // behind would leave the content behind with it.
+    "export_chunks",
+    "export_runs",
     "pending_events",
     "due_work",
     "due_work_failures",
@@ -222,27 +243,26 @@ export const PURGE_TABLES: Record<PurgeStage, readonly string[]> = {
   ],
   control_rows: [
     "push_subscriptions",
-    "agent_queue",
-    "agent_sessions",
-    "agent_delegations",
-    "agent_owners",
-    "agent_scope_channels",
-    "agent_local_policies",
-    "agent_runtime_configs",
     "agent_session_message_attribution",
     "agent_session_write_limits",
+    "agent_sessions",
+    "agent_delegations",
+    "agent_queue",
+    "agent_local_policies",
+    "agent_runtime_configs",
+    "agent_owners",
+    "agents",
     "mcp_message_attribution",
     "mcp_write_limits",
     "oauth_codes",
     "oauth_connections",
+    "runner_preset_requests",
+    "runner_wakes",
     "runner_agents",
     "runner_devices",
-    "runner_wakes",
-    "runner_preset_requests",
     "runtime_runs",
     "custom_runtime_deliveries",
     "anthropic_webhook_receipts",
-    "agents",
     "group_members",
     "groups",
     "members",
