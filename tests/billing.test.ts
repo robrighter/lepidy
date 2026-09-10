@@ -85,4 +85,16 @@ describe("B02 billing reconciliation", () => {
     await expect(env.CONTROL_DB.prepare("SELECT attempts, next_attempt_at, last_error FROM billing_reconciliation_jobs WHERE workspace_id = ?").bind(target.workspaceId).first())
       .resolves.toMatchObject({ attempts: 1, next_attempt_at: NOW + 1 + 120_000, last_error: "provider unavailable" });
   });
+
+  it("B03-INT-001 records signed invoice status for the customer ledger", async () => {
+    const target = await workspace();
+    const body = JSON.stringify({ id: "evt_b03_invoice", type: "invoice.paid", created: 500, livemode: false, data: { object: {
+      id: "in_b03_paid", amount_due: 3300, currency: "usd", status: "paid", hosted_invoice_url: "https://invoice.stripe.com/i/test",
+      metadata: { lepidy_workspace_id: target.workspaceId },
+    } } });
+    const result = await handleBillingGatewayRequest({ ...env, STRIPE_WEBHOOK_SECRET: SECRET }, new Request("https://lepidy.test/hooks/stripe", { method: "POST", body, headers: { "stripe-signature": await signature(body) } }), NOW);
+    expect(result?.status).toBe(200);
+    await expect(env.CONTROL_DB.prepare("SELECT amount_due_cents, currency, status, hosted_url FROM billing_invoices WHERE workspace_id = ?").bind(target.workspaceId).first())
+      .resolves.toMatchObject({ amount_due_cents: 3300, currency: "usd", status: "paid", hosted_url: "https://invoice.stripe.com/i/test" });
+  });
 });

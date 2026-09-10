@@ -32,16 +32,29 @@ export async function verifyStripeSignature(rawBody: string, header: string, sec
   if (!signatures.some((signature) => equalHex(signature, digest))) throw new Error("invalid Stripe signature");
 }
 
-function parseEvent(rawBody: string): BillingEvent {
+type StripeInvoice = { id: string; workspaceId: string; amountDueCents: number; currency: string; status: "open" | "paid" | "void" | "uncollectible"; hostedUrl: string | null; issuedAt: number };
+
+function parseEvent(rawBody: string): BillingEvent & { invoice?: StripeInvoice } {
   const value = JSON.parse(rawBody) as { id?: unknown; type?: unknown; created?: unknown; livemode?: unknown; data?: { object?: unknown } };
   if (value.livemode !== false) throw new Error("live billing events are refused in this environment");
   if (typeof value.id !== "string" || typeof value.type !== "string" || !Number.isInteger(value.created)) throw new Error("invalid Stripe event");
   const supported = value.type === "customer.subscription.created" || value.type === "customer.subscription.updated" || value.type === "customer.subscription.deleted";
+  const object = value.data?.object as Record<string, unknown> | undefined;
+  let invoice: StripeInvoice | undefined;
+  if (value.type.startsWith("invoice.") && object && typeof object.id === "string") {
+    const meta = object.metadata as Record<string, unknown> | undefined;
+    const workspaceId = meta?.lepidy_workspace_id;
+    const invoiceStatus = object.status;
+    if (typeof workspaceId === "string" && (invoiceStatus === "open" || invoiceStatus === "paid" || invoiceStatus === "void" || invoiceStatus === "uncollectible") && Number.isSafeInteger(object.amount_due) && Number(object.amount_due) >= 0 && typeof object.currency === "string") {
+      invoice = { id: object.id, workspaceId, amountDueCents: Number(object.amount_due), currency: object.currency, status: invoiceStatus, hostedUrl: typeof object.hosted_invoice_url === "string" ? object.hosted_invoice_url : null, issuedAt: Number(value.created) * 1000 };
+    }
+  }
   return {
     id: value.id,
     type: value.type,
     created: Number(value.created),
     entitlement: supported ? stripeEntitlement(value.data?.object ?? {}, Number(value.created), value.type.endsWith(".deleted")) : undefined,
+    invoice,
   };
 }
 
@@ -55,7 +68,12 @@ export async function handleBillingGatewayRequest(env: CloudflareEnv, request: R
   if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) return response("Payload too large", 413);
   try {
     await verifyStripeSignature(body, request.headers.get("stripe-signature") ?? "", env.STRIPE_WEBHOOK_SECRET, now);
-    const disposition = await new BillingReconciliationService(env.CONTROL_DB, () => now).accept("stripe", parseEvent(body));
+    const event = parseEvent(body);
+    const disposition = await new BillingReconciliationService(env.CONTROL_DB, () => now).accept("stripe", event);
+    if (event.invoice) await env.CONTROL_DB.prepare(`INSERT INTO billing_invoices(source, external_id, workspace_id, amount_due_cents, currency, status, hosted_url, issued_at)
+      VALUES ('stripe', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source, external_id) DO UPDATE SET amount_due_cents = excluded.amount_due_cents,
+      currency = excluded.currency, status = excluded.status, hosted_url = excluded.hosted_url, issued_at = excluded.issued_at`)
+      .bind(event.invoice.id, event.invoice.workspaceId, event.invoice.amountDueCents, event.invoice.currency, event.invoice.status, event.invoice.hostedUrl, event.invoice.issuedAt).run();
     return Response.json({ received: true, disposition }, { headers: { "cache-control": "no-store" } });
   } catch {
     return response("Invalid signature or event", 400);

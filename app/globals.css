@@ -245,6 +245,28 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 .list { display: grid; gap: 2px; margin: 10px 0 0; padding: 0; list-style: none; }
 .list a { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 10px; border-radius: var(--r-sm); color: var(--text-2); }
 .list a:hover { background: var(--sunken); color: var(--text); }
+
+/* Billing is a legible account ledger, not a promotional pricing grid. */
+.billing-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; border-left: 4px solid var(--coral); }
+.billing-hero > strong { white-space: nowrap; font: 700 28px/1 var(--font-display); }
+.billing-hero > strong small { color: var(--text-3); font: 500 12px var(--font-body); }
+.eyebrow { margin-bottom: 5px; color: var(--accent) !important; font-size: 11px; font-weight: 750; letter-spacing: .09em; text-transform: uppercase; }
+.billing-status { display: inline-flex; margin-left: 7px; padding: 3px 7px; border-radius: var(--r-pill); background: var(--mist); color: var(--text-2); font: 700 10px var(--font-body); text-transform: uppercase; vertical-align: middle; }
+.billing-status.active { background: color-mix(in srgb, var(--mint) 16%, var(--surface)); color: color-mix(in srgb, var(--mint) 42%, var(--text)); }
+.billing-form { display: grid; gap: 0; margin-top: 14px; border-top: 1px solid var(--line); }
+.billing-form label, .billing-current { display: grid; grid-template-columns: minmax(130px, .7fr) minmax(160px, 1fr); align-items: center; gap: 8px 18px; min-height: 68px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.billing-form label > span, .billing-current > span { font-weight: 650; }
+.billing-form select, .billing-form input { width: 100%; padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface); }
+.billing-form small { grid-column: 2; color: var(--text-3); }
+.billing-form > button { justify-self: start; margin-top: 14px; }
+.billing-review { border-color: var(--lilac); box-shadow: var(--sh-2); }
+.billing-review dl { display: grid; margin: 14px 0; border-top: 1px solid var(--line); }
+.billing-review dl div, .invoice-list > div { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.billing-review dt { color: var(--text-3); }.billing-review dd { margin: 0; font-weight: 650; text-align: right; }
+.invoice-list > div { grid-template-columns: 1fr 1fr auto auto; align-items: center; }
+.invoice-list a { color: var(--accent); font-weight: 650; }
+.safeguard { border-left: 4px solid var(--amber); }
+@media (max-width: 680px) { .billing-hero { flex-direction: column; }.billing-form label, .billing-current { grid-template-columns: 1fr; }.billing-form small { grid-column: 1; }.invoice-list > div { grid-template-columns: 1fr auto; } }
 /* --text-3 on --mist is 4.34:1 at this size, under the 4.5:1 minimum. */
 .tag { padding: 1px 7px; border-radius: var(--r-pill); background: var(--mist); color: var(--text-2); font-size: 11px; font-weight: 600; }
 

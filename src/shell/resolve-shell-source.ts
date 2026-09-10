@@ -12,6 +12,10 @@ export type ShellEnvironment = {
   ENVIRONMENT?: string;
   TRANSPORT_SECRET_KEY?: string;
   WIF_SIGNING_JWK?: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_TEAM_PRICE_ID?: string;
+  STRIPE_EXTRA_SEAT_PRICE_ID?: string;
+  STRIPE_STORAGE_PACK_PRICE_ID?: string;
 };
 
 /**

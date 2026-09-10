@@ -1,5 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const browserPortBase = Number(process.env.LEPIDY_BROWSER_PORT_BASE ?? 3100);
+const markupPort = Number(process.env.LEPIDY_MARKUP_PORT ?? 4174);
+
 export default defineConfig({
   testDir: "./tests/browser",
   fullyParallel: true,
@@ -22,7 +25,7 @@ export default defineConfig({
   retries: 0,
   reporter: [["list"], ["html", { open: "never", outputFolder: "playwright-report" }]],
   use: {
-    baseURL: "http://127.0.0.1:3100",
+    baseURL: `http://127.0.0.1:${browserPortBase}`,
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
   },
@@ -45,7 +48,7 @@ export default defineConfig({
       // real Worker gives the suite real D1 and real objects in one process,
       // and tests the runtime the product actually ships on.
       command: "node scripts/browser-worker.mjs development",
-      url: "http://127.0.0.1:3100/signin",
+      url: `http://127.0.0.1:${browserPortBase}/signin`,
       reuseExistingServer: false,
       timeout: 180_000,
       gracefulShutdown: { signal: "SIGTERM", timeout: 10_000 },
@@ -54,7 +57,7 @@ export default defineConfig({
     },
     {
       command: "node scripts/browser-worker.mjs production",
-      url: "http://127.0.0.1:3101/signin",
+      url: `http://127.0.0.1:${browserPortBase + 1}/signin`,
       reuseExistingServer: false,
       timeout: 180_000,
       gracefulShutdown: { signal: "SIGTERM", timeout: 10_000 },
@@ -63,7 +66,7 @@ export default defineConfig({
     },
     {
       command: "node scripts/serve-markups.mjs",
-      url: "http://127.0.0.1:4174",
+      url: `http://127.0.0.1:${markupPort}`,
       reuseExistingServer: false,
       timeout: 30_000,
       stdout: "ignore",

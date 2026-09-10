@@ -36,7 +36,7 @@ export default async function ProfilePage({ searchParams }: { searchParams: Prom
           <button className="primary-link" type="submit">Save profile</button>
         </form>
       </section>
-      <section className="panel"><h2>Workspace</h2><ul className="list"><li><a href="/people">People and administration<span className="tag">{viewer.role}</span></a></li><li><a href="/emoji">Custom emoji<span className="tag">admin</span></a></li><li><a href="/connections">MCP connections<span className="tag">yours</span></a></li></ul></section>
+      <section className="panel"><h2>Workspace</h2><ul className="list"><li><a href="/people">People and administration<span className="tag">{viewer.role}</span></a></li><li><a href="/billing">Plan and billing<span className="tag">{shell.workspace.plan}</span></a></li><li><a href="/emoji">Custom emoji<span className="tag">admin</span></a></li><li><a href="/connections">MCP connections<span className="tag">yours</span></a></li></ul></section>
     </>
   );
 }

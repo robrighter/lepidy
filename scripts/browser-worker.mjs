@@ -5,6 +5,7 @@ import path from "node:path";
 
 const environment = process.argv[2];
 if (!["development", "production"].includes(environment)) throw new Error("Expected a browser-test environment");
+const portBase = Number(process.env.LEPIDY_BROWSER_PORT_BASE ?? 3100);
 const root = process.cwd();
 const temporary = mkdtempSync(path.join(tmpdir(), "lepidy-browser-"));
 const config = JSON.parse(readFileSync("wrangler.jsonc", "utf8"));
@@ -46,7 +47,7 @@ const logPath = path.join(logDirectory, `worker-${environment}.log`);
 const logFd = openSync(logPath, "w");
 const child = spawn(
   process.execPath,
-  [cli, "dev", "--port", environment === "development" ? "3100" : "3101", ...common],
+  [cli, "dev", "--port", String(environment === "development" ? portBase : portBase + 1), ...common],
   { stdio: ["ignore", logFd, logFd] },
 );
 for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => child.kill(signal));

@@ -1,6 +1,11 @@
 interface CloudflareEnv {
   /** Stripe test-mode webhook signing secret; no purchase credential is held by this Worker. */
   STRIPE_WEBHOOK_SECRET?: string;
+  /** Stripe test-mode purchase credential and catalogue. */
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_TEAM_PRICE_ID?: string;
+  STRIPE_EXTRA_SEAT_PRICE_ID?: string;
+  STRIPE_STORAGE_PACK_PRICE_ID?: string;
   /** Platform transport key. A secret binding in production, never a tenant value. */
   TRANSPORT_SECRET_KEY?: string;
   /** Platform OIDC signing JWK. A secret/key-service binding in production. */
