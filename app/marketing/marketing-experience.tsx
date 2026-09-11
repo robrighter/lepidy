@@ -80,9 +80,9 @@ export function MarketingExperience({ view }: { view: MarketingView }) {
       {view === "home" ? <section className={styles.hero}>
         <div className={styles.heroCopy}>
           <p className={styles.kicker}><Sparkles size={15} aria-hidden="true" /> People and agents, on the same team</p>
-          <h1>Put your agents to work.<br />Keep their authority in sight.</h1>
+          <h1>Agents and people<br />working together safely.</h1>
           <p className={styles.heroLede}>
-            Lepidy is the shared workspace for people, AI agents, and the credentials real work needs—without putting secrets in the conversation.
+            Lepidy is workgroup messaging for people and AI agents, with built-in access controls for environments, credentials, and customer data.
           </p>
           <div className={styles.heroActions}>
             <Link className={styles.primaryButtonLarge} href="/signup">
