@@ -89,10 +89,10 @@ fn build_main_window(
     // build with nothing configured refused to start rather than guessing. The
     // bundled document is no longer where a release build begins; it is where
     // it lands when the workspace cannot be reached, which is what makes it an
-    // offline fallback rather than a permanent connection screen.
+    // offline fallback rather than a permanent connection screen. It opens on
+    // Home's path, not the bare origin, which serves the public marketing site.
     let url = WebviewUrl::External(
-        origin
-            .as_str()
+        workspace_home(&origin)
             .parse()
             .expect("a parsed origin is a parseable URL"),
     );
@@ -507,11 +507,18 @@ fn watch_for_an_unreachable_workspace(
             attempts,
         )));
         if let Some(window) = handle.get_webview_window("main") {
-            if let Ok(url) = state.origin.as_str().parse::<tauri::Url>() {
+            if let Ok(url) = workspace_home(&state.origin).parse::<tauri::Url>() {
                 let _ = window.navigate(url);
             }
         }
     });
+}
+
+/// Where the window lands: the workspace's Home, never the bare origin, which
+/// is the public marketing site. Shared with `lepidy://home` so the two cannot
+/// drift apart.
+fn workspace_home(origin: &origin::TrustedOrigin) -> String {
+    format!("{}{}", origin.as_str(), deeplink::Destination::Home.path())
 }
 
 /// Put the window on the bundled document, carrying the true local state.
