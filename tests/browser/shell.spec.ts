@@ -50,7 +50,7 @@ test("SHELL-INT-002 has no serious or critical accessibility violations in eithe
       .map(({ id, nodes }) => ({ id, targets: nodes.map((node) => node.target.join(" ")) }));
   }
 
-  for (const path of ["/", "/vault", "/profile"]) {
+  for (const path of ["/workspace", "/vault", "/profile"]) {
     await page.goto(path);
     expect(await blockingViolations(), `${path} in light mode`).toEqual([]);
     await page.getByRole("button", { name: "Switch to dark theme" }).click();

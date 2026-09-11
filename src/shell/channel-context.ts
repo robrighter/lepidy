@@ -13,7 +13,8 @@ import { SESSION_COOKIE, type ShellEnvironment } from "./resolve-shell-source";
  */
 export const channelHistory = cache(
   async (channelId: string, limit?: number): Promise<ChannelHistoryState> => {
-    const environment = process.env.ENVIRONMENT ?? process.env.NODE_ENV;
+    // Widened: generated types narrow ENVIRONMENT to the production config's literal.
+    const environment: string | undefined = process.env.ENVIRONMENT ?? process.env.NODE_ENV;
     const token = (await cookies()).get(SESSION_COOKIE)?.value ?? null;
 
     if (!token) {

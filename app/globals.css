@@ -190,7 +190,7 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
   align-items: center;
   gap: 12px;
   min-height: var(--topbar-h);
-  padding: 10px 20px;
+  padding: 10px 26px;
   border-bottom: 1px solid var(--line);
   background: color-mix(in srgb, var(--canvas) 88%, transparent);
   backdrop-filter: blur(8px);
@@ -202,7 +202,10 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 .icon-button:hover { border-color: var(--line-strong); color: var(--text); }
 .rail-toggle { display: none; }
 
-.content { flex: 1; padding: 22px 20px 64px; }
+/* Outer breathing room, matching the mockups' `.pad` (22px 26px 84px). The
+   topbar carries the same inline padding so the header and the column below
+   share one edge at widths where `.content-inner` is not yet centred. */
+.content { flex: 1; padding: 22px 26px 84px; }
 /* `minmax(0, 1fr)` rather than the implicit `auto` track: an auto track is
    sized by its items' min-content, so one wide descendant — a command line, a
    table, a code block — widens the whole column and the page scrolls sideways
@@ -213,6 +216,12 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
 
 .panel { padding: 18px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--sh-1); }
 .panel h2 { font: 650 15px/1.3 var(--font-display); }
+/* The mockups separate a panel's title from its body structurally — `.panel-h`
+   and `.panel-b` are two padded boxes with a rule between them. This panel is
+   one box, so the same separation has to be margin, or the title sits directly
+   on the first line of content. Direct children only: a heading inside an
+   empty state or a nested card carries its own rhythm. */
+.panel > h2, .panel > .panel-head { margin-bottom: 10px; }
 .panel > p { color: var(--text-2); }
 
 .notice { display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px; border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--sunken); color: var(--text-2); font-size: 13px; }
@@ -523,7 +532,8 @@ html[data-desktop-platform="macos"] .desktop-titlebar-label { padding-left: 70px
     display: block; border: 0; width: 100%; background: rgb(20 18 46 / 45%);
   }
   .rail-toggle { display: grid; }
-  .content { padding: 16px 14px 48px; }
+  .content, .topbar { padding-inline: 18px; }
+  .content { padding-block: 18px 64px; }
 }
 
 /* ---------------- form rooms and ranked queues (C10) ---------------- */

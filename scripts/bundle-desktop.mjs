@@ -32,9 +32,42 @@ const npmCli = process.env.npm_execpath;
 const unsigned = process.argv.includes("--unsigned");
 
 /** Which channel this bundle is for. Direct unless asked for otherwise. */
+// The rationale for each variant lives here rather than in its JSON: Tauri
+// validates the merged configuration against a schema that forbids unknown
+// keys, so a `"//"` comment in those files makes every bundle refuse to build.
 const VARIANTS = {
+  /**
+   * The direct-download build's extras, merged over tauri.conf.json by `npm run desktop:build`.
+   * They live in their own file for two reasons. Tauri validates externalBin when the crate is
+   * compiled, so a sidecar declared in the base configuration would make `cargo check` require
+   * a release build of the CLI — and the local gate compiles this crate on every run. And PRD
+   * §10.1 splits this product into a direct build that carries the injection engine and a Mac
+   * App Store build that cannot, so the direct build's extras belonging to the direct build is
+   * the shape that split will need; P02 owns the store variant.
+   */
   direct: { config: "bundle.direct.json", sidecars: true },
+  /**
+   * The Mac App Store build, merged over tauri.conf.json by `npm run desktop:build -- --variant
+   * mas`. It is the collaboration and approvals client: chat, agents, the vault UI, approvals
+   * with Touch ID, audit — complete for everyone whose job is to supervise agents. What is
+   * deliberately absent is absent because of one rule, not an oversight: a sandboxed App Store
+   * application may not spawn an arbitrary child process with an injected environment, which is
+   * exactly and only what `lepidy run --with GITHUB_TOKEN -- gh pr list` does (PRD §10.1). So
+   * there is no externalBin here, and the same rule means this build cannot host a runner
+   * either — it can configure a local agent and watch its sessions. The bundle gate refuses if
+   * this file ever grows a sidecar. Updates come from the store, so no updater artifact is
+   * produced.
+   */
   mas: { config: "bundle.mas.json", sidecars: false },
+  /**
+   * The Microsoft Store build, merged over tauri.conf.json by `npm run desktop:build --
+   * --variant msix`. Windows is unconstrained: an MSIX package declares runFullTrust, so this
+   * is the whole product with the injection engine in it (PRD §10.1, §10.2). Tauri has no MSIX
+   * target, so this produces the MSI payload that MSIX packaging wraps; validating the packaged
+   * artifact and its declared capabilities belongs to P04. Updates come from the store, so no
+   * updater artifact is produced — a self-updater inside a store package is a rejection, and a
+   * way to strand somebody on a version the store believes it already replaced.
+   */
   msix: { config: "bundle.msix.json", sidecars: true },
 };
 const requested = process.argv[process.argv.indexOf("--variant") + 1];
@@ -54,7 +87,7 @@ function run(label, command, args) {
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
-/** The triple rustc will actually build for, asked rather than assumed. */
+/** The triple rustc defaults to, asked rather than assumed. */
 function hostTriple() {
   const version = execFileSync("rustc", ["-vV"], { encoding: "utf8" });
   const host = version.split("\n").find((line) => line.startsWith("host: "));
@@ -62,7 +95,22 @@ function hostTriple() {
   return host.slice("host: ".length).trim();
 }
 
-const triple = hostTriple();
+/**
+ * The triple everything in this build agrees on.
+ *
+ * Passed to cargo, compiled into the gate as `LEPIDY_TARGET_TRIPLE`, used to
+ * name the staged sidecars, and handed to `tauri build` — because those four
+ * have to name the same triple or the bundle looks for a sidecar nobody built.
+ *
+ * It is a flag rather than rustc's host because the two can legitimately
+ * disagree: on an ARM64 Windows machine running an x64 toolchain under
+ * emulation, rustc reports `x86_64-pc-windows-msvc` while Tauri targets the
+ * machine's own `aarch64`, and the staged names then match neither.
+ */
+const triple = process.argv.includes("--target")
+  ? process.argv[process.argv.indexOf("--target") + 1]
+  : hostTriple();
+if (!triple) throw new Error("--target needs a triple, e.g. aarch64-pc-windows-msvc");
 const windows = triple.includes("windows");
 const suffix = windows ? ".exe" : "";
 
@@ -73,6 +121,8 @@ if (sidecars) {
   run("Build the injection engine and the daemon", "cargo", [
     "build",
     "--release",
+    "--target",
+    triple,
     "--manifest-path",
     manifest,
     "-p",
@@ -93,7 +143,7 @@ const staging = path.join(root, "src-tauri", "binaries");
 if (sidecars) {
   fs.mkdirSync(staging, { recursive: true });
   for (const binary of ["lepidy", "lepidy-agentd"]) {
-    const built = path.join(root, "src-tauri", "target", "release", `${binary}${suffix}`);
+    const built = path.join(root, "src-tauri", "target", triple, "release", `${binary}${suffix}`);
     const staged = path.join(staging, `${binary}-${triple}${suffix}`);
     fs.copyFileSync(built, staged);
     process.stdout.write(`staged ${path.relative(root, staged)}\n`);
@@ -112,6 +162,8 @@ process.env.LEPIDY_VARIANT = variant;
 run("Distribution gate", "cargo", [
   "run",
   "--release",
+  "--target",
+  triple,
   "--manifest-path",
   manifest,
   "--bin",
@@ -131,6 +183,20 @@ run("Bundle", process.execPath, [
   "--",
   "tauri",
   "build",
+  "--target",
+  triple,
   "--config",
-  variantConfig,
+  // Resolved against this script's own root rather than left relative: the
+  // Tauri CLI resolves `--config` from the working directory, which is the
+  // repository root here, while the variant configs live beside the crate.
+  path.join("src-tauri", variantConfig),
+  // An unsigned build produces no updater artifact, because signing one is
+  // exactly what it cannot do: `createUpdaterArtifacts` makes Tauri demand
+  // `TAURI_SIGNING_PRIVATE_KEY` after the installer is already written, and
+  // fail the build over a file this variant must not publish anyway. The gate
+  // has said the same thing one step earlier — what this produces "is not an
+  // update". Later `--config` values win, so this overrides the base.
+  ...(unsigned
+    ? ["--config", JSON.stringify({ bundle: { createUpdaterArtifacts: false } })]
+    : []),
 ]);

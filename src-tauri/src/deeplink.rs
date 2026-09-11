@@ -66,7 +66,8 @@ impl Destination {
     /// a slash, a dot-dot or a question mark would not have parsed.
     pub fn path(&self) -> String {
         match self {
-            Self::Home => "/".to_string(),
+            // `/` is the public marketing site; the signed-in home lives here.
+            Self::Home => "/workspace".to_string(),
             Self::Inbox => "/inbox".to_string(),
             Self::Approval { id } => format!("/inbox?approval={id}"),
             Self::Channel { channel } => format!("/c/{channel}"),
@@ -245,8 +246,8 @@ mod tests {
         for (link, path) in [
             ("lepidy://inbox", "/inbox"),
             ("lepidy:inbox", "/inbox"),
-            ("lepidy://", "/"),
-            ("lepidy://home", "/"),
+            ("lepidy://", "/workspace"),
+            ("lepidy://home", "/workspace"),
             ("lepidy://channel/deploys", "/c/deploys"),
             (
                 "lepidy://channel/deploys/msg-01hx",

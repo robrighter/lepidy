@@ -8,6 +8,11 @@ description = "Lepidy desktop shell and local runner"
 authors = ["Lepidy"]
 edition = "2021"
 rust-version = "1.77.2"
+# This crate builds two binaries: the shell, and the gate that decides whether
+# the shell may be bundled. Cargo has no reason to prefer one, and Tauri
+# bundles "the" binary cargo produced — which without this picks the gate and
+# ships it as the application.
+default-run = "lepidy-desktop"
 
 [lib]
 name = "lepidy_desktop_lib"

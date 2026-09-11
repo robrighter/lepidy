@@ -17,7 +17,7 @@ export async function markNotificationAction(form: FormData): Promise<void> {
     now: Date.now(),
   });
   revalidatePath("/inbox");
-  revalidatePath("/");
+  revalidatePath("/workspace");
 }
 
 function parseMinute(value: string): number | null {

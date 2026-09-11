@@ -13,6 +13,10 @@ config.name = `lepidy-browser-${environment}`;
 config.main = path.join(root, "tests/fixtures/browser-worker.ts");
 config.assets.directory = path.join(root, config.assets.directory);
 config.vars.ENVIRONMENT = environment;
+// The production custom domain would make `wrangler dev` rewrite every request's
+// host to it, so issuer URLs and the WebAuthn relying party stop matching the
+// loopback origin the suite actually uses.
+delete config.routes;
 for (const binding of config.d1_databases) binding.migrations_dir = path.join(root, binding.migrations_dir);
 const configPath = path.join(temporary, "wrangler.json");
 writeFileSync(configPath, JSON.stringify(config));

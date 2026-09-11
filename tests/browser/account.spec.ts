@@ -9,7 +9,7 @@ test("AUTH-INT-001 signs up into a real workspace and posts a message that persi
   await signUp(page, account);
 
   // Landed in the shell, signed in, with no development-data banner.
-  await expect(page).toHaveURL(/\/$/);
+  await expect(page).toHaveURL(/\/workspace$/);
   await expect(page.getByRole("heading", { name: account.workspaceName, level: 2 })).toBeVisible();
   await expect(page.getByText("Development workspace.")).toHaveCount(0);
   await expect(page.getByText(`@${account.handle}`)).toBeVisible();
@@ -44,7 +44,7 @@ test("AUTH-INT-002 signs out, revokes the session and refuses the workspace afte
 }) => {
   const account = freshAccount();
   await signUp(page, account);
-  await expect(page).toHaveURL(/\/$/);
+  await expect(page).toHaveURL(/\/workspace$/);
 
   const sessionCookie = (await page.context().cookies()).find(
     (cookie) => cookie.name === "lepidy_session",
@@ -106,7 +106,7 @@ test("AUTH-INT-003 signs back in and refuses a wrong password without saying whi
   await page.getByLabel("Email").fill(account.email);
   await page.getByLabel("Password").fill(account.password);
   await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page).toHaveURL(/\/$/);
+  await expect(page).toHaveURL(/\/workspace$/);
   await expect(page.getByRole("heading", { name: account.workspaceName, level: 2 })).toBeVisible();
 });
 
@@ -205,11 +205,11 @@ test("AUTH-INT-006 refuses forged sign-out actions without revoking the session"
   await page.getByLabel("Email").fill(account.email);
   await page.getByLabel("Password").fill(account.password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(page).toHaveURL(/\/$/);
+  await expect(page).toHaveURL(/\/workspace$/);
   const csrf = (await page.context().cookies()).find((cookie) => cookie.name === "lepidy_csrf")!;
   const headers = request.headers();
   for (const value of [null, "forged-signout-csrf", JSON.parse(request.postData()!)[0]]) {
-    const denied = await page.request.post("/", {
+    const denied = await page.request.post("/workspace", {
       headers: { "content-type": headers["content-type"], "next-action": headers["next-action"], origin: "http://127.0.0.1:3100" },
       data: JSON.stringify([value]),
     });

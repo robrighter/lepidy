@@ -34,7 +34,7 @@ export async function signUp(page: Page, account: ReturnType<typeof freshAccount
   await page.getByLabel("Password").fill(account.password);
   await page.getByLabel("Workspace name").fill(account.workspaceName);
   await page.getByRole("button", { name: "Create workspace" }).click();
-  await expect(page).toHaveURL(/\/$/);
+  await expect(page).toHaveURL(/\/workspace$/);
 }
 
 

@@ -1,10 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-
-  "//": "The Mac App Store build, merged over tauri.conf.json by `npm run desktop:build -- --variant mas`. It is the collaboration and approvals client: chat, agents, the vault UI, approvals with Touch ID, audit — complete for everyone whose job is to supervise agents. What is deliberately absent is absent because of one rule, not an oversight: a sandboxed App Store application may not spawn an arbitrary child process with an injected environment, which is exactly and only what `lepidy run --with GITHUB_TOKEN -- gh pr list` does (PRD §10.1). So there is no externalBin here, and the same rule means this build cannot host a runner either — it can configure a local agent and watch its sessions. The bundle gate refuses if this file ever grows a sidecar. Updates come from the store, so no updater artifact is produced.",
-
   "bundle": {
-    "targets": ["app"],
+    "targets": [
+      "app"
+    ],
     "createUpdaterArtifacts": false,
     "macOS": {
       "minimumSystemVersion": "10.15",

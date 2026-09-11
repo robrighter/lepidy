@@ -2,6 +2,8 @@
 
 import { useEffect } from "react";
 
+import { isDesktopShell } from "./desktop-platform";
+
 /**
  * Mirrors the unread count onto the operating system's own chrome — the dock
  * badge, the taskbar, the tray tooltip — when the app is running inside the
@@ -19,7 +21,7 @@ import { useEffect } from "react";
  */
 export function DesktopPresence({ unreadCount }: { unreadCount: number }) {
   useEffect(() => {
-    if (!(window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) return;
+    if (!isDesktopShell()) return;
     let cancelled = false;
 
     void (async () => {

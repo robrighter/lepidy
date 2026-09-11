@@ -13,7 +13,9 @@ import { SESSION_COOKIE } from "./resolve-shell-source";
 export const CSRF_COOKIE = "lepidy_csrf";
 
 export function isSecureDeployment(): boolean {
-  return (process.env.ENVIRONMENT ?? process.env.NODE_ENV) !== "development";
+  // Widened: generated types narrow ENVIRONMENT to the production config's literal.
+  const environment: string | undefined = process.env.ENVIRONMENT ?? process.env.NODE_ENV;
+  return environment !== "development";
 }
 
 export async function setSessionCookies(session: {

@@ -76,7 +76,7 @@ test("VAULT-APPROVAL-INT-001 asks a person, is answered with a real gesture, and
   // Followed by its address rather than by clicking the rail, so the scenario
   // proves the conversation exists at both viewports rather than proving where
   // a narrow layout happens to put the rail.
-  await page.goto(`${LOCALHOST_BASE}/`);
+  await page.goto(`${LOCALHOST_BASE}/workspace`);
   const conversation = await page
     .getByRole("link", { name: "a.vault", exact: true })
     .first()
