@@ -3,6 +3,8 @@
 import { usePathname } from "next/navigation";
 import { type FormEvent, type ReactNode, useEffect, useState } from "react";
 
+import { isDesktopShell } from "@/components/shell/desktop-platform";
+
 import styles from "./marketing-access-gate.module.css";
 
 const ACCESS_STORAGE_KEY = "lepidy-marketing-access";
@@ -12,10 +14,18 @@ export function MarketingAccessGate({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const [allowed, setAllowed] = useState(false);
   const [checked, setChecked] = useState(false);
+  const [leaving, setLeaving] = useState(false);
   const [code, setCode] = useState("");
   const [error, setError] = useState(false);
 
   useEffect(() => {
+    // Installed desktop builds from before the shell opened on /workspace still
+    // start at the bare origin. The app is never the place for the marketing site.
+    if (isDesktopShell()) {
+      setLeaving(true);
+      window.location.replace("/workspace");
+      return;
+    }
     setAllowed(window.localStorage.getItem(ACCESS_STORAGE_KEY) === ACCESS_CODE);
     setChecked(true);
   }, [pathname]);
@@ -30,6 +40,8 @@ export function MarketingAccessGate({ children }: { children: ReactNode }) {
     setError(false);
     setAllowed(true);
   };
+
+  if (leaving) return null;
 
   if (!checked || !allowed) {
     return (
