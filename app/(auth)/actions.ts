@@ -32,8 +32,8 @@ function formText(form: FormData, field: string, max: number): string {
  */
 function safeNextPath(form: FormData): string {
   const value = form.get("next");
-  if (typeof value !== "string" || value.length === 0 || value.length > 1024) return "/";
-  if (!value.startsWith("/") || value.startsWith("//") || value.startsWith("/\\")) return "/";
+  if (typeof value !== "string" || value.length === 0 || value.length > 1024) return "/workspace";
+  if (!value.startsWith("/") || value.startsWith("//") || value.startsWith("/\\")) return "/workspace";
   return value;
 }
 
@@ -128,7 +128,7 @@ export async function signUpWithPassword(
     platform: "web",
   });
   await setSessionCookies(session);
-  redirect("/");
+  redirect("/workspace");
 }
 
 /** Revokes the session server-side, not just the cookie in this browser. */

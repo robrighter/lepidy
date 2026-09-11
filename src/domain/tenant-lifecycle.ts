@@ -245,8 +245,6 @@ export const PURGE_TABLES: Record<PurgeStage, readonly string[]> = {
     "replay_events",
     "idempotency_keys",
     "applied_control_operations",
-    "usage_buckets",
-    "resource_limit_events",
   ],
   control_rows: [
     "push_subscriptions",

@@ -21,7 +21,7 @@ const CHANNELS = [
 
 describe("shell navigation rules", () => {
   it.each([
-    ["/", "home"],
+    ["/workspace", "home"],
     ["/inbox", "inbox"],
     ["/inbox/", "inbox"],
     ["/inbox/thread-1", "inbox"],
@@ -46,7 +46,7 @@ describe("shell navigation rules", () => {
   });
 
   it("SHELL-RULE-004 titles a section, a known channel and an unknown channel", () => {
-    expect(sectionTitle("/", CHANNELS)).toBe("Home");
+    expect(sectionTitle("/workspace", CHANNELS)).toBe("Home");
     expect(sectionTitle("/vault", CHANNELS)).toBe("Vault");
     expect(sectionTitle("/profile", CHANNELS)).toBe("Profile");
     expect(sectionTitle("/c/eng", CHANNELS)).toBe("#eng");

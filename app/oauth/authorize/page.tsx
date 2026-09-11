@@ -145,7 +145,7 @@ function Refused({ reason }: { reason: string }) {
       <h1>That connection cannot be made</h1>
       <p className="auth-intro">{reason}</p>
       <p className="auth-footer">
-        Nothing was connected. <Link href="/">Go to your workspace</Link>
+        Nothing was connected. <Link href="/workspace">Go to your workspace</Link>
       </p>
     </>
   );

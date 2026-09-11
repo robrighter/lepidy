@@ -60,7 +60,7 @@ test("AUTH-INT-002 signs out, revokes the session and refuses the workspace afte
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
 
   // Signed out, the workspace shows nothing and offers the way back in.
-  await page.goto("/");
+  await page.goto("/workspace");
   await expect(page.getByRole("heading", { name: "Sign in to Lepidy" })).toBeVisible();
   await expect(page.getByRole("link", { name: "Go to sign in" })).toBeVisible();
 
@@ -214,7 +214,7 @@ test("AUTH-INT-006 refuses forged sign-out actions without revoking the session"
       data: JSON.stringify([value]),
     });
     expect(await denied.text()).toContain("Unable to sign out. Refresh and try again.");
-    await page.goto("/");
+    await page.goto("/workspace");
     await expect(page.getByRole("heading", { name: account.workspaceName, level: 2 })).toBeVisible();
   }
   expect(csrf.value).not.toBe(JSON.parse(request.postData()!)[0]);
@@ -227,6 +227,6 @@ test("AUTH-INT-006 refuses forged sign-out actions without revoking the session"
   await page.getByRole("button", { name: /Account menu for/ }).click();
   await page.getByRole("menuitem", { name: "Sign out" }).click();
   await expect(page).toHaveURL(/\/signin$/);
-  await page.goto("/");
+  await page.goto("/workspace");
   await expect(page.getByRole("heading", { name: "Sign in to Lepidy" })).toBeVisible();
 });
