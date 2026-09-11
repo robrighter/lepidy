@@ -104,7 +104,7 @@ test("SAVED-INT-005 saves a message to a private list and removes it again", asy
 });
 
 test("SAVED-INT-006 offers Saved from the rail", async ({ page }, testInfo) => {
-  await page.goto("/");
+  await page.goto("/workspace");
   if (testInfo.project.name === "mobile-chromium") {
     await page.getByRole("button", { name: "Open navigation" }).click();
   }

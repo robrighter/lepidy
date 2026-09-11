@@ -10,7 +10,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("C06-UI-INT-001 shows the same durable mention in ranked Home and actionable Inbox", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/workspace");
   const home = page.getByRole("region", { name: "What needs you" });
   await expect(home).toContainText("please review the launch note");
   await expect(home).toContainText("Mention");

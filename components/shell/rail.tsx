@@ -59,7 +59,7 @@ export function Rail({
 
   return (
     <aside className="rail" aria-label="Workspace navigation">
-      <Link className="brand" href="/" onClick={onNavigate}>
+      <Link className="brand" href="/workspace" onClick={onNavigate}>
         <img src="/mark.svg" alt="" width={30} height={30} />
         <span>
           Lepidy

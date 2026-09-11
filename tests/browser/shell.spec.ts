@@ -19,7 +19,7 @@ async function openRailIfNarrow(page: Page, projectName: string) {
 }
 
 test("SHELL-INT-001 renders the workspace shell at the active viewport", async ({ page }, testInfo) => {
-  await page.goto("/");
+  await page.goto("/workspace");
 
   await expect(page.locator("aside[aria-label='Workspace navigation']")).toBeAttached();
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
@@ -61,7 +61,7 @@ test("SHELL-INT-002 has no serious or critical accessibility violations in eithe
 });
 
 test("SHELL-INT-003 marks exactly one navigation item current as you move around", async ({ page }, testInfo) => {
-  await page.goto("/");
+  await page.goto("/workspace");
   await openRailIfNarrow(page, testInfo.project.name);
 
   const current = page.locator(".rail nav[aria-label='Primary'] a[aria-current='page']");
@@ -84,7 +84,7 @@ test("SHELL-INT-003 marks exactly one navigation item current as you move around
 });
 
 test("SHELL-INT-004 reaches and operates the shell with the keyboard alone", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/workspace");
 
   await page.keyboard.press("Tab");
   await expect(page.getByRole("link", { name: "Skip to content" })).toBeFocused();
@@ -107,7 +107,7 @@ test("SHELL-INT-004 reaches and operates the shell with the keyboard alone", asy
 });
 
 test("SHELL-INT-005 applies dark mode, remembers it, and paints it before first render", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/workspace");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
 
   await page.getByRole("button", { name: "Switch to dark theme" }).click();
@@ -235,13 +235,13 @@ test("SHELL-INT-006 keeps shipped surfaces real and marks only unfinished ones",
 });
 
 test("SHELL-INT-007 uses authenticated workspace data without a development banner", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/workspace");
   await expect(page.getByText("Development workspace.")).toHaveCount(0);
   await expect(page.getByText("@maya")).toBeVisible();
 });
 
 test("SHELL-INT-008 shows the viewer's own profile from the shell data", async ({ page }, testInfo) => {
-  await page.goto("/");
+  await page.goto("/workspace");
   await openRailIfNarrow(page, testInfo.project.name);
   await page.locator(".rail-foot a").click();
 
@@ -252,7 +252,7 @@ test("SHELL-INT-008 shows the viewer's own profile from the shell data", async (
 });
 
 test("DESKTOP-INT-001 renders the frameless Windows caption controls and drag surface", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/workspace");
   await page.evaluate(() => {
     document.documentElement.dataset.desktopPlatform = "windows";
   });
@@ -267,7 +267,7 @@ test("DESKTOP-INT-001 renders the frameless Windows caption controls and drag su
 });
 
 test("DESKTOP-INT-002 reserves the branded macOS overlay for native traffic lights", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/workspace");
   await page.evaluate(() => {
     document.documentElement.dataset.desktopPlatform = "macos";
   });
@@ -278,7 +278,7 @@ test("DESKTOP-INT-002 reserves the branded macOS overlay for native traffic ligh
 });
 
 test("DESKTOP-INT-003 keeps the rail below the reserved native titlebar", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/workspace");
   const browserTop = await page.locator(".rail").evaluate((rail) => rail.getBoundingClientRect().top);
   expect(browserTop).toBe(0);
   await expect(page.locator(".desktop-titlebar")).toBeHidden();
@@ -306,7 +306,7 @@ test("DESKTOP-INT-004 hands the unread count to the desktop shell as a number", 
     };
   });
 
-  await page.goto("/");
+  await page.goto("/workspace");
   await page.waitForFunction(
     () => ((window as unknown as { __lepidyBadgeCalls?: unknown[] }).__lepidyBadgeCalls ?? []).length > 0,
   );
@@ -328,7 +328,7 @@ test("DESKTOP-INT-005 asks the machine for nothing when it is a browser", async 
   const failures: string[] = [];
   page.on("pageerror", (error) => failures.push(error.message));
 
-  await page.goto("/");
+  await page.goto("/workspace");
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
 
   const reachedTheMachine = await page.evaluate(

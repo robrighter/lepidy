@@ -19,7 +19,7 @@ export default function manifest(): MetadataRoute.Manifest {
     name: "Lepidy",
     short_name: "Lepidy",
     description: "A shared workspace for people, agents, and credentials.",
-    start_url: "/",
+    start_url: "/workspace",
     // The installed application handles its own scope. A link outside it opens
     // in the browser, which is what should happen: this window is a workspace,
     // not a browser.

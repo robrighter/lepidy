@@ -24,7 +24,7 @@ test("PWA-INT-001 serves a manifest whose icons all exist", async ({ page }) => 
   expect(manifest.display).toBe("standalone");
   // Home, because somebody opening this from a home-screen icon is asking what
   // needs them, and that is the screen which answers it.
-  expect(manifest.start_url).toBe("/");
+  expect(manifest.start_url).toBe("/workspace");
   expect(manifest.scope).toBe("/");
 
   // A launcher may crop an icon to a circle, and this mark is a pair of wings
@@ -45,7 +45,7 @@ test("PWA-INT-001 serves a manifest whose icons all exist", async ({ page }) => 
 
 test("PWA-INT-002 registers a service worker that caches nothing signed in", async ({ page }) => {
   await signUp(page, { ...freshAccount(), displayName: "Ada Ruiz", handle: "ada" });
-  await page.goto("/");
+  await page.goto("/workspace");
 
   const registered = await page.evaluate(async () => {
     const registration = await navigator.serviceWorker.ready;
@@ -81,7 +81,7 @@ test("PWA-INT-002 registers a service worker that caches nothing signed in", asy
 });
 
 test("PWA-INT-003 opens a notification only onto a place in this workspace", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/workspace");
   const source = await (await page.request.get("/sw.js")).text();
   // The shipped function, run in a real engine. The path arrives from outside
   // the page and is rendered by the operating system, so a payload that could
@@ -256,4 +256,3 @@ test("PWA-INT-008 says a deployment cannot push rather than failing silently", a
   expect(response.status()).toBe(503);
   expect(await response.json()).toMatchObject({ error: expect.stringContaining("not configured") });
 });
-
