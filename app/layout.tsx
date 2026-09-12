@@ -18,7 +18,7 @@ export const metadata: Metadata = {
     { rel: "icon", url: "/mark.svg" },
     // iOS takes its home-screen icon from here and not from the manifest, so a
     // manifest-only icon set installs as a screenshot of the page.
-    { rel: "apple-touch-icon", url: "/icon-192.png" },
+    { rel: "apple-touch-icon", url: "/apple-touch-icon.png", sizes: "180x180" },
   ],
   appleWebApp: { capable: true, title: "Lepidy", statusBarStyle: "default" },
 };
